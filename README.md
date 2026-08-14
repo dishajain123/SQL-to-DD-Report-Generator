@@ -14,12 +14,12 @@ export, report generation, persistence, and the review UI are deterministic
 code — no LLM involved, fully covered by tests, nothing to configure.
 
 The **reasoning steps** (understanding what a chain of SQL does, and
-translating it into the 4X Formula Expression grammar) call the Groq API
-for real. This requires `GROQ_API_KEY`. The test suite mocks this client
-(see `tests/conftest.py`) so `pytest` never makes a network call or needs a
-key. Prompt templates live in separate YAML files under
-`app/derivation/prompts/` so they can be edited without touching Python
-code.
+translating it into the 4X Formula Expression grammar) call an external LLM
+API for real. This requires `LLM_API_KEY` and a model/provider choice in
+`.env`. The test suite mocks this client (see `tests/conftest.py`) so
+`pytest` never makes a network call or needs a key. Prompt templates live in
+separate YAML files under `app/derivation/prompts/` so they can be edited
+without touching Python code.
 
 ## Setup
 
@@ -28,7 +28,7 @@ python3 -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env
-# edit .env and set GROQ_API_KEY if you want to run Groq-backed reasoning for real
+# edit .env and set LLM_API_KEY / LLM_MODEL_NAME if you want to run the LLM-backed reasoning for real
 ```
 
 Requires Python 3.10+.
@@ -39,10 +39,10 @@ Use this sequence for a clean local run:
 
 1. Create and activate a virtual environment.
 2. Install dependencies with `pip install -r requirements.txt`.
-3. Copy [`.env.example`](/Users/dishajain/Downloads/DD_Automation/.env.example) to [`.env`](/Users/dishajain/Downloads/DD_Automation/.env) and set `GROQ_API_KEY`.
+3. Copy [`.env.example`](/Users/dishajain/Downloads/DD_Automation/.env.example) to [`.env`](/Users/dishajain/Downloads/DD_Automation/.env) and set `LLM_API_KEY` and `LLM_MODEL_NAME`.
 4. Run the tests to verify the repo is healthy.
 5. Start the API or the Streamlit UI depending on what you want to use.
-6. Optionally run the Groq smoke test to see the reasoning outputs step by step.
+6. Optionally run the LLM smoke test to see the reasoning outputs step by step.
 
 Example commands:
 
@@ -61,9 +61,9 @@ DEFAULT_PLATFORM_NAME=4X
 DEFAULT_INTENT=Generate DD
 DEFAULT_FUNCTION_REFERENCE_PATH=samples/platform_docs/4x_functions_operators.md
 DEFAULT_ENTITY_NAME_MAP_JSON={}
-GROQ_API_KEY=your_real_key_here
-GROQ_MODEL=llama-3.3-70b-versatile
-GROQ_MODEL_FALLBACKS=llama-3.1-8b-instant,openai/gpt-oss-20b
+LLM_PROVIDER=auto
+LLM_API_KEY=your_real_key_here
+LLM_MODEL_NAME=gpt-4.1
 ```
 
 ## Run Check
@@ -82,13 +82,13 @@ python3 scripts/run_layer2_tests.py
 python3 scripts/run_layer3_tests.py
 ```
 
-If you want to see the Groq-backed reasoning output step by step:
+If you want to see the reasoning output step by step, use the smoke script:
 
 ```bash
 python3 scripts/run_groq_smoke.py
 ```
 
-If the script says the Groq API cannot be reached, run it on a machine with internet access.
+If the script says the API cannot be reached, run it on a machine with internet access.
 
 ## Configuration
 
@@ -97,21 +97,23 @@ All configuration is environment variables (loaded from `.env` via
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `GROQ_API_KEY` | (empty) | Required for real LLM calls. Not required for tests. |
-| `GROQ_MODEL` | `llama-3.3-70b-versatile` | Model used for reasoning/DD generation. |
-| `GROQ_MODEL_FALLBACKS` | `llama-3.1-8b-instant,openai/gpt-oss-20b` | Models tried automatically if the primary model is blocked. |
+| `LLM_PROVIDER` | `auto` | Chooses `openai` or `groq`. `auto` infers it from `LLM_MODEL_NAME` or `LLM_BASE_URL`. |
+| `LLM_API_KEY` | (empty) | API key for the selected provider. |
+| `LLM_MODEL_NAME` | provider-specific | Primary model used for reasoning/DD generation. |
+| `LLM_BASE_URL` | provider-specific | Override for the provider's chat-completions endpoint. |
 | `CHROMA_PERSIST_DIR` | `.chroma` | Where the RAG vector store persists to disk. |
 | `SQLITE_DB_PATH` | `dd_automation.db` | Job history / DD rows / review decisions / audit log. |
 | `OUTPUT_DIR` | `output` | Where reports and DD Excel exports are written. |
 | `STRUCTURAL_CONFIDENCE_THRESHOLD` | `0.5` | Below this, Structural Guardrails fail an object. |
 | `OUTPUT_GUARDRAIL_CONFIDENCE_THRESHOLD` | `0.7` | Below this, a DD row is flagged for review. |
 
-If you want to override the model, set `GROQ_MODEL` in `.env`. The default
-works well for the current pipeline.
+If you want to override the model, set `LLM_MODEL_NAME` in `.env`. If you
+want to switch providers, change `LLM_PROVIDER` and the matching key / base
+URL. The app will pick up the new values on restart.
 
-## Groq setup and output check
+## LLM setup and output check
 
-If you want to verify the Groq flow step by step, use the smoke script:
+If you want to verify the LLM flow step by step, use the smoke script:
 
 ```bash
 python3 scripts/run_groq_smoke.py
@@ -119,7 +121,7 @@ python3 scripts/run_groq_smoke.py
 
 What it does:
 
-1. Checks whether `GROQ_API_KEY` is present in your environment.
+1. Checks whether `LLM_API_KEY` is present in your environment.
 2. Runs the technical reasoning step and prints the summary.
 3. Runs the business reasoning step and prints the summary.
 4. Runs DD formula generation and prints the final expression text.
@@ -191,8 +193,8 @@ sample procs (`DPD_Calculation` -> `MaxDPD_ReferencePeriod_Calculation` ->
 `NPA_Date_Calculation`), generates DD rows, and writes a report + Excel file
 to `output/sample-job-1/`.
 
-To run it for real (actual Groq calls instead of the mock), set
-`GROQ_API_KEY` in `.env` and use `LLMClient()` instead of
+To run it for real (actual LLM calls instead of the mock), set
+`LLM_API_KEY` and `LLM_MODEL_NAME` in `.env` and use `LLMClient()` instead of
 `MockLLMClient()`.
 
 ## Running the application
@@ -220,7 +222,7 @@ platform, intent, function reference, and entity name map defined in
 If you want the shortest reliable path from clone to working app:
 
 1. `cp .env.example .env`
-2. Set `GROQ_API_KEY` in `.env`
+   2. Set `LLM_API_KEY` and `LLM_MODEL_NAME` in `.env`
 3. `pip install -r requirements.txt`
 4. `pytest`
 5. `uvicorn app.main:app --reload`
@@ -237,7 +239,7 @@ If you want the shortest reliable path from clone to working app:
   `DEFAULT_ENTITY_NAME_MAP_JSON` in `.env`.
 - Generated files in `output/`, SQLite DBs, Chroma caches, and `.venv/`
   are ignored by [`.gitignore`](/Users/dishajain/Downloads/DD_Automation/.gitignore).
-- The repository is designed to run tests without an API key; only the Groq
+- The repository is designed to run tests without an API key; only the LLM
   reasoning smoke test needs live network access and a real key.
 
 ## Project structure

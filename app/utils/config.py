@@ -18,9 +18,10 @@ class Settings:
         "DEFAULT_FUNCTION_REFERENCE_PATH", "samples/platform_docs/4x_functions_operators.md"
     )
     default_entity_name_map_json: str = os.getenv("DEFAULT_ENTITY_NAME_MAP_JSON", "{}")
-    groq_api_key: str = os.getenv("GROQ_API_KEY", "")
-    groq_model: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-    groq_model_fallbacks: str = os.getenv("GROQ_MODEL_FALLBACKS", "llama-3.1-8b-instant,openai/gpt-oss-20b")
+    llm_provider: str = os.getenv("LLM_PROVIDER", "auto")
+    llm_api_key: str = os.getenv("LLM_API_KEY", "")
+    llm_model_name: str = os.getenv("LLM_MODEL_NAME", "")
+    llm_base_url: str = os.getenv("LLM_BASE_URL", "")
     anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
     anthropic_model: str = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5")
     chroma_persist_dir: str = os.getenv("CHROMA_PERSIST_DIR", ".chroma")

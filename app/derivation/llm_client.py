@@ -1,8 +1,15 @@
 """Architecture steps 11 (AI Understanding) and 13 (DD Generation).
 
-This client now uses Groq's OpenAI-compatible chat completions API by default
-when `GROQ_API_KEY` is set. Prompt text lives in separate YAML assets so each
-stage can be updated without editing Python code.
+This client is provider-agnostic: choose the backend from environment
+variables only, then keep calling ``LLMClient()`` everywhere else.
+
+Supported providers:
+- OpenAI via `LLM_PROVIDER=openai`
+- Groq via `LLM_PROVIDER=groq`
+
+If `LLM_PROVIDER=auto` or unset, the client tries to infer the provider from
+`LLM_MODEL_NAME` or `LLM_BASE_URL`. The rest of the app never needs to know
+which provider is being used.
 """
 from __future__ import annotations
 
@@ -10,8 +17,8 @@ import json
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-
-from groq import APIConnectionError, APIStatusError, BadRequestError, Groq, NotFoundError, PermissionDeniedError, RateLimitError
+from typing import Any, Callable, Optional
+from urllib import error, request
 
 import yaml
 
@@ -21,6 +28,10 @@ from app.utils.logging_config import get_logger
 logger = get_logger(__name__)
 
 _PROMPTS_DIR = Path(__file__).with_name("prompts")
+
+
+class _ModelRejectedError(RuntimeError):
+    """Raised when a provider rejects a candidate model and fallback is okay."""
 
 
 @lru_cache(maxsize=1)
@@ -55,11 +66,6 @@ def _render_prompt(template: str, **kwargs: object) -> str:
     return template.format(**kwargs)
 
 
-def _parse_fallback_models(raw: str) -> list[str]:
-    models = [item.strip() for item in raw.split(",")]
-    return [model for model in models if model]
-
-
 def _strip_markdown_fences(text: str) -> str:
     stripped = text.strip()
     if not stripped.startswith("```"):
@@ -78,21 +84,109 @@ def _parse_json_payload(raw_output: str) -> dict[str, object]:
     return parsed
 
 
+def _normalize_provider(raw_provider: str, model: str, base_url: str) -> str:
+    provider = raw_provider.strip().lower()
+    if provider in {"", "auto"}:
+        model_hint = model.strip().lower()
+        base_url_hint = base_url.strip().lower()
+        if model_hint.startswith("gpt-") or "openai" in base_url_hint:
+            return "openai"
+        if model_hint.startswith("llama") or "groq" in base_url_hint:
+            return "groq"
+        return "openai"
+    if provider not in {"openai", "groq"}:
+        raise ValueError(
+            f"Unsupported LLM_PROVIDER '{raw_provider}'. Expected 'auto', 'openai', or 'groq'."
+        )
+    return provider
+
+
+def _extract_error_message(raw_body: str, fallback: str) -> str:
+    if not raw_body.strip():
+        return fallback
+
+    try:
+        parsed = json.loads(raw_body)
+    except json.JSONDecodeError:
+        return raw_body.strip() or fallback
+
+    if isinstance(parsed, dict):
+        error_obj = parsed.get("error")
+        if isinstance(error_obj, dict):
+            for key in ("message", "type", "code"):
+                value = error_obj.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        if isinstance(error_obj, str) and error_obj.strip():
+            return error_obj.strip()
+
+        detail = parsed.get("detail")
+        if isinstance(detail, str) and detail.strip():
+            return detail.strip()
+
+    return raw_body.strip() or fallback
+
+
+def _looks_like_rejected_model(status_code: Optional[int], message: str) -> bool:
+    if status_code not in {400, 401, 403, 404}:
+        return False
+
+    lowered = message.lower()
+    return any(
+        token in lowered
+        for token in (
+            "model",
+            "permission",
+            "not found",
+            "does not exist",
+            "unsupported",
+            "invalid model",
+        )
+    )
+
+
+def _truncate_for_provider(text: str, max_chars: int) -> str:
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n\n[truncated to fit provider input limit]"
+
+
 @dataclass
 class LLMClient:
-    """Thin wrapper around Groq's chat completions API."""
+    """Provider-agnostic chat-completions client for the pipeline."""
 
-    api_key: str = settings.groq_api_key
-    model: str = settings.groq_model
-    model_fallbacks: str = settings.groq_model_fallbacks
-    client: Groq | None = None
+    provider: str = settings.llm_provider
+    api_key: str = ""
+    model: str = ""
+    base_url: str = ""
+    temperature: float = 0.0
+    max_new_tokens: int = 1024
+    max_input_chars: int = 12000
+    transport: Optional[Callable[..., Any]] = None
 
     def __post_init__(self) -> None:
-        if self.client is None:
-            self.client = Groq(api_key=self.api_key) if self.api_key else None
+        self.model = self.model or settings.llm_model_name.strip()
+        self.base_url = self.base_url or settings.llm_base_url.strip()
+        self.provider = _normalize_provider(self.provider, self.model, self.base_url)
+        self.api_key = self.api_key or settings.llm_api_key.strip()
+        self.base_url = self.base_url or self._default_base_url()
+        self.model = self.model or self._default_model()
+        if self.transport is None:
+            self.transport = request.urlopen
+
+    def _default_base_url(self) -> str:
+        if self.provider == "openai":
+            return "https://api.openai.com/v1"
+        return "https://api.groq.com/openai/v1"
+
+    def _default_model(self) -> str:
+        if self.provider == "openai":
+            return "gpt-4.1"
+        return "llama-3.3-70b-versatile"
 
     def _candidate_models(self) -> list[str]:
-        candidates = [self.model, *_parse_fallback_models(self.model_fallbacks), "llama-3.1-8b-instant"]
+        fallback_models = ["gpt-4o-mini"] if self.provider == "openai" else ["llama-3.1-8b-instant", "openai/gpt-oss-20b"]
+        candidates = [self.model, *fallback_models]
         seen: set[str] = set()
         ordered: list[str] = []
         for model in candidates:
@@ -101,63 +195,99 @@ class LLMClient:
                 ordered.append(model)
         return ordered
 
-    def _is_retryable_model_error(self, exc: Exception) -> bool:
-        if isinstance(exc, (PermissionDeniedError, NotFoundError)):
-            return True
-        if isinstance(exc, BadRequestError):
-            text = str(exc).lower()
-            return "model" in text or "permission" in text or "not found" in text
-        if isinstance(exc, APIStatusError):
-            return getattr(exc, "status_code", None) in {403, 404}
-        return False
+    def _chat_completions_url(self) -> str:
+        base_url = self.base_url.rstrip("/")
+        if not base_url:
+            raise RuntimeError(
+                f"No base URL is configured for provider '{self.provider}'. "
+                "Set LLM_BASE_URL or the provider-specific base URL in .env."
+            )
+        return base_url + "/chat/completions"
 
-    def _complete_with_model(self, model: str, system: str, user: str, max_tokens: int = 1024) -> str:
+    def _complete_once(self, model: str, system: str, user: str, max_tokens: int) -> str:
         if not self.api_key:
             raise RuntimeError(
-                "GROQ_API_KEY is not set — cannot call the LLM. "
-                "Set it in your environment or .env file."
+                f"No API key is configured for provider '{self.provider}'. "
+                "Set LLM_API_KEY in your .env file."
             )
-        if self.client is None:
-            raise RuntimeError("Groq client is not initialized. Check GROQ_API_KEY.")
 
-        last_error: Exception | None = None
-        for candidate in self._candidate_models():
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": _truncate_for_provider(user, self.max_input_chars)},
+            ],
+            "max_tokens": max_tokens,
+            "temperature": self.temperature,
+        }
+
+        body = json.dumps(payload).encode("utf-8")
+        req = request.Request(
+            self._chat_completions_url(),
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            },
+            method="POST",
+        )
+
+        try:
+            with self.transport(req, timeout=120) as resp:
+                raw = resp.read().decode("utf-8")
+        except error.HTTPError as exc:
+            raw = exc.read().decode("utf-8") if exc.fp else ""
+            message = _extract_error_message(raw, exc.reason if isinstance(exc.reason, str) else str(exc.reason))
+            if _looks_like_rejected_model(exc.code, message):
+                raise _ModelRejectedError(message) from exc
+            raise RuntimeError(
+                f"{self.provider} chat completion failed for model '{model}': {message}"
+            ) from exc
+        except (error.URLError, TimeoutError) as exc:
+            reason = getattr(exc, "reason", str(exc))
+            raise RuntimeError(f"Could not reach the {self.provider} API: {reason}") from exc
+
+        parsed = _parse_json_payload(raw)
+        choices = parsed.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise RuntimeError(f"{self.provider} returned an unexpected response: missing choices")
+
+        first_choice = choices[0]
+        if not isinstance(first_choice, dict):
+            raise RuntimeError(f"{self.provider} returned an unexpected response: invalid choice")
+
+        message = first_choice.get("message")
+        if not isinstance(message, dict):
+            raise RuntimeError(f"{self.provider} returned an unexpected response: missing message")
+
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise RuntimeError(f"{self.provider} returned an empty message content")
+        return content.strip()
+
+    def _complete_with_model(self, system: str, user: str, max_tokens: int = 1024) -> str:
+        candidates = self._candidate_models()
+        if not candidates:
+            raise RuntimeError(
+                f"No model is configured for provider '{self.provider}'. "
+                "Set LLM_MODEL_NAME or the provider-specific model variable in .env."
+            )
+
+        last_error: Optional[Exception] = None
+        for candidate in candidates:
             try:
-                response = self.client.chat.completions.create(
-                    model=candidate,
-                    messages=[
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                    max_tokens=max_tokens,
-                    temperature=0.0,
-                )
-                content = response.choices[0].message.content
-                if not content:
-                    raise RuntimeError("Groq returned an empty message content")
-                return content.strip()
-            except APIConnectionError as exc:
-                raise RuntimeError(f"Could not reach Groq API: {exc}") from exc
-            except RateLimitError as exc:
-                raise RuntimeError(f"Groq rate limit hit while using model '{candidate}': {exc}") from exc
-            except APIStatusError as exc:
+                return self._complete_once(candidate, system, user, max_tokens=max_tokens)
+            except _ModelRejectedError as exc:
                 last_error = exc
-                if not self._is_retryable_model_error(exc):
-                    raise RuntimeError(f"Groq chat completion failed for model '{candidate}': {exc}") from exc
-            except Exception as exc:
-                last_error = exc
-                if not self._is_retryable_model_error(exc):
-                    raise RuntimeError(f"Groq chat completion failed for model '{candidate}': {exc}") from exc
+                continue
 
         raise RuntimeError(
-            "Groq rejected the configured model(s): "
-            f"{', '.join(self._candidate_models())}. "
-            "This usually means the API key does not have access to the primary model. "
+            f"{self.provider} rejected the configured model(s): {', '.join(candidates)}. "
             f"Last error: {last_error}"
         )
 
-    def _complete(self, system: str, user: str, max_tokens: int = 1024) -> str:
-        return self._complete_with_model(self.model, system, user, max_tokens=max_tokens)
+    def _complete(self, system: str, user: str, max_tokens: Optional[int] = None) -> str:
+        return self._complete_with_model(system, user, max_tokens=max_tokens or self.max_new_tokens)
 
     def technical_reasoning(self, sql_snippets: list[str]) -> str:
         prompts = _load_prompts()
@@ -183,7 +313,7 @@ class LLMClient:
             source_sql=source_sql,
             function_reference=function_reference,
         )
-        return self._complete(prompts["dd_generation_system"], user, max_tokens=512)
+        return self._complete(prompts["dd_generation_system"], user, max_tokens=min(self.max_new_tokens, 512))
 
     def retry_with_error(self, previous_expression: str, error: str, context: str) -> str:
         prompts = _load_prompts()
@@ -193,4 +323,4 @@ class LLMClient:
             error=error,
             context=context,
         )
-        return self._complete(prompts["retry_with_error_system"], user, max_tokens=512)
+        return self._complete(prompts["retry_with_error_system"], user, max_tokens=min(self.max_new_tokens, 512))
