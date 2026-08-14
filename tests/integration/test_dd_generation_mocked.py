@@ -70,3 +70,37 @@ def test_dd_generation_flags_grammar_failures_for_review(
     assert len(rows) > 0
     assert all(r.status == DDStatus.PENDING_REVIEW for r in rows)
     assert all(r.validation_errors for r in rows)
+
+
+def test_dd_generation_normalizes_legacy_comma_style_if(
+    dpd_calculation_sql, maxdpd_sql, npa_date_sql, mock_llm_client, function_reference
+):
+    class LegacyIfLLMClient:
+        def technical_reasoning(self, sql_snippets: list[str]) -> str:
+            return mock_llm_client.technical_reasoning(sql_snippets)
+
+        def business_reasoning(self, technical_summary: str) -> str:
+            return mock_llm_client.business_reasoning(technical_summary)
+
+        def generate_formula_expression(self, technical_summary, business_summary, source_sql, function_reference) -> str:
+            return 'IF(p_TIMEKEY > 26267, 1, 0)'
+
+        def retry_with_error(self, previous_expression, error, context) -> str:
+            return 'IF(p_TIMEKEY > 26267, 1, 0)'
+
+    chain, objects, infos = _build_chain(dpd_calculation_sql, maxdpd_sql, npa_date_sql)
+    model = build_canonical_model(chain, "job-int-3", objects, infos, mock_llm_client)
+
+    rows = generate_dd_rows(
+        chain=chain,
+        canonical_model=model,
+        objects=objects,
+        structural_infos=infos,
+        llm_client=LegacyIfLLMClient(),
+        function_reference=function_reference,
+    )
+
+    assert len(rows) > 0
+    assert all(not row.validation_errors for row in rows)
+    assert all("THEN(" in row.display_derivation_expression for row in rows)
+    assert all("," not in row.display_derivation_expression.split("THEN(", 1)[0] for row in rows)

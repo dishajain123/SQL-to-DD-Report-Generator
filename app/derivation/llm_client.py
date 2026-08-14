@@ -101,6 +101,24 @@ def _normalize_provider(raw_provider: str, model: str, base_url: str) -> str:
     return provider
 
 
+def _provider_from_model(model: str) -> Optional[str]:
+    lowered = model.strip().lower()
+    if lowered.startswith("gpt-") or lowered.startswith("openai/"):
+        return "openai"
+    if lowered.startswith("llama") or lowered.startswith("groq/"):
+        return "groq"
+    return None
+
+
+def _provider_from_api_key(api_key: str) -> Optional[str]:
+    lowered = api_key.strip().lower()
+    if lowered.startswith("gsk_"):
+        return "groq"
+    if lowered.startswith("sk-proj-") or lowered.startswith("sk-"):
+        return "openai"
+    return None
+
+
 def _extract_error_message(raw_body: str, fallback: str) -> str:
     if not raw_body.strip():
         return fallback
@@ -167,8 +185,24 @@ class LLMClient:
     def __post_init__(self) -> None:
         self.model = self.model or settings.llm_model_name.strip()
         self.base_url = self.base_url or settings.llm_base_url.strip()
-        self.provider = _normalize_provider(self.provider, self.model, self.base_url)
         self.api_key = self.api_key or settings.llm_api_key.strip()
+        inferred_provider = _normalize_provider(self.provider, self.model, self.base_url)
+        model_provider = _provider_from_model(self.model)
+        key_provider = _provider_from_api_key(self.api_key)
+
+        if self.provider in {"", "auto"}:
+            if model_provider and key_provider and model_provider != key_provider:
+                raise ValueError(
+                    "LLM config mismatch: LLM_MODEL_NAME looks like "
+                    f"{model_provider} but LLM_API_KEY looks like {key_provider}. "
+                    "Make the model and API key belong to the same provider."
+                )
+            if key_provider:
+                inferred_provider = key_provider
+            elif model_provider:
+                inferred_provider = model_provider
+
+        self.provider = inferred_provider
         self.base_url = self.base_url or self._default_base_url()
         self.model = self.model or self._default_model()
         if self.transport is None:
@@ -207,7 +241,7 @@ class LLMClient:
     def _complete_once(self, model: str, system: str, user: str, max_tokens: int) -> str:
         if not self.api_key:
             raise RuntimeError(
-                f"No API key is configured for provider '{self.provider}'. "
+                "No API key is configured for the LLM provider. "
                 "Set LLM_API_KEY in your .env file."
             )
 
@@ -238,6 +272,14 @@ class LLMClient:
         except error.HTTPError as exc:
             raw = exc.read().decode("utf-8") if exc.fp else ""
             message = _extract_error_message(raw, exc.reason if isinstance(exc.reason, str) else str(exc.reason))
+            if exc.code == 1010 or "1010" in message:
+                raise RuntimeError(
+                    f"{self.provider} returned Cloudflare error 1010 while calling model '{model}'. "
+                    "This is an upstream access block, not a prompt or SQL bug. "
+                    "If you want to continue without this blocker, switch .env to a provider/model "
+                    "your account can reach (for example LLM_PROVIDER=openai with gpt-4.1), "
+                    "or use a Groq account/network that is allowed to access the API."
+                ) from exc
             if _looks_like_rejected_model(exc.code, message):
                 raise _ModelRejectedError(message) from exc
             raise RuntimeError(

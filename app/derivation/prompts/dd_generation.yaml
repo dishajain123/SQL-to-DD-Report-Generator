@@ -4,10 +4,12 @@ system: >
   logic, (2) the exact source SQL, and (3) the platform's function/operator
   reference. Output ONLY a single valid Formula Expression string using that
   grammar — functions like IF/THEN/ELSEIF/ELSE, ISNOTEMPTY, DATEDIFF, AND,
-  OR, BETWEEN, etc. Do not include any explanation, markdown formatting, or
-  code fences — output the raw expression only. If the logic is a
-  categorical/range-based classification rather than a single formula, instead
-  output a JSON object with a "decision_table" key describing the buckets.
+  OR, BETWEEN, etc. Use the exact 4X syntax: `IF(condition)THEN(true_expr)ELSE(false_expr)`.
+  Do not write comma-style `IF(condition, true_expr, false_expr)` syntax.
+  Do not include any explanation, markdown formatting, or code fences —
+  output the raw expression only. If the logic is a categorical/range-based
+  classification rather than a single formula, instead output a JSON object
+  with a "decision_table" key describing the buckets.
 
 user: |
   Technical summary:

@@ -36,6 +36,93 @@ from app.utils.logging_config import get_logger
 logger = get_logger(__name__)
 
 
+def _normalize_legacy_if_syntax(expression: str) -> str:
+    """Convert common comma-style IF(condition, true, false) output into 4X syntax.
+
+    The 4X grammar expects IF(condition)THEN(true)ELSE(false). Some LLM
+    outputs default to SQL-style IF(condition, true, false); this helper
+    rewrites that shape before validation.
+    """
+
+    def split_top_level_args(text: str) -> list[str] | None:
+        args = []
+        current = []
+        depth = 0
+        in_string = False
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch == '"':
+                in_string = not in_string
+                current.append(ch)
+            elif not in_string and ch == "(":
+                depth += 1
+                current.append(ch)
+            elif not in_string and ch == ")":
+                if depth == 0:
+                    return None
+                depth -= 1
+                current.append(ch)
+            elif not in_string and ch == "," and depth == 0:
+                args.append("".join(current).strip())
+                current = []
+            else:
+                current.append(ch)
+            i += 1
+        args.append("".join(current).strip())
+        return args if len(args) == 3 else None
+
+    def rewrite_once(text: str) -> str:
+        result = []
+        i = 0
+        in_string = False
+        while i < len(text):
+            ch = text[i]
+            if ch == '"':
+                in_string = not in_string
+                result.append(ch)
+                i += 1
+                continue
+
+            if not in_string and text[i : i + 3].upper() == "IF(":
+                start = i + 3
+                depth = 1
+                j = start
+                local_in_string = False
+                while j < len(text):
+                    cur = text[j]
+                    if cur == '"':
+                        local_in_string = not local_in_string
+                    elif not local_in_string:
+                        if cur == "(":
+                            depth += 1
+                        elif cur == ")":
+                            depth -= 1
+                            if depth == 0:
+                                break
+                    j += 1
+                if depth == 0:
+                    inner = text[start:j]
+                    parts = split_top_level_args(inner)
+                    if parts:
+                        condition, when_true, when_false = parts
+                        result.append(f"IF({condition})THEN({when_true})ELSE({when_false})")
+                        i = j + 1
+                        continue
+
+            result.append(ch)
+            i += 1
+        return "".join(result)
+
+    previous = expression
+    for _ in range(3):
+        rewritten = rewrite_once(previous)
+        if rewritten == previous:
+            return rewritten
+        previous = rewritten
+    return previous
+
+
 def generate_dd_rows(
     chain: LineageChain,
     canonical_model: CanonicalModel,
@@ -89,6 +176,8 @@ def _generate_for_column(
     )
 
     derivation_option, expression, decision_table_json, parse_errors = _interpret_llm_output(raw_output)
+    if expression:
+        expression = _normalize_legacy_if_syntax(expression)
 
     validation_errors = list(parse_errors)
     if expression:
@@ -101,6 +190,8 @@ def _generate_for_column(
                 context=f"Column: {column}, Entity: {entity_name}",
             )
             corrected_option, corrected_expr, corrected_dt_json, corrected_errors = _interpret_llm_output(corrected)
+            if corrected_expr:
+                corrected_expr = _normalize_legacy_if_syntax(corrected_expr)
             retry_result = validate_expression(corrected_expr) if corrected_expr else None
             if retry_result and retry_result.valid:
                 derivation_option, expression, decision_table_json = (

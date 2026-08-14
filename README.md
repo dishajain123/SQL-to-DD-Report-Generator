@@ -33,6 +33,52 @@ cp .env.example .env
 
 Requires Python 3.10+.
 
+## Quick Run
+
+Use these exact commands to run the project locally:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+pytest
+uvicorn app.main:app --reload
+```
+
+In a second terminal:
+
+```bash
+.venv/bin/streamlit run app/review/streamlit_app.py
+```
+
+If you want to run the LLM-backed steps for real, set these in `.env` before
+starting the app:
+
+```env
+LLM_PROVIDER=auto
+LLM_API_KEY=your_real_key_here
+LLM_MODEL_NAME=gpt-4.1
+```
+
+## Run Backend
+
+```bash
+cd /Users/dishajain/Downloads/DD_Automation
+source .venv/bin/activate
+uvicorn app.main:app --reload
+```
+
+## Run Frontend
+
+Open a second terminal and run:
+
+```bash
+cd /Users/dishajain/Downloads/DD_Automation
+source .venv/bin/activate
+.venv/bin/streamlit run app/review/streamlit_app.py
+```
+
 ## How To Run
 
 Use this sequence for a clean local run:
@@ -222,7 +268,7 @@ platform, intent, function reference, and entity name map defined in
 If you want the shortest reliable path from clone to working app:
 
 1. `cp .env.example .env`
-   2. Set `LLM_API_KEY` and `LLM_MODEL_NAME` in `.env`
+2. Set `LLM_API_KEY` and `LLM_MODEL_NAME` in `.env`
 3. `pip install -r requirements.txt`
 4. `pytest`
 5. `uvicorn app.main:app --reload`
