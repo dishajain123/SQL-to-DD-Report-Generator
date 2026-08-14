@@ -5,7 +5,11 @@ Flow per column: build a column-specific SQL excerpt -> retrieve relevant
 RAG context -> generate a Formula Expression -> deterministic grammar
 validation -> semantic validation against the source SQL -> if either
 fails, feed the errors (plus RAG context) back for a bounded number of
-repair attempts -> accept or fall back to PENDING_REVIEW.
+repair attempts -> accept -> for each effective-dated period, prune the
+accepted expression down to just the branch that period's TIMEKEY
+threshold actually selects (see app/derivation/period_pruning.py) -> or,
+if generation never fully succeeded, fall back to PENDING_REVIEW with the
+full, unpruned expression so a reviewer sees everything.
 
 A column is very often assigned in more than one place in a real
 procedure (a main calculation plus a special-case override, or a success
@@ -31,7 +35,8 @@ from datetime import date
 from typing import Optional
 
 from app.derivation.llm_client import LLMClient
-from app.derivation.versioning import effective_dates_for_column
+from app.derivation.period_pruning import prune_expression_for_period
+from app.derivation.versioning import effective_periods_for_column
 from app.grammar.validator import validate_expression
 from app.guardrails.semantic_validation import check_semantic_consistency
 from app.models.core import (
@@ -182,6 +187,66 @@ def _flatten_whitespace(expression: str) -> str:
     instead of patching the symptom separately in each renderer.
     """
     return " ".join(expression.split())
+
+
+def _fix_unbalanced_trailing_parens(expression: str) -> str:
+    """Fix the common LLM mistake of closing one (or a few) too many, or
+    too few, parentheses at the very end of an otherwise-correct
+    expression -- deeply nested IF/ELSEIF/ELSE trees make manual
+    paren-counting error prone, and this is a purely mechanical, frequent
+    failure mode, distinct from any actual logic error.
+
+    Only ever trims or adds parentheses at the very end of the expression,
+    and only accepts the result if it actually parses against the real 4X
+    grammar (not merely paren-depth-balanced -- depth balance alone isn't
+    proof of a correct token sequence). It never touches parentheses in
+    the interior, so it can't silently change the expression's actual
+    structure. If no simple trailing adjustment produces something that
+    parses, the expression is left untouched and grammar validation will
+    correctly reject it, triggering a normal LLM repair attempt instead.
+    """
+
+    def depth_profile(text: str) -> list[int]:
+        depth = 0
+        profile = []
+        in_double = False
+        for ch in text:
+            if ch == '"':
+                in_double = not in_double
+            elif not in_double and ch == "(":
+                depth += 1
+            elif not in_double and ch == ")":
+                depth -= 1
+            profile.append(depth)
+        return profile
+
+    profile = depth_profile(expression)
+    if not profile:
+        return expression
+    final_depth = profile[-1]
+    if final_depth == 0:
+        return expression
+
+    if final_depth > 0:
+        candidate = expression + (")" * final_depth)
+        if validate_expression(candidate).valid:
+            return candidate
+        return expression
+
+    excess = -final_depth
+    trimmed = expression.rstrip()
+    trailing_closes = 0
+    i = len(trimmed) - 1
+    while i >= 0 and trimmed[i] == ")" and trailing_closes < excess:
+        trailing_closes += 1
+        i -= 1
+    if trailing_closes < excess:
+        return expression
+
+    candidate = trimmed[: len(trimmed) - trailing_closes]
+    if validate_expression(candidate).valid:
+        return candidate
+    return expression
 
 
 def _normalize_sql_functions(expression: str) -> str:
@@ -435,11 +500,13 @@ def _normalize_expression(expression: str) -> str:
     the final result is always safe for both a Markdown table cell and a
     spreadsheet cell), then quotes/operators, then function-call rewriting
     and comma-style IF detection, both of which rely on string-boundary
-    tracking."""
+    tracking, and finally a trailing-paren-balance check as a last safety
+    net after all other rewrites have run."""
     expression = _flatten_whitespace(expression)
     expression = _normalize_sql_style_syntax(expression)
     expression = _normalize_sql_functions(expression)
     expression = _normalize_legacy_if_syntax(expression)
+    expression = _fix_unbalanced_trailing_parens(expression)
     return expression
 
 
@@ -558,26 +625,38 @@ def _generate_for_column(
     confidence = info.confidence if not validation_errors else min(info.confidence, 0.3)
     status = DDStatus.PENDING_REVIEW if validation_errors else DDStatus.ACTIVE
 
-    effective_dates = effective_dates_for_column(info.version_thresholds, timekey_map)
-    if not effective_dates:
-        effective_dates = [(date.today(), True)]
+    periods = effective_periods_for_column(info.version_thresholds, timekey_map)
+    if not periods:
+        periods = [(date.today(), True, "", 0)]
 
     data_type = _infer_data_type(column)
 
     rows = []
-    for eff_date, is_real_mapping in effective_dates:
+    for eff_date, is_real_mapping, variable, representative_value in periods:
         row_confidence = confidence if is_real_mapping else min(confidence, 0.5)
         row_status = status if is_real_mapping else DDStatus.PENDING_REVIEW
         row_validation_errors = list(validation_errors)
         if not is_real_mapping:
             row_validation_errors.append(_SYNTHETIC_DATE_REVIEW_NOTE)
+
+        row_expression = expression or ""
+        # Only prune an already-clean expression -- pruning a row that's
+        # already flagged PENDING_REVIEW would risk hiding the very logic
+        # a reviewer needs to see, and there is nothing reliable to prune
+        # from an expression that hasn't been validated in the first
+        # place.
+        if row_expression and variable and not validation_errors:
+            pruned = prune_expression_for_period(row_expression, variable, representative_value)
+            if pruned != row_expression and validate_expression(pruned).valid:
+                row_expression = pruned
+
         rows.append(
             DDRow(
                 entity_name=entity_name,
                 column_name=column,
                 column_type=ColumnType.PHYSICAL,
                 derivation_option=derivation_option,
-                display_derivation_expression=expression or "",
+                display_derivation_expression=row_expression,
                 effective_start_date=eff_date,
                 status=row_status,
                 data_type=data_type,

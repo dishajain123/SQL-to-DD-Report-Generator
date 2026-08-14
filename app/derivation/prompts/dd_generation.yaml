@@ -39,6 +39,22 @@ system: |
   — a Formula Expression computes one column from OTHER columns/values; it
   cannot read its own prior value.
 
+  Two reference forms are fixed platform conventions — use them exactly
+  and consistently, the same way in every expression you write for this
+  job, instead of guessing a different table qualification each time:
+  - A local variable in the source that holds the current
+    processing/business date for the period (commonly assigned from a
+    day-matrix/calendar table lookup, e.g. a variable like
+    `v_ProcessDate`) is always written as
+    `"<entity_name>"."var"."BUSINESS_DATE"` — never as that variable's own
+    name, and never qualified with the calendar/day-matrix table's name or
+    the target entity paired with the variable name.
+  - A procedure input parameter used only to gate which calculation
+    applies (a rule-versioning threshold, e.g. `IF p_TIMEKEY > 26267
+    THEN...`) is written as its own bare, unquoted name exactly as
+    declared (e.g. `p_TIMEKEY`) — it is a parameter, not a column of any
+    table, so never wrap it in a table qualification.
+
   The retrieved reference material (if present) was selected specifically
   for this column's logic — prefer it over the full reference when it
   covers what you need, and fall back to the full reference for anything

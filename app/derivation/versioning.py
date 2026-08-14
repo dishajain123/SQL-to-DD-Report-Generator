@@ -51,3 +51,47 @@ def effective_dates_for_column(
     earliest first."""
     unique_values = sorted({int(t.value) for t in thresholds})
     return [resolve_timekey_to_date(v, timekey_map) for v in unique_values]
+
+
+def effective_periods_for_column(
+    thresholds: list[VersionThreshold], timekey_map: dict[int, date] | None = None
+) -> list[tuple[date, bool, str, int]]:
+    """Like `effective_dates_for_column`, but each entry also carries the
+    rule-versioning variable name and a representative TIMEKEY value for
+    that period (the threshold itself, plus one) -- letting a consumer
+    (see app/derivation/period_pruning.py) evaluate exactly which branch
+    of a threshold-gated Formula Expression actually applies from that
+    date forward, instead of every effective-dated row embedding the
+    entire branch tree identically.
+
+    "Threshold plus one" is deliberate, not arbitrary: a row with
+    Effective Start Date X represents "the rule that took effect starting
+    at X" -- i.e. the branch selected once the source's own threshold
+    comparison (almost always a strict `>`) has just become true, not the
+    instant at the boundary itself where a strict `>` is still false. If a
+    procedure's threshold values were ever separated by exactly 1 (an
+    edge case not seen in the real sample procedures this pipeline was
+    built against), the representative value for one period could
+    coincide with the very next threshold; the pruner still only ever
+    prunes a branch it can evaluate with full confidence, so the worst
+    outcome in that edge case is simply less pruning for that one period,
+    never an incorrect one.
+
+    When more than one distinct threshold variable name appears across the
+    object (rare -- real procedures overwhelmingly use one rule-versioning
+    parameter), each threshold keeps its own originating variable name; a
+    consumer only ever prunes conditions that reference that same
+    variable, so a mismatched variable name never causes incorrect
+    pruning -- it just means that threshold isn't prunable against a
+    differently-named condition, the same safe, conservative behavior as
+    when nothing else in the expression matches at all.
+    """
+    variable_by_value: dict[int, str] = {}
+    for t in thresholds:
+        variable_by_value.setdefault(int(t.value), t.variable)
+
+    periods: list[tuple[date, bool, str, int]] = []
+    for value in sorted(variable_by_value):
+        resolved_date, is_real = resolve_timekey_to_date(value, timekey_map)
+        periods.append((resolved_date, is_real, variable_by_value[value], value + 1))
+    return periods

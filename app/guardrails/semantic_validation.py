@@ -61,6 +61,55 @@ def _extract_identifiers(text: str) -> set[str]:
     return {tok.upper() for tok in _IDENTIFIER_RE.findall(text) if tok.upper() not in _KEYWORD_STOPWORDS}
 
 
+def _strip_sql_comments(text: str) -> str:
+    """Strip `--` line comments and `/* */` block comments throughout the
+    text (not just leading ones), so a hallucination check never treats an
+    identifier that only appears inside commented-out/dead SQL as
+    legitimate source evidence. This is a generic, always-applied pass --
+    a stray word inside a `/* ... */` remark shouldn't make an unrelated,
+    wrongly-attributed reference look justified for any input."""
+    result: list[str] = []
+    i = 0
+    n = len(text)
+    in_single = False
+    in_double = False
+    while i < n:
+        ch = text[i]
+        if in_single:
+            result.append(ch)
+            if ch == "'" and not (i + 1 < n and text[i + 1] == "'"):
+                in_single = False
+            i += 1
+            continue
+        if in_double:
+            result.append(ch)
+            if ch == '"':
+                in_double = False
+            i += 1
+            continue
+        if ch == "'":
+            in_single = True
+            result.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            result.append(ch)
+            i += 1
+            continue
+        if ch == "-" and i + 1 < n and text[i + 1] == "-":
+            nl = text.find("\n", i)
+            i = n if nl == -1 else nl
+            continue
+        if ch == "/" and i + 1 < n and text[i + 1] == "*":
+            end = text.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            continue
+        result.append(ch)
+        i += 1
+    return "".join(result)
+
+
 def check_self_reference(expression: str, column: str) -> list[str]:
     """A Formula Expression must not reference the very column it is
     computing -- there is no prior-period/running value available in this
@@ -173,7 +222,9 @@ def check_semantic_consistency(
     source_sql: str,
 ) -> GuardrailResult:
     """Run every semantic check and return a single combined result."""
-    source_text = "\n".join(chunk.raw_sql for chunk in relevant_chunks) + "\n" + source_sql
+    source_text = _strip_sql_comments(
+        "\n".join(chunk.raw_sql for chunk in relevant_chunks) + "\n" + source_sql
+    )
 
     errors: list[str] = []
     errors.extend(check_self_reference(expression, column))
