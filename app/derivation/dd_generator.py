@@ -1,12 +1,11 @@
 """Architecture step 13: DD Generation — chain collapse + grammar
 targeting + versioning, orchestrated end to end.
 
-For each column written by an object in the lineage chain, this asks the
-LLM to translate that object's logic into a 4X Formula Expression (or a
-Decision Table), validates the result against the real grammar, retries
-once on failure with the error fed back to the model, and — if the source
-object had TIMEKEY-style version thresholds — splits the result into
-multiple DD rows with distinct Effective Start Dates.
+Flow per column: build a column-specific SQL excerpt -> retrieve relevant
+RAG context -> generate a Formula Expression -> deterministic grammar
+validation -> semantic validation against the source SQL -> if either
+fails, feed the errors (plus RAG context) back for a bounded number of
+repair attempts -> accept or fall back to PENDING_REVIEW.
 
 A column is very often assigned in more than one place in a real
 procedure (a main calculation plus a special-case override, or a success
@@ -16,7 +15,9 @@ the model happens to notice first in a long procedure, this module builds
 a column-specific SQL excerpt from the object's SmartChunks (see
 app/parsing/smart_chunking.py) -- every logical block that actually
 assigns the target column, anywhere in the object -- and passes that to
-the LLM as the authoritative source for that one column.
+the LLM as the authoritative source for that one column. The same chunk
+list is also handed to semantic validation so it can check whether an
+override/exception-style chunk was actually reflected in the result.
 
 Entity-name resolution (staging table -> fact table name) is intentionally
 pluggable via `entity_name_map` rather than hardcoded, since that mapping is
@@ -27,10 +28,12 @@ from __future__ import annotations
 
 import json
 from datetime import date
+from typing import Optional
 
 from app.derivation.llm_client import LLMClient
 from app.derivation.versioning import effective_dates_for_column
 from app.grammar.validator import validate_expression
+from app.guardrails.semantic_validation import check_semantic_consistency
 from app.models.core import (
     CanonicalModel,
     ColumnType,
@@ -38,39 +41,147 @@ from app.models.core import (
     DDStatus,
     DerivationOption,
     LineageChain,
+    SmartChunk,
     SQLObject,
     StructuralInfo,
 )
+from app.rag.chroma_store import ChromaStore, DOMAIN_COLLECTION, PLATFORM_COLLECTION
 from app.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
 
+# Total generation attempts per column: one initial attempt plus up to two
+# bounded repair/regeneration attempts, each fed the accumulated grammar
+# and/or semantic errors from the previous attempt.
+_MAX_GENERATION_ATTEMPTS = 3
 
-def _relevant_sql_excerpt(info: StructuralInfo, column: str) -> str:
-    """Collect every logical block (SmartChunk) that actually assigns the
-    target column somewhere in the object -- across every conditional
-    branch, MERGE override, or exception handler, not just wherever it
-    happens to appear first.
+_SYNTHETIC_DATE_REVIEW_NOTE = (
+    "Effective start date is a synthetic estimate because no "
+    "TIMEKEY-to-calendar-date mapping was supplied for this run; confirm "
+    "the exact date before finalizing this DD row."
+)
+
+
+def _relevant_chunks(info: StructuralInfo, column: str) -> list[SmartChunk]:
+    """Every logical block (SmartChunk) that actually assigns the target
+    column somewhere in the object -- across every conditional branch,
+    MERGE override, or exception handler, not just wherever it happens to
+    appear first.
 
     SmartChunks already keep control-flow blocks (IF/ELSE, CASE) together
     as one unit, and each chunk's `columns_written` is the union of every
     column actually assigned within it -- so filtering on that gives a
-    focused, still-conditionally-correct excerpt for one column, built the
-    same way regardless of which procedure or column is being processed.
+    focused, still-conditionally-correct set of chunks for one column,
+    built the same way regardless of which procedure or column is being
+    processed.
 
-    Returns an empty string (letting the caller fall back to explaining
-    that nothing specific was isolated) if smart chunking found nothing for
-    this column -- this is a targeting aid, not a hard requirement.
+    A bare control-flow header (`EXCEPTION`, `WHEN ... THEN`, `ELSE`, ...)
+    that touches no table/column of its own becomes its own tiny chunk
+    immediately before the statement it governs (see
+    app/parsing/smart_chunking.py's branch-marker handling), rather than
+    being merged into it. Any such header(s) immediately preceding a
+    matched chunk are folded into that chunk's text here, since they carry
+    the trigger condition (e.g. "this is the error-handling path") that
+    both the LLM and semantic validation need to see alongside the
+    statement itself.
     """
-    excerpts: list[str] = []
+    all_chunks = info.smart_chunks
+    matched: list[SmartChunk] = []
     seen_chunk_ids: set[str] = set()
-    for chunk in info.smart_chunks:
-        if column in chunk.columns_written and chunk.chunk_id not in seen_chunk_ids:
-            seen_chunk_ids.add(chunk.chunk_id)
-            excerpt = chunk.raw_sql.strip()
-            if excerpt:
-                excerpts.append(excerpt)
+
+    for idx, chunk in enumerate(all_chunks):
+        if column not in chunk.columns_written or chunk.chunk_id in seen_chunk_ids:
+            continue
+        seen_chunk_ids.add(chunk.chunk_id)
+
+        header_lines: list[str] = []
+        j = idx - 1
+        while j >= 0:
+            candidate = all_chunks[j]
+            is_bare_header = (
+                not candidate.tables_written and not candidate.tables_read and not candidate.columns_written
+            )
+            if not is_bare_header:
+                break
+            header_lines.insert(0, candidate.raw_sql.strip())
+            j -= 1
+
+        if header_lines:
+            merged_raw_sql = "\n".join([*header_lines, chunk.raw_sql.strip()])
+            chunk = chunk.model_copy(update={"raw_sql": merged_raw_sql})
+
+        matched.append(chunk)
+
+    return matched
+
+
+def _relevant_sql_excerpt(info: StructuralInfo, column: str) -> str:
+    """Text form of `_relevant_chunks`, for handing to the LLM prompt.
+    Returns an empty string (letting the caller fall back to explaining
+    that nothing specific was isolated) if smart chunking found nothing
+    for this column -- this is a targeting aid, not a hard requirement.
+    """
+    excerpts = [chunk.raw_sql.strip() for chunk in _relevant_chunks(info, column) if chunk.raw_sql.strip()]
     return "\n\n".join(excerpts)
+
+
+def _retrieve_rag_context(
+    rag_store: Optional[ChromaStore],
+    relevant_sql: str,
+    technical_summary: str,
+    business_summary: str,
+) -> str:
+    """Query the platform (4X function/operator) and domain RAG
+    collections for the chunks most relevant to this specific column,
+    instead of handing the model the entire reference document every time.
+
+    Falls back to an empty string -- letting the caller rely on the full
+    function_reference instead -- if no RAG store was supplied, the store
+    can't be reached, or nothing has been ingested yet. This keeps the
+    pipeline fully functional whether or not `ingest_platform_doc` /
+    `ingest_domain_doc` has ever been run; RAG is a targeting aid on top of
+    the existing full-reference behavior, not a replacement that could
+    break generation if it's unavailable.
+    """
+    if rag_store is None:
+        return ""
+
+    platform_query = (relevant_sql or technical_summary).strip()
+    domain_query = (business_summary or technical_summary).strip()
+
+    sections: list[str] = []
+    try:
+        if platform_query:
+            platform_hits = rag_store.query(PLATFORM_COLLECTION, platform_query, n_results=4)
+            if platform_hits:
+                sections.append(
+                    "Relevant platform function/operator reference:\n" + "\n---\n".join(platform_hits)
+                )
+        if domain_query:
+            domain_hits = rag_store.query(DOMAIN_COLLECTION, domain_query, n_results=2)
+            if domain_hits:
+                sections.append("Relevant domain glossary:\n" + "\n---\n".join(domain_hits))
+    except Exception as exc:  # pragma: no cover - defensive: RAG must never break generation
+        logger.warning("RAG retrieval failed, continuing without it: %s", exc)
+        return ""
+
+    return "\n\n".join(sections)
+
+
+def _flatten_whitespace(expression: str) -> str:
+    """Collapse all internal whitespace (including newlines and
+    indentation) into single spaces.
+
+    The 4X grammar itself ignores whitespace entirely when parsing (see
+    fourx_grammar.lark's `%ignore WS`), so this never changes what an
+    expression means -- it only guarantees the stored/exported expression
+    is always a single line. A multi-line value breaks a Markdown table
+    row (the report renders every DD row as one table row) and makes a
+    poor spreadsheet cell; applying this once here, at the source, keeps
+    the Markdown report and the Excel export consistent with each other
+    instead of patching the symptom separately in each renderer.
+    """
+    return " ".join(expression.split())
 
 
 def _normalize_sql_functions(expression: str) -> str:
@@ -319,9 +430,13 @@ def _normalize_sql_style_syntax(expression: str) -> str:
 
 def _normalize_expression(expression: str) -> str:
     """Apply every mechanical, input-independent normalization pass, in an
-    order chosen so each pass sees syntax the next one expects (quotes and
-    operators normalized before function-call rewriting and comma-style IF
-    detection, both of which rely on string-boundary tracking)."""
+    order chosen so each pass sees syntax the next one expects. Whitespace
+    is flattened first (so every later pass works on a single line, and so
+    the final result is always safe for both a Markdown table cell and a
+    spreadsheet cell), then quotes/operators, then function-call rewriting
+    and comma-style IF detection, both of which rely on string-boundary
+    tracking."""
+    expression = _flatten_whitespace(expression)
     expression = _normalize_sql_style_syntax(expression)
     expression = _normalize_sql_functions(expression)
     expression = _normalize_legacy_if_syntax(expression)
@@ -337,6 +452,7 @@ def generate_dd_rows(
     function_reference: str,
     entity_name_map: dict[str, str] | None = None,
     timekey_map: dict[int, date] | None = None,
+    rag_store: Optional[ChromaStore] = None,
 ) -> list[DDRow]:
     entity_name_map = entity_name_map or {}
     dd_rows: list[DDRow] = []
@@ -358,6 +474,7 @@ def generate_dd_rows(
                         llm_client=llm_client,
                         function_reference=function_reference,
                         timekey_map=timekey_map,
+                        rag_store=rag_store,
                     )
                 )
     return dd_rows
@@ -372,8 +489,13 @@ def _generate_for_column(
     llm_client: LLMClient,
     function_reference: str,
     timekey_map: dict[int, date] | None,
+    rag_store: Optional[ChromaStore] = None,
 ) -> list[DDRow]:
-    relevant_sql = _relevant_sql_excerpt(info, column)
+    relevant_chunks = _relevant_chunks(info, column)
+    relevant_sql = "\n\n".join(chunk.raw_sql.strip() for chunk in relevant_chunks if chunk.raw_sql.strip())
+    rag_context = _retrieve_rag_context(
+        rag_store, relevant_sql, canonical_model.technical_summary, canonical_model.business_summary
+    )
 
     raw_output = llm_client.generate_formula_expression(
         technical_summary=canonical_model.technical_summary,
@@ -383,42 +505,55 @@ def _generate_for_column(
         column_name=column,
         entity_name=entity_name,
         relevant_sql=relevant_sql,
+        rag_context=rag_context,
     )
 
-    derivation_option, expression, decision_table_json, parse_errors = _interpret_llm_output(raw_output)
-    if expression:
-        expression = _normalize_expression(expression)
+    derivation_option = DerivationOption.FORMULA_EXPRESSION
+    expression: str | None = None
+    decision_table_json: str | None = None
+    validation_errors: list[str] = []
 
-    validation_errors = list(parse_errors)
-    if expression:
-        result = validate_expression(expression)
-        if not result.valid:
-            validation_errors.append(result.error or "unknown grammar error")
-            retry_context = f"Column: {column}, Entity: {entity_name}"
-            if relevant_sql:
-                retry_context += (
-                    "\n\nStatements found in the source that assign this "
-                    f"column (make sure your corrected expression still "
-                    f"reflects all of them):\n{relevant_sql}"
-                )
-            corrected = llm_client.retry_with_error(
-                previous_expression=expression,
-                error=result.error or "invalid syntax",
-                context=retry_context,
-            )
-            corrected_option, corrected_expr, corrected_dt_json, corrected_errors = _interpret_llm_output(corrected)
-            if corrected_expr:
-                corrected_expr = _normalize_expression(corrected_expr)
-            retry_result = validate_expression(corrected_expr) if corrected_expr else None
-            if retry_result and retry_result.valid:
-                derivation_option, expression, decision_table_json = (
-                    corrected_option,
-                    corrected_expr,
-                    corrected_dt_json,
-                )
-                validation_errors = []
+    for attempt in range(_MAX_GENERATION_ATTEMPTS):
+        derivation_option, expression, decision_table_json, parse_errors = _interpret_llm_output(raw_output)
+        if expression:
+            expression = _normalize_expression(expression)
+
+        attempt_errors = list(parse_errors)
+
+        if expression and not attempt_errors:
+            grammar_result = validate_expression(expression)
+            if not grammar_result.valid:
+                attempt_errors.append(f"Grammar validation failed: {grammar_result.error}")
             else:
-                validation_errors.append("retry also failed validation")
+                semantic_result = check_semantic_consistency(
+                    expression, column, entity_name, relevant_chunks, obj.raw_sql
+                )
+                if not semantic_result.passed:
+                    attempt_errors.extend(f"Semantic validation: {e}" for e in semantic_result.errors)
+
+        if not attempt_errors:
+            validation_errors = []
+            break
+
+        validation_errors = attempt_errors
+        if attempt == _MAX_GENERATION_ATTEMPTS - 1:
+            break
+
+        retry_context = f"Column: {column}, Entity: {entity_name}"
+        if relevant_sql:
+            retry_context += (
+                "\n\nStatements found in the source that assign this "
+                f"column (make sure your corrected expression still "
+                f"reflects all of them):\n{relevant_sql}"
+            )
+        if rag_context:
+            retry_context += f"\n\nRelevant platform/domain reference:\n{rag_context}"
+
+        raw_output = llm_client.retry_with_error(
+            previous_expression=expression or raw_output,
+            error="; ".join(attempt_errors),
+            context=retry_context,
+        )
 
     confidence = info.confidence if not validation_errors else min(info.confidence, 0.3)
     status = DDStatus.PENDING_REVIEW if validation_errors else DDStatus.ACTIVE
@@ -433,6 +568,9 @@ def _generate_for_column(
     for eff_date, is_real_mapping in effective_dates:
         row_confidence = confidence if is_real_mapping else min(confidence, 0.5)
         row_status = status if is_real_mapping else DDStatus.PENDING_REVIEW
+        row_validation_errors = list(validation_errors)
+        if not is_real_mapping:
+            row_validation_errors.append(_SYNTHETIC_DATE_REVIEW_NOTE)
         rows.append(
             DDRow(
                 entity_name=entity_name,
@@ -447,7 +585,7 @@ def _generate_for_column(
                 source_chain_id=canonical_model.chain_id,
                 source_object_ids=[obj.object_id],
                 confidence=row_confidence,
-                validation_errors=validation_errors,
+                validation_errors=row_validation_errors,
             )
         )
     return rows

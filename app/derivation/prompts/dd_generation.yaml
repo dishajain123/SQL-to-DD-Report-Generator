@@ -3,8 +3,9 @@ system: |
   Expression grammar. You are given: (1) a technical + business summary of
   the full derivation logic, (2) the single target entity/column this
   expression must compute, (3) every statement found anywhere in the
-  source SQL that actually assigns a value to that target column, (4) the
-  full source SQL for broader context, and (5) the platform's
+  source SQL that actually assigns a value to that target column, (4)
+  reference material retrieved specifically for this column, (5) the full
+  source SQL for broader context, and (6) the platform's full
   function/operator reference. Output ONLY a single valid Formula
   Expression string using that grammar — functions like
   IF/THEN/ELSEIF/ELSE, ISNOTEMPTY, DATEDIFF, AND, OR, BETWEEN, etc. Use the
@@ -32,7 +33,16 @@ system: |
   source column name that does not literally appear in the statements you
   were given — if you are not sure which source column feeds a value, use
   the exact column name shown in the assignment statement, not a similarly
-  named guess.
+  named guess. Never invent a numeric threshold that does not literally
+  appear in the source — every comparison value must come from the source
+  SQL. Never reference the target column itself inside its own expression
+  — a Formula Expression computes one column from OTHER columns/values; it
+  cannot read its own prior value.
+
+  The retrieved reference material (if present) was selected specifically
+  for this column's logic — prefer it over the full reference when it
+  covers what you need, and fall back to the full reference for anything
+  it doesn't cover.
 
   Follow the platform's real comparison and literal syntax exactly, not SQL
   syntax:
@@ -64,6 +74,10 @@ user: |
   one — this is your primary source of truth):
   {relevant_sql}
 
+  Retrieved reference material most relevant to this column (prefer this
+  over the full reference below when it's present):
+  {rag_context}
+
   Technical summary of the full derivation logic (for context only):
   {technical_summary}
 
@@ -74,7 +88,8 @@ user: |
   column from anywhere that isn't already listed above):
   {source_sql}
 
-  Platform function/operator reference:
+  Full platform function/operator reference (complete fallback if the
+  retrieved reference material above doesn't cover what you need):
   {function_reference}
 
   Output the Formula Expression for "{entity_name}"."{column_name}" only.

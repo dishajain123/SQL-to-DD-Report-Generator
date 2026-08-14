@@ -27,6 +27,18 @@ _CONFIDENCE_REVIEW_THRESHOLD = 0.7
 _MAX_NOTE_LENGTH = 200
 
 
+def _flatten_for_table_cell(text: str) -> str:
+    """Markdown table cells cannot contain a literal newline (it would
+    prematurely terminate that row and corrupt every row after it) or an
+    unescaped pipe character (it would be parsed as a new column
+    boundary). This collapses arbitrary text into a single render-safe
+    line -- it never changes the underlying stored/exported value (the
+    DDRow itself, and the Excel export, are unaffected), only how the text
+    is displayed in this Markdown table."""
+    flattened = " ".join(text.split())
+    return flattened.replace("|", "\\|")
+
+
 def generate_report(
     job_plan: JobPlan,
     canonical_models: list[CanonicalModel],
@@ -39,10 +51,6 @@ def generate_report(
     lines: list[str] = []
     lines.append(f"# DD Automation Report — Job {job_plan.job_id}")
     lines.append("")
-    lines.append(f"**Company:** {job_plan.company}  ")
-    lines.append(f"**Platform:** {job_plan.platform}  ")
-    lines.append(f"**Intent:** {job_plan.intent.value}  ")
-    lines.append("")
 
     dd_by_chain: dict[str, list[DDRow]] = {}
     for row in dd_rows:
@@ -50,9 +58,7 @@ def generate_report(
 
     for model in canonical_models:
         object_names = [objects[oid].name if oid in objects else oid for oid in model.object_ids]
-        lines.append(f"## Lineage Chain: {model.chain_id}")
-        lines.append("")
-        lines.append(f"**Objects in this chain:** {', '.join(object_names)}")
+        lines.append(f"## {', '.join(object_names)}")
         lines.append("")
         lines.append("### Technical Summary")
         lines.append(model.technical_summary)
@@ -80,13 +86,17 @@ def generate_report(
             lines.append("")
             lines.append("### DD Conditions")
             lines.append("")
-            lines.append("| Entity | Column | Option | Expression | Effective Start Date | Status |")
-            lines.append("|---|---|---|---|---|---|")
+            lines.append("| Entity | Column | Option | Expression | Effective Start Date | Status | Review Notes |")
+            lines.append("|---|---|---|---|---|---|---|")
             for dd in chain_dd_rows:
                 expr = dd.display_derivation_expression or "(see Decision Table Json)"
+                expr = _flatten_for_table_cell(expr)
+                review_notes = (
+                    _flatten_for_table_cell("; ".join(dd.validation_errors)) if dd.validation_errors else ""
+                )
                 lines.append(
                     f"| {dd.entity_name} | {dd.column_name} | {dd.derivation_option.value} "
-                    f"| `{expr}` | {dd.effective_start_date} | {dd.status.value} |"
+                    f"| `{expr}` | {dd.effective_start_date} | {dd.status.value} | {review_notes} |"
                 )
             lines.append("")
         else:

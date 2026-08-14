@@ -353,6 +353,7 @@ class LLMClient:
         column_name: str = "",
         entity_name: str = "",
         relevant_sql: str = "",
+        rag_context: str = "",
     ) -> str:
         prompts = _load_prompts()
         user = _render_prompt(
@@ -367,6 +368,10 @@ class LLMClient:
                 "(No specific assignment statements were isolated automatically "
                 "-- search the full source SQL below for every place this "
                 "column is assigned.)"
+            ),
+            rag_context=rag_context.strip() or (
+                "(No specific reference material was retrieved for this "
+                "column -- rely on the full platform reference below.)"
             ),
         )
         return self._complete(prompts["dd_generation_system"], user, max_tokens=min(self.max_new_tokens, 512))

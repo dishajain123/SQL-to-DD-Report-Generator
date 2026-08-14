@@ -4,7 +4,7 @@ only runs when the intent actually requires it (architecture step 3/12).
 """
 from __future__ import annotations
 
-from typing import Any, TypedDict
+from typing import Any, Optional, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
@@ -18,6 +18,7 @@ from app.models.core import JobPlan, SQLObject
 from app.parsing.dialect import detect_dialect
 from app.parsing.object_splitter import split_objects
 from app.parsing.structural_analysis import analyze_object
+from app.rag.chroma_store import ChromaStore
 from app.report.excel_export import export_dd_rows
 from app.report.report_generator import generate_report
 from app.utils import db
@@ -104,7 +105,9 @@ def node_canonical_models(state: PipelineState, llm_client: LLMClient) -> Pipeli
     return state
 
 
-def node_dd_generation(state: PipelineState, llm_client: LLMClient) -> PipelineState:
+def node_dd_generation(
+    state: PipelineState, llm_client: LLMClient, rag_store: Optional[ChromaStore] = None
+) -> PipelineState:
     all_rows = []
     for chain, model in zip(state["chains"], state["canonical_models"]):
         rows = generate_dd_rows(
@@ -115,6 +118,7 @@ def node_dd_generation(state: PipelineState, llm_client: LLMClient) -> PipelineS
             llm_client=llm_client,
             function_reference=state.get("function_reference", ""),
             entity_name_map=state.get("entity_name_map"),
+            rag_store=rag_store,
         )
         for row in rows:
             guardrail_result = check_dd_row(row, model)
@@ -163,8 +167,24 @@ def _requires_dd_generation(state: PipelineState) -> str:
     return "generate_dd" if state["job_plan"].requires_dd_generation else "skip_dd"
 
 
-def build_pipeline(llm_client: LLMClient | None = None) -> Any:
+def _build_default_rag_store() -> Optional[ChromaStore]:
+    """RAG is a targeting aid layered on top of the existing full-reference
+    behavior (see app/derivation/dd_generator.py::_retrieve_rag_context),
+    not a hard dependency -- if Chroma can't be initialized for any reason
+    (no persist directory yet, environment issue, etc.), the pipeline must
+    keep working exactly as it did before RAG was wired in, just without
+    the extra retrieval step."""
+    try:
+        return ChromaStore()
+    except Exception as exc:  # pragma: no cover - defensive: RAG must never block startup
+        logger.warning("Could not initialize the RAG store, continuing without it: %s", exc)
+        return None
+
+
+def build_pipeline(llm_client: LLMClient | None = None, rag_store: ChromaStore | None = None) -> Any:
     llm_client = llm_client or LLMClient()
+    if rag_store is None:
+        rag_store = _build_default_rag_store()
 
     graph = StateGraph(PipelineState)
     graph.add_node("split_and_parse", node_split_and_parse)
@@ -172,7 +192,7 @@ def build_pipeline(llm_client: LLMClient | None = None) -> Any:
     graph.add_node("smart_chunking", node_smart_chunking)
     graph.add_node("lineage", node_lineage)
     graph.add_node("canonical_models", lambda state: node_canonical_models(state, llm_client))
-    graph.add_node("generate_dd", lambda state: node_dd_generation(state, llm_client))
+    graph.add_node("generate_dd", lambda state: node_dd_generation(state, llm_client, rag_store))
     graph.add_node("skip_dd", node_skip_dd_generation)
     graph.add_node("report_and_export", node_report_and_export)
 

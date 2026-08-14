@@ -28,6 +28,8 @@ class MockLLMClient:
         function_reference,
         column_name="",
         entity_name="",
+        relevant_sql="",
+        rag_context="",
     ) -> str:
         return (
             'IF(ISNOTEMPTY("FCT_NPA_PRODUCT"."OverDueSinceDt"))'
