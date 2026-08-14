@@ -11,9 +11,16 @@ Effective Start Date) are replaced, not duplicated. This matters because a
 DD Excel is a living document — re-running the pipeline on one changed
 procedure should not wipe out everything else the team has already
 reviewed and accepted.
+
+The existing DD export can be supplied either as a real .xlsx/.xlsm
+workbook or as a .csv export of the exact same column schema (e.g. a CSV
+saved out of Excel) — both are read into the same internal row shape before
+merging, so which format the platform's own DD export happens to be saved
+in does not matter as long as the column names/order match.
 """
 from __future__ import annotations
 
+import csv
 from pathlib import Path
 
 import openpyxl
@@ -49,6 +56,10 @@ _COLUMN_KEYS = {
     "Conditional Json": "conditional_json",
 }
 
+# File extensions treated as CSV-style exports of the Derivations schema,
+# rather than real spreadsheet workbooks.
+_CSV_EXTENSIONS = {".csv"}
+
 
 def dd_row_to_dict(dd: DDRow) -> dict:
     return {
@@ -69,14 +80,7 @@ def _row_key(row: dict) -> tuple:
     return (row["entity_name"], row["column_name"], row["effective_start_date"])
 
 
-def read_existing_dd_excel(path: str | Path) -> list[dict]:
-    """Read an existing DD Excel export back into plain dict rows, keyed the
-    same way dd_row_to_dict produces them, so it can be merged against new
-    rows. Returns [] if the file doesn't exist yet (first run)."""
-    path = Path(path)
-    if not path.exists():
-        return []
-
+def _read_existing_dd_xlsx(path: Path) -> list[dict]:
     wb = openpyxl.load_workbook(path)
     ws = wb.active
     header = [cell.value for cell in ws[1]]
@@ -85,6 +89,35 @@ def read_existing_dd_excel(path: str | Path) -> list[dict]:
         row_dict = dict(zip(header, row_cells))
         rows.append({_COLUMN_KEYS[h]: row_dict.get(h, "") for h in COLUMNS if h in _COLUMN_KEYS})
     return rows
+
+
+def _read_existing_dd_csv(path: Path) -> list[dict]:
+    rows = []
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        for row_dict in reader:
+            rows.append(
+                {_COLUMN_KEYS[h]: (row_dict.get(h) or "") for h in COLUMNS if h in _COLUMN_KEYS}
+            )
+    return rows
+
+
+def read_existing_dd_excel(path: str | Path) -> list[dict]:
+    """Read an existing DD export back into plain dict rows, keyed the same
+    way dd_row_to_dict produces them, so it can be merged against new rows.
+
+    Accepts either a real .xlsx/.xlsm workbook or a .csv export of the same
+    column schema (matched purely by file extension — the column
+    names/order in the file are what actually define compatibility, not
+    the container format). Returns [] if the file doesn't exist yet (first
+    run)."""
+    path = Path(path)
+    if not path.exists():
+        return []
+
+    if path.suffix.lower() in _CSV_EXTENSIONS:
+        return _read_existing_dd_csv(path)
+    return _read_existing_dd_xlsx(path)
 
 
 def merge_dd_rows(existing: list[dict], new_rows: list[DDRow]) -> list[dict]:

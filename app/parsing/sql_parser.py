@@ -5,6 +5,17 @@ Statement splitting is done with a quote/paren-aware character scan rather
 than a naive semicolon split, because subquery text can itself contain
 identifiers that look like keywords. Semicolons only terminate a real
 statement when they sit at paren-depth 0 and outside any quoted string.
+
+A procedural control-flow header (`IF ... THEN`, `ELSIF ... THEN`, `ELSE`,
+`BEGIN`, or an exception handler's `EXCEPTION` / `WHEN ... THEN`) has no
+semicolon of its own, so pure semicolon-splitting glues it onto whatever
+DML statement follows as a single blob. Left alone, that blob's leading
+word is the control-flow keyword, so it gets classified as CONTROL_FLOW
+instead of its real statement type, and the DML statement inside it -- and
+every column it assigns -- is silently invisible to every later stage
+(structural analysis, smart chunking, DD row generation). A dedicated pass
+after the semicolon split peels any such header off, so both halves are
+correctly classified and analyzed.
 """
 from __future__ import annotations
 
@@ -19,6 +30,13 @@ _DML_KEYWORDS = ("SELECT", "UPDATE", "MERGE", "INSERT", "DELETE")
 _CONTROL_KEYWORDS = ("IF", "BEGIN", "EXCEPTION", "DECLARE", "END", "CASE", "LOOP")
 
 _SQLGLOT_DIALECT = {Dialect.ORACLE: "oracle", Dialect.MYSQL: "mysql"}
+
+# Headers that are complete on their own (nothing to search for beyond the
+# keyword itself) -- the split point is right after the keyword.
+_HEADER_ONLY_KEYWORDS = ("ELSE", "EXCEPTION", "BEGIN")
+# Headers that continue up through a "THEN" -- the split point is right
+# after the first top-level THEN following the keyword.
+_HEADER_THEN_KEYWORDS = ("IF", "ELSIF", "ELSEIF", "WHEN")
 
 
 def split_statements(raw_sql: str) -> list[str]:
@@ -79,7 +97,140 @@ def split_statements(raw_sql: str) -> list[str]:
     if tail:
         statements.append(tail)
 
-    return statements
+    return _split_glued_control_flow(statements)
+
+
+def _split_glued_control_flow(statements: list[str]) -> list[str]:
+    """Peel any leading control-flow header off of each statement,
+    emitting the header and the real statement as separate list entries.
+    Applies repeatedly per statement so multiple stacked headers (for
+    example `EXCEPTION` immediately followed by `WHEN OTHERS THEN`) are
+    each split out on their own, the same way regardless of which
+    procedure or how many headers happen to be glued together.
+    """
+    result: list[str] = []
+    for stmt in statements:
+        remainder = stmt
+        while remainder:
+            lead = _leading_keyword_ignoring_comments(remainder)
+
+            if lead in _HEADER_ONLY_KEYWORDS:
+                header_end = _leading_keyword_end_index(remainder)
+                if header_end == -1:
+                    break
+                header = remainder[:header_end]
+                rest = remainder[header_end:].strip()
+                result.append(header)
+                remainder = rest
+                continue
+
+            if lead in _HEADER_THEN_KEYWORDS:
+                search_start = _leading_keyword_end_index(remainder)
+                if search_start == -1:
+                    break
+                then_end = _find_top_level_keyword(remainder, "THEN", start=search_start)
+                if then_end == -1:
+                    break
+                header = remainder[:then_end]
+                rest = remainder[then_end:].strip()
+                result.append(header)
+                remainder = rest
+                continue
+
+            break
+
+        if remainder:
+            result.append(remainder)
+
+    return result
+
+
+def _leading_keyword_end_index(text: str) -> int:
+    """Return the index in `text` right after its leading keyword (past any
+    leading comments/whitespace), or -1 if there is no leading keyword."""
+    pos = 0
+    n = len(text)
+    while pos < n:
+        ch = text[pos]
+        if ch.isspace():
+            pos += 1
+        elif text[pos : pos + 2] == "--":
+            nl = text.find("\n", pos)
+            pos = n if nl == -1 else nl + 1
+        elif text[pos : pos + 2] == "/*":
+            end = text.find("*/", pos + 2)
+            pos = n if end == -1 else end + 2
+        else:
+            break
+    match = re.match(r"[A-Za-z]+", text[pos:])
+    if not match:
+        return -1
+    return pos + len(match.group(0))
+
+
+def _find_top_level_keyword(text: str, keyword: str, start: int = 0) -> int:
+    """Return the index right after the first case-insensitive, word-
+    boundary occurrence of `keyword` in `text` starting from `start`,
+    respecting quoted strings and comments so a keyword inside a string
+    literal or comment is never matched. Returns -1 if not found."""
+    n = len(text)
+    i = start
+    in_single = False
+    in_double = False
+    in_line_comment = False
+    in_block_comment = False
+    kw_upper = keyword.upper()
+    kw_len = len(keyword)
+    while i < n:
+        ch = text[i]
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+        if in_block_comment:
+            if ch == "*" and i + 1 < n and text[i + 1] == "/":
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+        if in_single:
+            if ch == "'" and not (i + 1 < n and text[i + 1] == "'"):
+                in_single = False
+            elif ch == "'" and i + 1 < n and text[i + 1] == "'":
+                i += 1
+            i += 1
+            continue
+        if in_double:
+            if ch == '"':
+                in_double = False
+            i += 1
+            continue
+        if ch == "-" and i + 1 < n and text[i + 1] == "-":
+            in_line_comment = True
+            i += 2
+            continue
+        if ch == "/" and i + 1 < n and text[i + 1] == "*":
+            in_block_comment = True
+            i += 2
+            continue
+        if ch == "'":
+            in_single = True
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            i += 1
+            continue
+        if text[i : i + kw_len].upper() == kw_upper:
+            before_ok = i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")
+            after_idx = i + kw_len
+            after_ok = after_idx >= n or not (text[after_idx].isalnum() or text[after_idx] == "_")
+            if before_ok and after_ok:
+                return after_idx
+        i += 1
+    return -1
 
 
 def classify_statement(stmt_text: str) -> str:
@@ -92,6 +243,12 @@ def classify_statement(stmt_text: str) -> str:
     if first_word in _CONTROL_KEYWORDS:
         return "CONTROL_FLOW"
     return "OTHER"
+
+
+def _leading_keyword_ignoring_comments(text: str) -> str:
+    stripped = _strip_leading_comments(text)
+    match = re.match(r"[A-Za-z]+", stripped)
+    return match.group(0).upper() if match else ""
 
 
 def _strip_leading_comments(text: str) -> str:

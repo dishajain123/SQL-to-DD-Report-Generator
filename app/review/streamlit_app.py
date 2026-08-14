@@ -117,6 +117,20 @@ def _get_json(url: str) -> tuple[int, dict]:
         raise RuntimeError(f"Could not reach the API at {url}: {reason}") from exc
 
 
+def _get_bytes(url: str) -> tuple[int, bytes]:
+    """Like _get_json, but for binary/text file downloads (e.g. the
+    Business Understanding report) instead of JSON API responses."""
+    req = request.Request(url, method="GET")
+    try:
+        with request.urlopen(req, timeout=60) as resp:
+            return resp.status, resp.read()
+    except error.HTTPError as exc:
+        return exc.code, exc.read()
+    except (error.URLError, TimeoutError, socket.timeout) as exc:
+        reason = getattr(exc, "reason", str(exc))
+        raise RuntimeError(f"Could not reach the API at {url}: {reason}") from exc
+
+
 def _wait_for_job(api_base_url: str, job_id: str, max_wait_seconds: int = 1800) -> dict:
     status_url = api_base_url.rstrip("/") + f"/api/jobs/{job_id}/status"
     start = time.monotonic()
@@ -139,6 +153,40 @@ def _wait_for_job(api_base_url: str, job_id: str, max_wait_seconds: int = 1800) 
             )
 
         time.sleep(2)
+
+
+def _render_business_understanding_download(api_base_url: str, job_id: str, final_status: dict) -> None:
+    """Fetch the generated Business Understanding report from the new
+    /api/jobs/{job_id}/report endpoint and offer it as a download.
+
+    Only attempted once the job has actually COMPLETED and a report_path
+    was recorded, since the report file will not exist otherwise.
+    """
+    if str(final_status.get("status", "")).upper() != "COMPLETED":
+        return
+    if not final_status.get("report_path"):
+        return
+
+    report_url = api_base_url.rstrip("/") + f"/api/jobs/{job_id}/report"
+    try:
+        report_status, report_bytes = _get_bytes(report_url)
+    except RuntimeError as exc:
+        _log(f"Could not fetch the Business Understanding report: {exc}")
+        st.warning(f"Could not fetch the Business Understanding report: {exc}")
+        return
+
+    if report_status >= 400:
+        _log(f"Report download endpoint returned HTTP {report_status}.")
+        st.warning("The Business Understanding report is not available for download yet.")
+        return
+
+    st.download_button(
+        label="Download Business Understanding Report",
+        data=report_bytes,
+        file_name=f"business_understanding_{job_id}.md",
+        mime="text/markdown",
+        key=f"download-report-{job_id}",
+    )
 
 
 def _render_submission_tab() -> None:
@@ -252,6 +300,7 @@ def _render_submission_tab() -> None:
         st.error(f"Job {job_id} failed: {final_status.get('error_message', 'Unknown error')}")
     else:
         st.success(f"Job submitted successfully: {job_id}")
+        _render_business_understanding_download(api_base_url, job_id, final_status)
 
     st.json(final_status)
     st.session_state["last_submission"] = final_status

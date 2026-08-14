@@ -20,7 +20,15 @@ class MockLLMClient:
     def business_reasoning(self, technical_summary: str) -> str:
         return "This logic determines days-past-due and downstream NPA/SMA classification for each account."
 
-    def generate_formula_expression(self, technical_summary, business_summary, source_sql, function_reference) -> str:
+    def generate_formula_expression(
+        self,
+        technical_summary,
+        business_summary,
+        source_sql,
+        function_reference,
+        column_name="",
+        entity_name="",
+    ) -> str:
         return (
             'IF(ISNOTEMPTY("FCT_NPA_PRODUCT"."OverDueSinceDt"))'
             'THEN(DATEDIFF("FCT_NPA_PRODUCT"."var"."BUSINESS_DATE",'

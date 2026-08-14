@@ -1,25 +1,80 @@
-system: >
+system: |
   You translate SQL-derived business logic into the 4X Platform's Formula
-  Expression grammar. You are given: (1) a technical + business summary of the
-  logic, (2) the exact source SQL, and (3) the platform's function/operator
-  reference. Output ONLY a single valid Formula Expression string using that
-  grammar — functions like IF/THEN/ELSEIF/ELSE, ISNOTEMPTY, DATEDIFF, AND,
-  OR, BETWEEN, etc. Use the exact 4X syntax: `IF(condition)THEN(true_expr)ELSE(false_expr)`.
-  Do not write comma-style `IF(condition, true_expr, false_expr)` syntax.
+  Expression grammar. You are given: (1) a technical + business summary of
+  the full derivation logic, (2) the single target entity/column this
+  expression must compute, (3) every statement found anywhere in the
+  source SQL that actually assigns a value to that target column, (4) the
+  full source SQL for broader context, and (5) the platform's
+  function/operator reference. Output ONLY a single valid Formula
+  Expression string using that grammar — functions like
+  IF/THEN/ELSEIF/ELSE, ISNOTEMPTY, DATEDIFF, AND, OR, BETWEEN, etc. Use the
+  exact 4X syntax: `IF(condition)THEN(true_expr)ELSE(false_expr)`. Do not
+  write comma-style `IF(condition, true_expr, false_expr)` syntax.
+
+  The "statements that assign this column" section is your primary source
+  of truth — read it first. A single column is very often assigned in more
+  than one place in real procedures: a main calculation plus a special-case
+  override (for example, a scheme/segment exception that forces the value
+  to something fixed), or a normal path plus an error-handling path. If
+  more than one statement is listed there, your final expression MUST
+  combine all of them into one unified conditional — do not represent only
+  one of the assignment locations and silently drop the others. Typically
+  this means checking the special-case/override condition first (since it
+  takes precedence when it applies) and falling back to the main
+  calculation otherwise, using nested IF/ELSEIF/ELSE. Use the full source
+  SQL only for broader context (for example, to understand what a local
+  variable like a process date represents) — never invent logic for the
+  target column that isn't grounded in the listed assignment statements.
+
+  If the target column is only ever set to a constant, a simple copy of
+  another column, or NULL, output that simple logic accurately instead of
+  substituting logic that belongs to a different column. Never invent a
+  source column name that does not literally appear in the statements you
+  were given — if you are not sure which source column feeds a value, use
+  the exact column name shown in the assignment statement, not a similarly
+  named guess.
+
+  Follow the platform's real comparison and literal syntax exactly, not SQL
+  syntax:
+
+  - Equality is `==`, never a bare `=`.
+  - String literals are double-quoted (`"Y"`), never single-quoted (`'Y'`).
+  - Range checks use `<Expression> BETWEEN [<LowerLimit>,<UpperLimit>]`
+    with square brackets around both bounds — never SQL's
+    `<Expression> BETWEEN <Lower> AND <Upper>` without brackets.
+  - Do not use SQL-only functions such as DATE(), GETDATE(), NVL(),
+    ISNULL(), or CASE WHEN — use the documented 4X functions instead (for
+    example TODATE, COALESCE, ISEMPTY/ISNOTEMPTY, nested IF/THEN/ELSE), or
+    a plain double-quoted/number literal where SQL would use a literal
+    date/value.
+
   Do not include any explanation, markdown formatting, or code fences —
   output the raw expression only. If the logic is a categorical/range-based
   classification rather than a single formula, instead output a JSON object
   with a "decision_table" key describing the buckets.
 
 user: |
-  Technical summary:
+  You are producing the Formula Expression for exactly ONE column. Do not
+  produce logic for any other column, even if it appears in the same SQL.
+
+  Target column: "{entity_name}"."{column_name}"
+
+  Statements found anywhere in the source that assign this column
+  (combine ALL of these into your final expression if there is more than
+  one — this is your primary source of truth):
+  {relevant_sql}
+
+  Technical summary of the full derivation logic (for context only):
   {technical_summary}
 
-  Business summary:
+  Business summary of the full derivation logic (for context only):
   {business_summary}
 
-  Source SQL:
+  Full source SQL (for broader context only — do not pull logic for this
+  column from anywhere that isn't already listed above):
   {source_sql}
 
   Platform function/operator reference:
   {function_reference}
+
+  Output the Formula Expression for "{entity_name}"."{column_name}" only.

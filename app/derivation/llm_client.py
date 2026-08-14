@@ -345,7 +345,14 @@ class LLMClient:
         return self._complete(prompts["business_reasoning_system"], user)
 
     def generate_formula_expression(
-        self, technical_summary: str, business_summary: str, source_sql: str, function_reference: str
+        self,
+        technical_summary: str,
+        business_summary: str,
+        source_sql: str,
+        function_reference: str,
+        column_name: str = "",
+        entity_name: str = "",
+        relevant_sql: str = "",
     ) -> str:
         prompts = _load_prompts()
         user = _render_prompt(
@@ -354,6 +361,13 @@ class LLMClient:
             business_summary=business_summary,
             source_sql=source_sql,
             function_reference=function_reference,
+            column_name=column_name,
+            entity_name=entity_name,
+            relevant_sql=relevant_sql.strip() or (
+                "(No specific assignment statements were isolated automatically "
+                "-- search the full source SQL below for every place this "
+                "column is assigned.)"
+            ),
         )
         return self._complete(prompts["dd_generation_system"], user, max_tokens=min(self.max_new_tokens, 512))
 

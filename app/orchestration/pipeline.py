@@ -140,6 +140,7 @@ def node_report_and_export(state: PipelineState) -> PipelineState:
         job_plan, state["canonical_models"], state.get("dd_rows", []),
         output_path=f"output/{job_plan.job_id}/report.md",
         objects=state["objects"],
+        structural_infos=state.get("structural_infos"),
     )
     state["report_path"] = str(report_path)
 

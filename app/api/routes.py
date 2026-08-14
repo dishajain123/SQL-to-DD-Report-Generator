@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import uuid
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi.responses import FileResponse
 
 from app.api.schemas import JobSubmitRequest, JobSubmitResponse
 from app.guardrails.input_guardrails import check_input_file, check_job_plan
@@ -92,3 +94,44 @@ def get_job_status(job_id: str) -> dict:
     job["dd_row_count"] = dd_row_count
     job["pending_review_count"] = pending
     return job
+
+
+@router.get("/jobs/{job_id}/report")
+def download_business_understanding_report(job_id: str) -> FileResponse:
+    """Stream back the generated combined report (technical + Business
+    Understanding + derivation summary) for a job so the frontend can offer
+    it as a downloadable file.
+
+    The report is produced by app.report.report_generator.generate_report()
+    and its on-disk path is persisted on the job row (`report_path`). This
+    endpoint is the piece that was previously missing: the job status
+    endpoint only ever exposed that path as a string, never the file's
+    actual contents, so there was nothing for the frontend to download.
+    """
+    with db.get_connection() as conn:
+        row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job = dict(row)
+    status = job.get("status")
+    report_path = job.get("report_path")
+
+    if status != "COMPLETED":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Report is not available yet (job status: {status})",
+        )
+
+    if not report_path:
+        raise HTTPException(status_code=404, detail="No report was generated for this job")
+
+    path = Path(report_path)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Report file no longer exists on the server")
+
+    return FileResponse(
+        path=path,
+        media_type="text/markdown",
+        filename=f"business_understanding_{job_id}.md",
+    )

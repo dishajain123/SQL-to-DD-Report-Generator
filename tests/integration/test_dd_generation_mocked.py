@@ -82,7 +82,16 @@ def test_dd_generation_normalizes_legacy_comma_style_if(
         def business_reasoning(self, technical_summary: str) -> str:
             return mock_llm_client.business_reasoning(technical_summary)
 
-        def generate_formula_expression(self, technical_summary, business_summary, source_sql, function_reference) -> str:
+        def generate_formula_expression(
+            self,
+            technical_summary,
+            business_summary,
+            source_sql,
+            function_reference,
+            column_name="",
+            entity_name="",
+            relevant_sql="",
+        ) -> str:
             return 'IF(p_TIMEKEY > 26267, 1, 0)'
 
         def retry_with_error(self, previous_expression, error, context) -> str:
