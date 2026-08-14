@@ -1,0 +1,70 @@
+// Grammar for the 4X Platform Formula Expression language, transcribed from
+// the platform's function/operator reference document.
+// Covers: IF/THEN/ELSEIF/ELSE, the documented function library, and all
+// documented operators (logical, comparison, arithmetic, membership).
+
+?start: if_expr
+      | expr
+
+if_expr: "IF" "(" expr ")" "THEN" "(" expr ")" elseif_clause* else_clause?
+
+elseif_clause: "ELSEIF" "(" expr ")" "THEN" "(" expr ")"
+else_clause: "ELSE" "(" expr ")"
+
+?expr: or_expr
+
+?or_expr: and_expr
+        | "OR" "(" expr ("," expr)+ ")" -> or_call
+        | or_expr "OR" and_expr        -> or_op
+
+?and_expr: not_expr
+         | "AND" "(" expr ("," expr)+ ")" -> and_call
+         | and_expr "AND" not_expr        -> and_op
+
+?not_expr: "NOT" "(" expr ")" -> not_op
+         | comparison
+
+?comparison: membership
+           | comparison COMP_OP membership -> compare
+
+membership: arith
+          | arith MEMBERSHIP_OP "[" value_list "]"
+          | arith "BETWEEN" "[" arith "," arith "]" -> between_op
+
+?arith: term
+      | arith "+" term -> add
+      | arith "-" term -> sub
+
+?term: factor
+     | term "*" factor -> mul
+     | term "/" factor -> div
+
+?factor: atom
+       | "-" atom -> neg
+
+?atom: function_call
+     | column_ref
+     | STRING
+     | NUMBER
+     | if_expr
+     | "(" expr ")"
+
+function_call: FUNC_NAME "(" [arg_list] ")"
+arg_list: expr ("," expr)*
+
+column_ref: STRING ("." STRING)*
+          | NAME
+
+value_list: value ("," value)*
+value: STRING | NUMBER
+
+COMP_OP: "==" | "!=" | ">=" | "<=" | ">" | "<"
+MEMBERSHIP_OP: "NOTIN" | "IN" | "HRCHYNOTIN" | "HRCHYIN" | "CONTAINS" | "BEGINSWITH" | "ENDSWITH" | "DOESNOTCONTAINS"
+
+FUNC_NAME: /(?!(?:AND|OR|NOT|IF|THEN|ELSE|ELSEIF|BETWEEN|IN|NOTIN|HRCHYIN|HRCHYNOTIN|CONTAINS|BEGINSWITH|ENDSWITH|DOESNOTCONTAINS)\b)[A-Za-z_][A-Za-z0-9_]*/
+
+%import common.CNAME -> NAME
+%import common.ESCAPED_STRING -> STRING
+%import common.SIGNED_NUMBER -> NUMBER
+%import common.WS
+%ignore WS
