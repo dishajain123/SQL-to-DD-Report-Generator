@@ -32,6 +32,7 @@ class _FakeTransport:
             {
                 "url": req.full_url,
                 "model": payload["model"],
+                "max_tokens": payload["max_tokens"],
                 "headers": dict(req.headers),
             }
         )
@@ -75,6 +76,7 @@ def test_llm_client_uses_openai_endpoint_and_model():
     assert result == "fallback ok"
     assert transport.calls[0]["url"] == "https://api.openai.com/v1/chat/completions"
     assert transport.calls[0]["model"] == "gpt-4.1"
+    assert transport.calls[0]["max_tokens"] == 768
     assert transport.calls[0]["headers"]["Authorization"] == "Bearer test-key"
 
 
@@ -92,3 +94,27 @@ def test_llm_client_falls_back_when_primary_model_is_blocked():
 
     assert result == "fallback ok"
     assert [call["model"] for call in transport.calls] == ["gpt-4.1", "gpt-4o-mini"]
+
+
+def test_llm_client_uses_configured_max_tokens_for_formula_generation():
+    transport = _FakeTransport()
+    client = LLMClient(
+        provider="openai",
+        api_key="test-key",
+        model="gpt-4.1",
+        base_url="https://api.openai.com/v1",
+        transport=transport,
+        max_new_tokens=512,
+    )
+
+    result = client.generate_formula_expression(
+        technical_summary="tech",
+        business_summary="biz",
+        source_sql="select 1",
+        function_reference="ref",
+        column_name="COL",
+        entity_name="ENT",
+    )
+
+    assert result == "fallback ok"
+    assert transport.calls[0]["max_tokens"] == 512

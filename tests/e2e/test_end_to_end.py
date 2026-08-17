@@ -39,6 +39,8 @@ def test_full_pipeline_generate_dd(
 
     # DD generation ran because intent required it
     assert len(result["dd_rows"]) > 0
+    assert any(r.status == DDStatus.ACTIVE for r in result["dd_rows"])
+    assert any(r.advisory_notes for r in result["dd_rows"])
 
     # Report was produced and contains a DD Conditions section
     assert result["report_path"]

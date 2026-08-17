@@ -54,6 +54,7 @@ def test_dd_generation_produces_valid_rows(dpd_calculation_sql, maxdpd_sql, npa_
         assert row.entity_name
         assert row.column_name
         assert row.status in (DDStatus.ACTIVE, DDStatus.PENDING_REVIEW)
+    assert any(row.advisory_notes for row in rows)
 
 
 def test_dd_generation_flags_grammar_failures_for_review(
@@ -70,6 +71,53 @@ def test_dd_generation_flags_grammar_failures_for_review(
     assert len(rows) > 0
     assert all(r.status == DDStatus.PENDING_REVIEW for r in rows)
     assert all(r.validation_errors for r in rows)
+
+
+def test_dd_generation_rejects_truncated_expressions_instead_of_exporting_them(
+    dpd_calculation_sql, maxdpd_sql, npa_date_sql, function_reference
+):
+    class TruncatedLLMClient:
+        def technical_reasoning(self, sql_snippets: list[str]) -> str:
+            return "technical"
+
+        def business_reasoning(self, technical_summary: str) -> str:
+            return "business"
+
+        def generate_formula_expression(
+            self,
+            technical_summary,
+            business_summary,
+            source_sql,
+            function_reference,
+            column_name="",
+            entity_name="",
+            relevant_sql="",
+            rag_context="",
+        ) -> str:
+            return 'IF(ISNOTEMPTY("A"."X"))THEN(("A"."Y") +'
+
+        def retry_with_error(self, previous_expression, error, context) -> str:
+            return 'IF(ISNOTEMPTY("A"."X"))THEN(("A"."Y") +'
+
+    chain, objects, infos = _build_chain(dpd_calculation_sql, maxdpd_sql, npa_date_sql)
+    model = build_canonical_model(chain, "job-int-trunc", objects, infos, TruncatedLLMClient())
+
+    rows = generate_dd_rows(
+        chain=chain,
+        canonical_model=model,
+        objects=objects,
+        structural_infos=infos,
+        llm_client=TruncatedLLMClient(),
+        function_reference=function_reference,
+    )
+
+    assert rows
+    assert all(row.display_derivation_expression == "" for row in rows)
+    assert all(
+        any("Unexpected end-of-input" in error for error in row.validation_errors)
+        for row in rows
+    )
+    assert all(row.status == DDStatus.PENDING_REVIEW for row in rows)
 
 
 def test_dd_generation_normalizes_legacy_comma_style_if(
@@ -113,8 +161,16 @@ def test_dd_generation_normalizes_legacy_comma_style_if(
     assert len(rows) > 0
     # The comma-style IF must always be normalized into valid 4X syntax,
     # regardless of what semantic validation later decides about the
-    # column's completeness -- these are two independent guarantees.
-    assert all("THEN(" in row.display_derivation_expression for row in rows)
+    # column's completeness -- these are two independent guarantees. A row
+    # whose effective period falls entirely on one side of the p_TIMEKEY
+    # threshold is legitimately period-pruned down to just the selected
+    # branch's literal (see app/derivation/period_pruning.py), so "THEN("
+    # is only required to survive on rows that weren't pruned to a bare
+    # literal.
+    assert all(
+        "THEN(" in row.display_derivation_expression or row.display_derivation_expression in ("1", "0")
+        for row in rows
+    )
     assert all("," not in row.display_derivation_expression.split("THEN(", 1)[0] for row in rows)
     assert all("Grammar validation failed" not in " ".join(row.validation_errors) for row in rows)
 

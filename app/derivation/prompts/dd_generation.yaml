@@ -27,6 +27,39 @@ system: |
   variable like a process date represents) — never invent logic for the
   target column that isn't grounded in the listed assignment statements.
 
+  Treat the listed assignment statements as an ordered write sequence, not
+  a bag of snippets. If the source first initializes a column, then later
+  fills NULLs, then later overrides a subset of rows, preserve that
+  sequence explicitly. Do not collapse later fix-up UPDATEs into a generic
+  ELSE(NULL), and do not drop a later override just because an earlier
+  MERGE already set the same column once.
+
+  For source procedures that write the same column in multiple stages
+  (for example a MERGE/USING calculation followed by one or more UPDATE
+  fix-ups), keep the stages separate unless the source SQL itself clearly
+  rewrites them into one single CASE tree. The first stage is the base
+  value, and later UPDATEs are sequential corrections or backfills, not a
+  reason to flatten everything into the first branch.
+
+  When a branch-heavy source condition is expressed as CASE/WHEN or a
+  nested IF inside the source SQL, preserve every branch and every guard in
+  the same logical order. Prefer a more literal translation over an
+  over-simplified one if the simpler version would lose a source branch.
+  Never invent a default branch or threshold when the source does not
+  clearly provide one.
+
+  For MERGE ... USING (SELECT ... ) patterns, keep the logic in two
+  layers:
+  1. The SELECT list / CASE expression inside the USING subquery becomes
+     the value you assign in the THEN branch.
+  2. The USING / ON / WHERE predicates become the outer IF guard that
+     decides whether the assignment applies.
+  Do not bury the guard inside the assigned value and do not turn the
+  assigned value itself into a comparison against the target column.
+  Likewise, if the source SELECT already contains a CASE expression that
+  chooses between two source values, preserve that CASE choice before you
+  apply the outer MERGE guard.
+
   If the target column is only ever set to a constant, a simple copy of
   another column, or NULL, output that simple logic accurately instead of
   substituting logic that belongs to a different column. Never invent a
@@ -99,20 +132,25 @@ system: |
     counter increment. Otherwise, rewrite the branch to use the actual
     source column or a constant/null result from the source SQL.
   - If a listed assignment statement is a plain (non-MERGE) UPDATE whose
-    WHERE clause filters on something other than the target column itself
-    (for example a specific process name or identifier, restricting the
-    statement to one row of a table that multiple different procedures
-    also write), that WHERE condition is a row-scoping guard, not
-    incidental detail — the target table may hold rows for several
-    different processes/owners, and the column's real value depends on
-    which one applies. Include that same scoping condition in your
-    expression (for example
-    `IF("Entity"."ProcessName"=="ThisProcedureName" AND ...)THEN(...)...`)
-    so it does not compute a value for rows this statement never actually
-    touches. A WHERE clause that instead filters on the target column's
-    own current value (a cleanup/normalize pattern like
-    `WHERE Col = DATE'1900-01-01'`) is not this case — that is the
-    calculation's own condition, already covered by the guidance above.
+  WHERE clause filters on something other than the target column itself
+  (for example a specific process name or identifier, restricting the
+  statement to one row of a table that multiple different procedures
+  also write), that WHERE condition is a row-scoping guard, not
+  incidental detail — the target table may hold rows for several
+  different processes/owners, and the column's real value depends on
+  which one applies. Include that same scoping condition in your
+  expression (for example
+  `IF("Entity"."ProcessName"=="ThisProcedureName" AND ...)THEN(...)...`)
+  so it does not compute a value for rows this statement never actually
+  touches. A WHERE clause that instead filters on the target column's
+  own current value (a cleanup/normalize pattern like
+  `WHERE Col = DATE'1900-01-01'`) is not this case — that is the
+  calculation's own condition, already covered by the guidance above.
+
+  - Keep the source qualification of branch guards and value references as
+    faithfully as possible. If the SQL uses another table's alias or a
+    customer/process scoping filter, preserve that guard in the output
+    rather than dropping it to a bare column name.
 
   Do not include any explanation, markdown formatting, or code fences —
   output the raw expression only. If the logic is a categorical/range-based
@@ -130,9 +168,15 @@ user: |
   one — this is your primary source of truth):
   {relevant_sql}
 
+  If the assignment section above is empty, rely on the full source SQL
+  below to locate every place this column is assigned.
+
   Retrieved reference material most relevant to this column (prefer this
   over the full reference below when it's present):
   {rag_context}
+
+  If the retrieved reference section above is empty, rely on the full
+  platform reference below as the fallback source for platform syntax.
 
   Technical summary of the full derivation logic (for context only):
   {technical_summary}

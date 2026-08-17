@@ -31,6 +31,7 @@ from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from app.models.core import DDRow
+from app.utils.identity import canonical_expression_key, canonical_logical_name
 from app.utils import db
 
 COLUMNS = [
@@ -112,7 +113,38 @@ def _row_dict_to_dd_row(row: dict) -> DDRow:
 
 
 def _row_key(row: dict) -> tuple:
-    return (row["entity_name"], row["column_name"], row["effective_start_date"])
+    return (
+        canonical_logical_name(str(row["entity_name"])),
+        canonical_logical_name(str(row["column_name"])),
+        row["effective_start_date"],
+    )
+
+
+def _row_signature(row: dict) -> tuple:
+    return (
+        canonical_logical_name(str(row["entity_name"])),
+        canonical_logical_name(str(row["column_name"])),
+        canonical_expression_key(str(row["display_derivation_expression"])),
+        row["column_type"],
+        row["derivation_option"],
+        row["status"],
+        row["data_type"],
+        row["decision_table_json"],
+        row["conditional_json"],
+    )
+
+
+def _dedupe_equivalent_rows(rows: list[dict]) -> list[dict]:
+    grouped: dict[tuple, dict] = {}
+    for row in rows:
+        signature = _row_signature(row)
+        existing = grouped.get(signature)
+        if existing is None:
+            grouped[signature] = dict(row)
+            continue
+        if row["effective_start_date"] < existing["effective_start_date"]:
+            existing["effective_start_date"] = row["effective_start_date"]
+    return list(grouped.values())
 
 
 def _read_existing_dd_xlsx(path: Path) -> list[dict]:
@@ -162,7 +194,7 @@ def merge_dd_rows(existing: list[dict], new_rows: list[DDRow]) -> list[dict]:
     new_dicts = [dd_row_to_dict(r) for r in new_rows]
     new_keys = {_row_key(r) for r in new_dicts}
     preserved = [r for r in existing if _row_key(r) not in new_keys]
-    return preserved + new_dicts
+    return _dedupe_equivalent_rows(preserved + new_dicts)
 
 
 def export_dd_rows(
@@ -172,7 +204,7 @@ def export_dd_rows(
         existing = read_existing_dd_excel(existing_dd_path)
         merged = merge_dd_rows(existing, dd_rows)
     else:
-        merged = [dd_row_to_dict(r) for r in dd_rows]
+        merged = _dedupe_equivalent_rows([dd_row_to_dict(r) for r in dd_rows])
 
     wb = Workbook()
     ws = wb.active
@@ -207,7 +239,7 @@ def export_dd_rows_csv(
         existing = read_existing_dd_excel(existing_dd_path)
         merged = merge_dd_rows(existing, dd_rows)
     else:
-        merged = [dd_row_to_dict(r) for r in dd_rows]
+        merged = _dedupe_equivalent_rows([dd_row_to_dict(r) for r in dd_rows])
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)

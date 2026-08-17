@@ -94,6 +94,31 @@ def test_merge_with_no_existing_file_behaves_like_fresh_export(tmp_path):
     assert wb.active.max_row == 2  # header + one row
 
 
+def test_export_dedupes_equivalent_rows_across_effective_dates(tmp_path):
+    row_a = _sample_row(effective_start_date=date(2026, 1, 1))
+    row_b = _sample_row(effective_start_date=date(2026, 3, 1))
+    out = export_dd_rows([row_a, row_b], tmp_path / "dd.xlsx")
+    wb = openpyxl.load_workbook(out)
+    assert wb.active.max_row == 2
+    assert wb.active.cell(2, 6).value == "01-01-2026"
+
+
+def test_export_dedupes_case_variant_logical_columns(tmp_path):
+    row_a = _sample_row(
+        column_name="REFPERIODMAX",
+        display_derivation_expression='IF(ISEMPTY(REFPERIODMAX))THEN(0)ELSE(REFPERIODMAX)',
+    )
+    row_b = _sample_row(
+        column_name="REFPeriodMax",
+        display_derivation_expression='IF(ISEMPTY(REFPeriodMax))THEN(0)ELSE(REFPeriodMax)',
+    )
+    out = export_dd_rows([row_a, row_b], tmp_path / "dd.xlsx")
+    wb = openpyxl.load_workbook(out)
+    ws = wb.active
+    assert ws.max_row == 2
+    assert ws.cell(2, 2).value.upper() == "REFPERIODMAX"
+
+
 def test_read_existing_dd_excel_returns_empty_for_missing_file(tmp_path):
     from app.report.excel_export import read_existing_dd_excel
 

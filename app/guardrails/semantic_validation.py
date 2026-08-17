@@ -65,6 +65,7 @@ _IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _NUMBER_RE = re.compile(r"(?<![A-Za-z0-9_])\d+(?:\.\d+)?(?![A-Za-z0-9_])")
 _QUOTED_SEGMENT_RE = re.compile(r'"([^"]+)"')
 _LITERAL_LIKE_QUOTED_VALUES = {"Y", "N", "YES", "NO", "TRUE", "FALSE", "NULL"}
+_DATE_LITERAL_RE = re.compile(r"\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4}")
 
 # Bare (unquoted) column_ref NAME tokens, per the grammar's
 # `column_ref: STRING ("." STRING)* | NAME` -- the quoted form is not the
@@ -72,6 +73,12 @@ _LITERAL_LIKE_QUOTED_VALUES = {"Y", "N", "YES", "NO", "TRUE", "FALSE", "NULL"}
 # or a fabricated bare identifier (e.g. a made-up flag name standing in
 # for "an exception occurred") slips through undetected.
 _BARE_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_STRING_LITERAL_COMPARISON_RE = re.compile(
+    r'"([^"]*)"\s*(==|!=|<=|>=|<|>)\s*"([^"]*)"'
+)
+_NUMBER_LITERAL_COMPARISON_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(\d+(?:\.\d+)?)\s*(==|!=|<=|>=|<|>)\s*(\d+(?:\.\d+)?)(?![A-Za-z0-9_])"
+)
 
 
 def _is_function_call_name(text: str, match: re.Match[str]) -> bool:
@@ -94,6 +101,35 @@ def _looks_like_identifier_reference(candidate: str) -> bool:
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*", candidate):
         return False
     return True
+
+
+def _is_literal_like_quoted_value(candidate: str) -> bool:
+    """Return True when a quoted token is clearly being used as a literal
+    value rather than a field reference.
+
+    The 4X grammar uses `STRING` for quoted column references, so the
+    semantic validator needs a lightweight heuristic to tell
+    field-vs-literal comparisons apart. We only want to flag comparisons
+    where both sides are obviously literal values (for example
+    `"N"=="Y"` or `""=="ODA"`), not normal business rules like
+    `"Aqua_Scheme"=="Y"` or `"SchemeType"=="ODA"`.
+    """
+    token = candidate.strip()
+    if token == "":
+        return True
+    if token.upper() in _LITERAL_LIKE_QUOTED_VALUES:
+        return True
+    if _DATE_LITERAL_RE.fullmatch(token):
+        return True
+    if _NUMBER_RE.fullmatch(token):
+        return True
+    # Short all-caps codes are overwhelmingly used as literal values in
+    # the DD formulas we validate here (e.g. Y/N/ODA/STD). Longer mixed-
+    # case or underscore-bearing names are much more likely to be actual
+    # source fields, so we leave those alone.
+    if token.upper() == token and token.isalpha() and len(token) <= 4:
+        return True
+    return False
 
 
 def _source_allows_target_reference(source_sql: str, column: str) -> bool:
@@ -304,11 +340,147 @@ def check_invented_numeric_literals(expression: str, source_text: str) -> list[s
 
 
 def _extract_where_clause(raw_sql: str) -> str | None:
-    match = _WHERE_CLAUSE_RE.search(raw_sql)
-    if not match:
+    text = raw_sql
+    upper = text.upper()
+    in_single = False
+    in_double = False
+    depth = 0
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if in_single:
+            if ch == "'" and not (i + 1 < len(text) and text[i + 1] == "'"):
+                in_single = False
+            i += 1
+            continue
+        if in_double:
+            if ch == '"':
+                in_double = False
+            i += 1
+            continue
+        if ch == "'":
+            in_single = True
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+            i += 1
+            continue
+        if ch == ")":
+            depth = max(0, depth - 1)
+            i += 1
+            continue
+        if depth == 0 and upper[i : i + 5] == "WHERE" and (
+            i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")
+        ) and (
+            i + 5 >= len(text) or not (text[i + 5].isalnum() or text[i + 5] == "_")
+        ):
+            clause = text[i + 5 :].strip()
+            return clause or None
+        i += 1
+    return None
+
+
+def _find_matching_paren(text: str, open_index: int) -> int:
+    depth = 0
+    in_double = False
+    for idx in range(open_index, len(text)):
+        ch = text[idx]
+        if ch == '"':
+            in_double = not in_double
+            continue
+        if in_double:
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return idx
+    return -1
+
+
+def _extract_simple_if_branches(expression: str) -> tuple[str, str] | None:
+    """Extract the outermost THEN/ELSE branches when the expression starts
+    with a plain IF(... )THEN(... )ELSE(... ) chain.
+
+    This is intentionally conservative: it only handles the simple shape
+    that is most useful for spotting obviously collapsed branches such as
+    `THEN(NULL)ELSE(NULL)` or other identical branch bodies. More complex
+    ELSEIF chains are left to the other semantic checks.
+    """
+    text = expression.strip()
+    if not text.upper().startswith("IF(") or "ELSEIF(" in text.upper():
         return None
-    clause = match.group(1).strip()
-    return clause or None
+
+    condition_close = _find_matching_paren(text, 2)
+    if condition_close == -1:
+        return None
+
+    then_index = condition_close + 1
+    while then_index < len(text) and text[then_index].isspace():
+        then_index += 1
+    if not text[then_index:].upper().startswith("THEN("):
+        return None
+
+    then_body_start = then_index + len("THEN(")
+    depth = 0
+    in_double = False
+    for idx in range(then_body_start, len(text)):
+        ch = text[idx]
+        if ch == '"':
+            in_double = not in_double
+            continue
+        if in_double:
+            continue
+        if ch == "(":
+            depth += 1
+            continue
+        if ch == ")":
+            if depth > 0:
+                depth -= 1
+            continue
+        if depth == 0 and text[idx : idx + 5].upper() == "ELSE(":
+            then_body = text[then_body_start:idx].strip()
+            else_close = _find_matching_paren(text, idx + 4)
+            if else_close == -1:
+                return None
+            else_body = text[idx + 5 : else_close].strip()
+            return then_body, else_body
+    return None
+
+
+def _check_constant_conditions(expression: str) -> list[str]:
+    errors: list[str] = []
+    for left, op, right in _STRING_LITERAL_COMPARISON_RE.findall(expression):
+        if _is_literal_like_quoted_value(left) and _is_literal_like_quoted_value(right):
+            errors.append(
+                f"Semantic validation: condition compares only literals ({left!r} {op} {right!r}); "
+                "this branch does not depend on source data."
+            )
+    for left, op, right in _NUMBER_LITERAL_COMPARISON_RE.findall(expression):
+        errors.append(
+            f"Semantic validation: condition compares only numeric literals ({left} {op} {right}); "
+            "this branch does not depend on source data."
+        )
+    return errors
+
+
+def _check_identical_simple_branches(expression: str) -> list[str]:
+    match = re.match(
+        r'(?is)^IF\((?P<cond>.*)\)THEN\(\s*(?P<branch>[^()]*)\s*\)ELSE\(\s*(?P=branch)\s*\)$',
+        expression.strip(),
+    )
+    if match:
+        return [
+            "Semantic validation: THEN and ELSE branches resolve to the same value, "
+            "so the condition has no effect and likely dropped source logic."
+        ]
+    return []
 
 
 def check_dropped_override_conditions(
@@ -408,6 +580,8 @@ def check_semantic_consistency(
     errors.extend(check_self_reference(expression, column, entity_name, source_sql))
     errors.extend(check_invented_references(expression, source_text, entity_name))
     errors.extend(check_invented_numeric_literals(expression, source_text))
+    errors.extend(_check_constant_conditions(expression))
+    errors.extend(_check_identical_simple_branches(expression))
     errors.extend(check_dropped_override_conditions(expression, relevant_chunks, column))
 
     return GuardrailResult(passed=not errors, errors=errors)

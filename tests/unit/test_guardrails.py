@@ -1,6 +1,8 @@
 from datetime import date
 
 from app.guardrails.input_guardrails import check_input_file, check_job_plan
+from app.guardrails.semantic_validation import check_invented_references
+from app.guardrails.semantic_validation import check_semantic_consistency
 from app.guardrails.output_guardrails import check_dd_row
 from app.guardrails.structural_guardrails import check_structural_info
 from app.models.core import (
@@ -68,7 +70,7 @@ def test_output_guardrail_flags_invalid_grammar():
     assert not result.passed
 
 
-def test_output_guardrail_flags_entity_not_in_evidence():
+def test_output_guardrail_treats_entity_not_in_evidence_as_informational():
     model = CanonicalModel(
         chain_id="c1", job_id="j1", object_ids=["x"],
         technical_summary="t", business_summary="b", evidence=["SOME_OTHER_TABLE"],
@@ -81,8 +83,8 @@ def test_output_guardrail_flags_entity_not_in_evidence():
         data_type="number", source_chain_id="c1", confidence=1.0,
     )
     result = check_dd_row(row, model)
-    assert not result.passed
-    assert any("hallucination" in e for e in result.errors)
+    assert result.passed
+    assert not result.errors
 
 
 def test_output_guardrail_passes_clean_row():
@@ -98,3 +100,72 @@ def test_output_guardrail_passes_clean_row():
         data_type="datetime", source_chain_id="c1", confidence=1.0,
     )
     assert check_dd_row(row, model).passed
+
+
+def test_semantic_guardrail_flags_invented_bare_identifier():
+    errors = check_invented_references(
+        'IF(ERROR_OCCURRED)THEN(SQLERRM)ELSE(NULL)',
+        'UPDATE PRO.ACLRUNNINGPROCESSSTATUS SET ERRORDESCRIPTION = SQLERRM;',
+        entity_name="ACLRUNNINGPROCESSSTATUS",
+    )
+    assert errors
+
+
+def test_semantic_guardrail_flags_constant_comparison():
+    result = check_semantic_consistency(
+        'IF("N"=="Y")THEN(1)ELSE(0)',
+        column="X",
+        entity_name="A",
+        relevant_chunks=[],
+        source_sql='UPDATE A SET X = 1 WHERE FLAG = "Y";',
+    )
+    assert not result.passed
+    assert any("compares only literals" in e for e in result.errors)
+
+
+def test_semantic_guardrail_allows_field_vs_literal_comparisons():
+    result = check_semantic_consistency(
+        'IF("Aqua_Scheme"=="Y" AND "SchemeType"=="ODA")THEN(1)ELSE(0)',
+        column="X",
+        entity_name="DIMPRODUCT",
+        relevant_chunks=[],
+        source_sql='WHERE Aqua_Scheme = "Y" AND SchemeType = "ODA"',
+    )
+    assert result.passed
+
+
+def test_semantic_guardrail_ignores_nested_where_inside_exists():
+    result = check_semantic_consistency(
+        'IF("A"."INITIALNPADT"==1)THEN(0)ELSE(1)',
+        column="INITIALNPADT",
+        entity_name="A",
+        relevant_chunks=[],
+        source_sql=(
+            "UPDATE A SET INITIALNPADT = NULL "
+            "WHERE EXISTS (SELECT 1 FROM B WHERE B.ID = A.ID AND B.FLAG = 'Y');"
+        ),
+    )
+    assert result.passed
+
+
+def test_semantic_guardrail_flags_identical_then_else_branches():
+    result = check_semantic_consistency(
+        'IF("A"."X"==TODATE("1900-01-01"))THEN(NULL)ELSE(NULL)',
+        column="X",
+        entity_name="A",
+        relevant_chunks=[],
+        source_sql="UPDATE A SET X = NULL WHERE X = DATE '1900-01-01';",
+    )
+    assert not result.passed
+    assert any("THEN and ELSE branches resolve to the same value" in e for e in result.errors)
+
+
+def test_semantic_guardrail_allows_distinct_branches():
+    result = check_semantic_consistency(
+        'IF("A"."X"==TODATE("1900-01-01"))THEN(NULL)ELSE("A"."X")',
+        column="X",
+        entity_name="A",
+        relevant_chunks=[],
+        source_sql="UPDATE A SET X = NULL WHERE X = DATE '1900-01-01';",
+    )
+    assert result.passed

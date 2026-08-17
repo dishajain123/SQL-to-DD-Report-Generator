@@ -4,12 +4,13 @@ only runs when the intent actually requires it (architecture step 3/12).
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
 from app.derivation.canonical_model import build_canonical_model
-from app.derivation.dd_generator import flag_duplicate_dd_rows, generate_dd_rows
+from app.derivation.dd_generator import flag_duplicate_dd_rows, generate_dd_rows_for_chains
 from app.derivation.llm_client import LLMClient
 from app.guardrails.output_guardrails import check_dd_row
 from app.guardrails.structural_guardrails import check_structural_info
@@ -22,6 +23,7 @@ from app.rag.chroma_store import ChromaStore
 from app.report.excel_export import export_dd_rows
 from app.report.report_generator import generate_report
 from app.utils import db
+from app.utils.config import settings
 from app.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -70,13 +72,14 @@ def node_structural_analysis(state: PipelineState) -> PipelineState:
 
 def node_smart_chunking(state: PipelineState) -> PipelineState:
     smart_chunks = {}
+    job_id = state["job_plan"].job_id
+    audit_entries: list[tuple[str, str, str]] = []
     for oid, info in state["structural_infos"].items():
         smart_chunks[oid] = info.smart_chunks
-        db.log_audit(
-            state["job_plan"].job_id,
-            "smart_chunking",
-            f"{len(info.smart_chunks)} chunk(s) derived for object {oid}",
+        audit_entries.append(
+            (job_id, "smart_chunking", f"{len(info.smart_chunks)} chunk(s) derived for object {oid}")
         )
+    db.log_audit_bulk(audit_entries)
     state["smart_chunks"] = smart_chunks
     return state
 
@@ -90,17 +93,40 @@ def node_lineage(state: PipelineState) -> PipelineState:
 
 
 def node_canonical_models(state: PipelineState, llm_client: LLMClient) -> PipelineState:
-    models = []
-    for chain in state["chains"]:
-        model = build_canonical_model(
+    chains = state["chains"]
+    job_id = state["job_plan"].job_id
+
+    if not chains:
+        state["canonical_models"] = []
+        return state
+
+    def _build(chain: Any) -> Any:
+        return build_canonical_model(
             chain=chain,
-            job_id=state["job_plan"].job_id,
+            job_id=job_id,
             objects=state["objects"],
             structural_infos=state["structural_infos"],
             llm_client=llm_client,
         )
-        models.append(model)
-        db.log_audit(state["job_plan"].job_id, "canonical_model", f"Built for chain {chain.chain_id}")
+
+    # Chains are independent of each other (each is its own lineage
+    # group), so their canonical models can be built concurrently instead
+    # of one chain waiting on the previous chain's two sequential LLM
+    # calls (technical + business reasoning) to finish first. Each call is
+    # network-bound, so a thread pool gives real concurrency here.
+    # `executor.map` preserves input order, so `models[i]` still
+    # corresponds to `chains[i]` exactly as the sequential version did --
+    # this matters because node_dd_generation zips the two lists together.
+    max_workers = max(1, min(settings.canonical_model_max_workers, len(chains)))
+    if max_workers == 1:
+        models = [_build(chain) for chain in chains]
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            models = list(executor.map(_build, chains))
+
+    db.log_audit_bulk(
+        [(job_id, "canonical_model", f"Built for chain {chain.chain_id}") for chain in chains]
+    )
     state["canonical_models"] = models
     return state
 
@@ -108,29 +134,44 @@ def node_canonical_models(state: PipelineState, llm_client: LLMClient) -> Pipeli
 def node_dd_generation(
     state: PipelineState, llm_client: LLMClient, rag_store: Optional[ChromaStore] = None
 ) -> PipelineState:
-    all_rows = []
-    for chain, model in zip(state["chains"], state["canonical_models"]):
-        rows = generate_dd_rows(
-            chain=chain,
-            canonical_model=model,
-            objects=state["objects"],
-            structural_infos=state["structural_infos"],
-            llm_client=llm_client,
-            function_reference=state.get("function_reference", ""),
-            entity_name_map=state.get("entity_name_map"),
-            rag_store=rag_store,
-        )
-        for row in rows:
-            guardrail_result = check_dd_row(row, model)
-            if not guardrail_result.passed:
-                row.validation_errors.extend(guardrail_result.errors)
-                row.status = row.status.__class__.PENDING_REVIEW
-            all_rows.append(row)
+    chains = state["chains"]
+    canonical_models = state["canonical_models"]
+
+    # Every column-generation job across every chain is batched into a
+    # single worker pool here (see
+    # app/derivation/dd_generator.py::generate_dd_rows_for_chains) instead
+    # of looping chain-by-chain with a separate pool per chain -- a chain
+    # with fewer columns than the worker limit no longer leaves workers
+    # idle while later chains wait their turn.
+    all_rows = generate_dd_rows_for_chains(
+        chains=chains,
+        canonical_models=canonical_models,
+        objects=state["objects"],
+        structural_infos=state["structural_infos"],
+        llm_client=llm_client,
+        function_reference=state.get("function_reference", ""),
+        entity_name_map=state.get("entity_name_map"),
+        rag_store=rag_store,
+    )
+
+    model_by_chain_id = {model.chain_id: model for model in canonical_models}
+    for row in all_rows:
+        model = model_by_chain_id.get(row.source_chain_id)
+        if model is None:
+            continue
+        guardrail_result = check_dd_row(row, model)
+        if not guardrail_result.passed:
+            row.validation_errors.extend(guardrail_result.errors)
+            row.status = row.status.__class__.PENDING_REVIEW
 
     all_rows = flag_duplicate_dd_rows(all_rows)
     state["dd_rows"] = all_rows
-    for i, row in enumerate(all_rows):
-        db.record_dd_row(state["job_plan"].job_id, row.source_chain_id, i, row.model_dump())
+
+    job_id = state["job_plan"].job_id
+    db.record_dd_rows_bulk(
+        job_id,
+        [(row.source_chain_id, i, row.model_dump()) for i, row in enumerate(all_rows)],
+    )
     return state
 
 

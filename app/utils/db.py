@@ -151,28 +151,61 @@ def update_job_status(
         )
 
 
+def _dd_row_params(job_id: str, chain_id: str, row_index: int, dd_row_dict: dict) -> tuple:
+    return (
+        job_id,
+        chain_id,
+        row_index,
+        dd_row_dict["entity_name"],
+        dd_row_dict["column_name"],
+        dd_row_dict["derivation_option"],
+        dd_row_dict.get("display_derivation_expression", ""),
+        str(dd_row_dict["effective_start_date"]),
+        dd_row_dict["status"],
+        dd_row_dict["confidence"],
+        json.dumps(dd_row_dict.get("validation_errors", [])),
+        json.dumps(dd_row_dict, default=str),
+    )
+
+
 def record_dd_row(job_id: str, chain_id: str, row_index: int, dd_row_dict: dict, db_path: str | None = None) -> int:
     with get_connection(db_path) as conn:
         cur = conn.execute(
             "INSERT INTO dd_rows (job_id, chain_id, row_index, entity_name, column_name, "
             "derivation_option, expression, effective_start_date, status, confidence, "
             "validation_errors, row_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                job_id,
-                chain_id,
-                row_index,
-                dd_row_dict["entity_name"],
-                dd_row_dict["column_name"],
-                dd_row_dict["derivation_option"],
-                dd_row_dict.get("display_derivation_expression", ""),
-                str(dd_row_dict["effective_start_date"]),
-                dd_row_dict["status"],
-                dd_row_dict["confidence"],
-                json.dumps(dd_row_dict.get("validation_errors", [])),
-                json.dumps(dd_row_dict, default=str),
-            ),
+            _dd_row_params(job_id, chain_id, row_index, dd_row_dict),
         )
         return cur.lastrowid
+
+
+def record_dd_rows_bulk(
+    job_id: str, rows: list[tuple[str, int, dict]], db_path: str | None = None
+) -> None:
+    """Same effect as calling `record_dd_row` once per row, but writes every
+    row in a single connection/transaction instead of one connection (and
+    one commit/fsync) per row.
+
+    `rows` is a list of `(chain_id, row_index, dd_row_dict)` tuples. A large
+    job can produce hundreds of DD rows; persisting them one at a time was
+    pure per-row connection/commit overhead sitting directly in the
+    critical path between DD generation finishing and the report/Excel
+    export starting, with no effect on the data actually written. This is a
+    no-op for an empty list, and every row still ends up in exactly the
+    same `dd_rows` table shape as before -- nothing about what's recorded
+    changes, only how many round trips it takes to record it."""
+    if not rows:
+        return
+    with get_connection(db_path) as conn:
+        conn.executemany(
+            "INSERT INTO dd_rows (job_id, chain_id, row_index, entity_name, column_name, "
+            "derivation_option, expression, effective_start_date, status, confidence, "
+            "validation_errors, row_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                _dd_row_params(job_id, chain_id, row_index, dd_row_dict)
+                for chain_id, row_index, dd_row_dict in rows
+            ],
+        )
 
 
 def get_pending_review_rows(db_path: str | None = None) -> list[sqlite3.Row]:
@@ -231,4 +264,17 @@ def log_audit(job_id: str, stage: str, detail: str, db_path: str | None = None) 
         conn.execute(
             "INSERT INTO audit_log (job_id, stage, detail) VALUES (?, ?, ?)",
             (job_id, stage, detail),
+        )
+
+
+def log_audit_bulk(entries: list[tuple[str, str, str]], db_path: str | None = None) -> None:
+    """Same effect as calling `log_audit` once per entry, but in a single
+    connection/transaction. `entries` is a list of `(job_id, stage,
+    detail)` tuples. No-op for an empty list."""
+    if not entries:
+        return
+    with get_connection(db_path) as conn:
+        conn.executemany(
+            "INSERT INTO audit_log (job_id, stage, detail) VALUES (?, ?, ?)",
+            entries,
         )

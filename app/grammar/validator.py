@@ -31,6 +31,49 @@ KNOWN_FUNCTIONS = {
     "ROUND", "ABS", "FLOOR", "CEIL", "DATE",
 }
 
+_INCOMPLETE_TRAILING_TOKENS = {
+    "IF",
+    "THEN",
+    "ELSE",
+    "ELSEIF",
+    "AND",
+    "OR",
+    "NOT",
+    "BETWEEN",
+    "IN",
+    "NOTIN",
+    "ISEMPTY",
+    "ISNOTEMPTY",
+    "COALESCE",
+    "CONCAT",
+    "DATEDIFF",
+    "TODATE",
+    "DATEPART",
+    "ROUND",
+    "ABS",
+    "FLOOR",
+    "CEIL",
+    "MAX",
+    "MIN",
+    "LEN",
+    "SUBSTR",
+    "LOWER",
+    "UPPER",
+    "TRIM",
+    "REPLACE",
+    "REGEX",
+    "SOM",
+    "EOM",
+    "SOY",
+    "EOY",
+    "SOFY",
+    "EOFY",
+    "PERIOD",
+    "SOQ",
+    "EOQ",
+    "DATE",
+}
+
 
 def _flatten_whitespace(expression: str) -> str:
     return " ".join(expression.split())
@@ -63,6 +106,13 @@ def _rewrite_isnotempty_boolean_comparisons(expression: str) -> str:
     )
 
 
+def _rewrite_postfix_isnotempty(expression: str) -> str:
+    pattern = re.compile(
+        r'(?i)(?<![A-Za-z0-9_"])((?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*(?:\.\s*(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*))*)\s+ISNOTEMPTY\b(?!\s*\()'
+    )
+    return pattern.sub(lambda m: f"ISNOTEMPTY({m.group(1).strip()})", expression)
+
+
 def _rewrite_null_predicates(expression: str) -> str:
     expression = re.sub(
         r'(?i)\b([A-Za-z_][A-Za-z0-9_".]*?)\s+IS\s+NOT\s+NULL\b',
@@ -83,6 +133,15 @@ def _rewrite_date_function(expression: str) -> str:
         return f"TODATE({inner})"
 
     return re.sub(r"(?i)\bDATE\s*\(\s*([^()]+?)\s*\)", replace, expression)
+
+
+def _rewrite_sql_date_literals(expression: str) -> str:
+    """Rewrite SQL-style date literals into the 4X `TODATE(...)` form."""
+    return re.sub(
+        r'(?i)\bDATE\s*["\']([^"\']+)["\']',
+        lambda match: f'TODATE("{match.group(1).strip()}")',
+        expression,
+    )
 
 
 def _rewrite_exists_predicates(expression: str) -> str:
@@ -131,6 +190,23 @@ def _rewrite_exists_predicates(expression: str) -> str:
     return "".join(result)
 
 
+def _rewrite_in_subquery_membership(expression: str) -> str:
+    """Rewrite a single-row `IN [value WHERE predicate]` subquery shape.
+
+    SQL-to-4X translations sometimes compress an `IN (SELECT ... FROM ...
+    WHERE ...)` predicate into a bracketed membership test with an inline
+    `WHERE` clause. That is not valid 4X syntax, but when the bracket
+    contains exactly one candidate value, the intent is usually a direct
+    equality check guarded by the subquery predicate.
+    """
+    pattern = re.compile(
+        r'(?i)\b(?P<lhs>(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)(?:\s*\.\s*(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*))*)'
+        r'\s+IN\s*\[\s*(?P<rhs>(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)(?:\s*\.\s*(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*))*)'
+        r'\s+WHERE\s+(?P<predicate>[^\]]+?)\s*\]'
+    )
+    return pattern.sub(lambda m: f'{m.group("lhs")} == {m.group("rhs")} AND ({m.group("predicate").strip()})', expression)
+
+
 def _rewrite_unquoted_dotted_refs(expression: str) -> str:
     result: list[str] = []
     i = 0
@@ -163,7 +239,18 @@ def _rewrite_unquoted_dotted_refs(expression: str) -> str:
                 m = l + 1
                 while m < n and expression[m].isspace():
                     m += 1
-                if m >= n or not (expression[m].isalpha() or expression[m] == "_"):
+                if m >= n:
+                    break
+                if expression[m] == '"':
+                    p = m + 1
+                    while p < n and expression[p] != '"':
+                        p += 1
+                    if p >= n:
+                        break
+                    parts.append(expression[m + 1 : p])
+                    k = p + 1
+                    continue
+                if not (expression[m].isalpha() or expression[m] == "_"):
                     break
                 p = m + 1
                 while p < n and (expression[p].isalnum() or expression[p] == "_"):
@@ -177,6 +264,24 @@ def _rewrite_unquoted_dotted_refs(expression: str) -> str:
         result.append(ch)
         i += 1
     return "".join(result)
+
+
+def _rewrite_bundled_business_date_var(expression: str) -> str:
+    """Normalize a fused business-date variable token into the platform's
+    conventional two-segment path.
+
+    Some model outputs collapse `"Entity"."var"."BUSINESS_DATE"` into a
+    single quoted identifier such as `"Entity"."var_BUSINESS_DATE"`.
+    That token is grammatically legal but it loses the intended platform
+    convention and can be misread as an invented field. Rewriting it back
+    to the conventional path keeps the generated expression aligned with
+    the prompt guidance and the semantic validator.
+    """
+    return re.sub(
+        r'("?[A-Za-z_][A-Za-z0-9_]*"?)\s*\.\s*"var_BUSINESS_DATE"',
+        r'\1."var"."BUSINESS_DATE"',
+        expression,
+    )
 
 
 def _strip_angle_bracket_placeholders(expression: str) -> str:
@@ -276,6 +381,81 @@ def _rewrite_legacy_if_syntax(expression: str) -> str:
     return previous
 
 
+def _expression_looks_incomplete(expression: str) -> bool:
+    """Detect obvious truncation before sending a string to the grammar.
+
+    This is a lightweight, generic completeness check for the common
+    failure modes we see from model output: empty strings, dangling
+    operators, unterminated IF/THEN/ELSE branches, missing function
+    arguments, and expressions that end while still inside a quoted
+    string or an open delimiter.
+    """
+    stripped = expression.strip()
+    if not stripped:
+        return True
+
+    in_double = False
+    paren_depth = 0
+    bracket_depth = 0
+    last_token: str | None = None
+    token: list[str] = []
+
+    def flush_token() -> None:
+        nonlocal last_token, token
+        if token:
+            last_token = "".join(token)
+            token = []
+
+    for ch in stripped:
+        if ch == '"':
+            if in_double:
+                last_token = "STRING"
+            else:
+                flush_token()
+            in_double = not in_double
+            continue
+
+        if in_double:
+            continue
+
+        if ch.isalnum() or ch == "_":
+            token.append(ch)
+            continue
+
+        flush_token()
+        if ch == "(":
+            paren_depth += 1
+            last_token = "("
+        elif ch == ")":
+            paren_depth -= 1
+            last_token = ")"
+        elif ch == "[":
+            bracket_depth += 1
+            last_token = "["
+        elif ch == "]":
+            bracket_depth -= 1
+            last_token = "]"
+        elif ch in {"+", "-", "*", "/", ",", ".", "<", ">", "=", "!"}:
+            last_token = ch
+
+    flush_token()
+    if in_double or paren_depth > 0 or bracket_depth > 0:
+        return True
+
+    if last_token is None:
+        return True
+
+    return last_token.upper() in _INCOMPLETE_TRAILING_TOKENS or last_token in {"+", "-", "*", "/", ",", ".", "<", ">", "=", "!", "("}
+
+
+def is_incomplete_expression_error(error: str | None) -> bool:
+    """Return True when a validation error indicates truncation or emptiness."""
+    if not error:
+        return False
+    lowered = error.lower()
+    return "unexpected end-of-input" in lowered or "empty expression" in lowered
+
+
 def _repair_missing_then_parentheses(expression: str) -> str:
     """Close an unterminated IF/ELSEIF condition immediately before THEN.
 
@@ -316,6 +496,7 @@ def _repair_missing_then_parentheses(expression: str) -> str:
             depth = 1
             j = start
             local_in_double = False
+            repaired = False
             while j < n:
                 cur = expression[j]
                 if cur == '"':
@@ -331,18 +512,29 @@ def _repair_missing_then_parentheses(expression: str) -> str:
                         before = expression[j - 1] if j > 0 else ""
                         after = expression[j + 4] if j + 4 < n else ""
                         if not (before.isalnum() or before == "_") and not (after.isalnum() or after == "_"):
+                            # Condition was never closed before THEN --
+                            # insert the missing ")" right here and resume
+                            # scanning from the THEN token itself.
                             result.append(expression[i:j])
                             result.append(")")
                             i = j
+                            repaired = True
                             break
                 j += 1
-            else:
-                result.append(ch)
-                i += 1
+
+            if repaired:
+                # `i` was already advanced to the THEN position above --
+                # resume the outer scan from there.
                 continue
 
-            if i != j:
-                continue
+            # Either the condition closed normally (a well-formed
+            # `IF(...)THEN(...)`, the overwhelmingly common case) or the
+            # scan ran off the end of the string without finding anything
+            # to repair. Either way there is nothing to do here -- fall
+            # through and advance one character at a time as usual. (Not
+            # jumping straight past the matched span keeps this branch
+            # simple and correct; it is still linear overall since every
+            # character is visited at most once by this fallthrough.)
 
         result.append(ch)
         i += 1
@@ -355,11 +547,15 @@ def _normalize_expression(expression: str) -> str:
     normalized = _rewrite_legacy_else_if(normalized)
     normalized = _rewrite_not_in_membership(normalized)
     normalized = _rewrite_is_empty_syntax(normalized)
+    normalized = _rewrite_postfix_isnotempty(normalized)
     normalized = _rewrite_isnotempty_boolean_comparisons(normalized)
     normalized = _rewrite_null_predicates(normalized)
+    normalized = _rewrite_sql_date_literals(normalized)
     normalized = _rewrite_date_function(normalized)
     normalized = _rewrite_unquoted_dotted_refs(normalized)
+    normalized = _rewrite_bundled_business_date_var(normalized)
     normalized = _rewrite_exists_predicates(normalized)
+    normalized = _rewrite_in_subquery_membership(normalized)
     normalized = _rewrite_legacy_if_syntax(normalized)
     normalized = _strip_angle_bracket_placeholders(normalized)
     normalized = _repair_missing_then_parentheses(normalized)
@@ -368,6 +564,10 @@ def _normalize_expression(expression: str) -> str:
 
 def validate_expression(expression: str) -> ValidationResult:
     expression = _normalize_expression(expression)
+    if not expression.strip():
+        return ValidationResult(valid=False, error="Empty expression")
+    if _expression_looks_incomplete(expression):
+        return ValidationResult(valid=False, error="Unexpected end-of-input")
     try:
         tree = _parser.parse(expression)
     except UnexpectedInput as exc:

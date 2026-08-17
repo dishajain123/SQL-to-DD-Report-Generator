@@ -29,6 +29,20 @@ logger = get_logger(__name__)
 
 _PROMPTS_DIR = Path(__file__).with_name("prompts")
 
+_PROMPT_FILE_SPECS = {
+    "technical_reasoning": _PROMPTS_DIR / "technical_reasoning.yaml",
+    "business_reasoning": _PROMPTS_DIR / "business_reasoning.yaml",
+    "dd_generation": _PROMPTS_DIR / "dd_generation.yaml",
+    "retry_with_error": _PROMPTS_DIR / "retry_with_error.yaml",
+}
+
+_PROMPT_KEY_MAP = {
+    "technical_reasoning": ("technical_reasoning_system", "technical_reasoning_user"),
+    "business_reasoning": ("business_reasoning_system", "business_reasoning_user"),
+    "dd_generation": ("dd_generation_system", "dd_generation_user"),
+    "retry_with_error": ("retry_with_error_system", "retry_with_error_user"),
+}
+
 
 class _ModelRejectedError(RuntimeError):
     """Raised when a provider rejects a candidate model and fallback is okay."""
@@ -36,15 +50,8 @@ class _ModelRejectedError(RuntimeError):
 
 @lru_cache(maxsize=1)
 def _load_prompts() -> dict[str, str]:
-    prompt_specs = {
-        "technical_reasoning": _PROMPTS_DIR / "technical_reasoning.yaml",
-        "business_reasoning": _PROMPTS_DIR / "business_reasoning.yaml",
-        "dd_generation": _PROMPTS_DIR / "dd_generation.yaml",
-        "retry_with_error": _PROMPTS_DIR / "retry_with_error.yaml",
-    }
-
     prompts: dict[str, str] = {}
-    for prefix, path in prompt_specs.items():
+    for prefix, path in _PROMPT_FILE_SPECS.items():
         with path.open("r", encoding="utf-8") as f:
             loaded = yaml.safe_load(f)
 
@@ -60,6 +67,11 @@ def _load_prompts() -> dict[str, str]:
         prompts[f"{prefix}_user"] = str(loaded["user"])
 
     return prompts
+
+
+def _prompt_pair(prompts: dict[str, str], prompt_name: str) -> tuple[str, str]:
+    system_key, user_key = _PROMPT_KEY_MAP[prompt_name]
+    return prompts[system_key], prompts[user_key]
 
 
 def _render_prompt(template: str, **kwargs: object) -> str:
@@ -335,16 +347,15 @@ class LLMClient:
 
     def technical_reasoning(self, sql_snippets: list[str]) -> str:
         prompts = _load_prompts()
-        user = _render_prompt(
-            prompts["technical_reasoning_user"],
-            sql_snippets="\n\n---\n\n".join(sql_snippets),
-        )
-        return self._complete(prompts["technical_reasoning_system"], user, max_tokens=768)
+        system, user_template = _prompt_pair(prompts, "technical_reasoning")
+        user = _render_prompt(user_template, sql_snippets="\n\n---\n\n".join(sql_snippets))
+        return self._complete(system, user, max_tokens=768)
 
     def business_reasoning(self, technical_summary: str) -> str:
         prompts = _load_prompts()
-        user = _render_prompt(prompts["business_reasoning_user"], technical_summary=technical_summary)
-        return self._complete(prompts["business_reasoning_system"], user, max_tokens=512)
+        system, user_template = _prompt_pair(prompts, "business_reasoning")
+        user = _render_prompt(user_template, technical_summary=technical_summary)
+        return self._complete(system, user, max_tokens=512)
 
     def generate_formula_expression(
         self,
@@ -358,32 +369,22 @@ class LLMClient:
         rag_context: str = "",
     ) -> str:
         prompts = _load_prompts()
+        system, user_template = _prompt_pair(prompts, "dd_generation")
         user = _render_prompt(
-            prompts["dd_generation_user"],
+            user_template,
             technical_summary=technical_summary,
             business_summary=business_summary,
             source_sql=source_sql,
             function_reference=function_reference,
             column_name=column_name,
             entity_name=entity_name,
-            relevant_sql=relevant_sql.strip() or (
-                "(No specific assignment statements were isolated automatically "
-                "-- search the full source SQL below for every place this "
-                "column is assigned.)"
-            ),
-            rag_context=rag_context.strip() or (
-                "(No specific reference material was retrieved for this "
-                "column -- rely on the full platform reference below.)"
-            ),
+            relevant_sql=relevant_sql.strip(),
+            rag_context=rag_context.strip(),
         )
-        return self._complete(prompts["dd_generation_system"], user, max_tokens=256)
+        return self._complete(system, user, max_tokens=self.max_new_tokens)
 
     def retry_with_error(self, previous_expression: str, error: str, context: str) -> str:
         prompts = _load_prompts()
-        user = _render_prompt(
-            prompts["retry_with_error_user"],
-            previous_expression=previous_expression,
-            error=error,
-            context=context,
-        )
-        return self._complete(prompts["retry_with_error_system"], user, max_tokens=256)
+        system, user_template = _prompt_pair(prompts, "retry_with_error")
+        user = _render_prompt(user_template, previous_expression=previous_expression, error=error, context=context)
+        return self._complete(system, user, max_tokens=self.max_new_tokens)

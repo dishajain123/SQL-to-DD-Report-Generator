@@ -34,12 +34,13 @@ import json
 import re
 from datetime import date
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Optional
 
 from app.derivation.llm_client import LLMClient
 from app.derivation.period_pruning import prune_expression_for_period
 from app.derivation.versioning import effective_periods_for_column
-from app.grammar.validator import validate_expression
+from app.grammar.validator import is_incomplete_expression_error, validate_expression
 from app.guardrails.semantic_validation import check_semantic_consistency
 from app.models.core import (
     CanonicalModel,
@@ -50,26 +51,29 @@ from app.models.core import (
     LineageChain,
     SmartChunk,
     SQLObject,
+    StatementInfo,
     StructuralInfo,
 )
+from app.utils.identity import canonical_logical_name
 from app.rag.chroma_store import ChromaStore, DOMAIN_COLLECTION, PLATFORM_COLLECTION
 from app.utils.config import settings
 from app.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
 
-# Total generation attempts per column. Default to a single fast pass so
-# large jobs do not stall on repeated model repair retries; additional
-# retries can be enabled from .env when higher recall is worth the extra
-# latency.
+# Total generation attempts per column. Keep this bounded, but allow one
+# repair pass so validation failures get a generic retry instead of being
+# exported unchanged.
 _MAX_GENERATION_ATTEMPTS = max(1, settings.dd_generation_max_attempts)
 _MAX_SOURCE_SQL_CONTEXT_CHARS = 5000
 
-_SYNTHETIC_DATE_REVIEW_NOTE = (
-    "Effective start date is a synthetic estimate because no "
-    "TIMEKEY-to-calendar-date mapping was supplied for this run; confirm "
-    "the exact date before finalizing this DD row."
-)
+
+@dataclass(frozen=True)
+class _AssignmentSite:
+    kind: str
+    statement_indices: list[int]
+    raw_sql: str
+    columns_written: list[str]
 
 
 def _relevant_chunks(info: StructuralInfo, column: str) -> list[SmartChunk]:
@@ -100,7 +104,7 @@ def _relevant_chunks(info: StructuralInfo, column: str) -> list[SmartChunk]:
     seen_chunk_ids: set[str] = set()
 
     for idx, chunk in enumerate(all_chunks):
-        if column not in chunk.columns_written or chunk.chunk_id in seen_chunk_ids:
+        if canonical_logical_name(column) not in {canonical_logical_name(c) for c in chunk.columns_written} or chunk.chunk_id in seen_chunk_ids:
             continue
         seen_chunk_ids.add(chunk.chunk_id)
 
@@ -131,8 +135,228 @@ def _relevant_sql_excerpt(info: StructuralInfo, column: str) -> str:
     that nothing specific was isolated) if smart chunking found nothing
     for this column -- this is a targeting aid, not a hard requirement.
     """
-    excerpts = [chunk.raw_sql.strip() for chunk in _relevant_chunks(info, column) if chunk.raw_sql.strip()]
+    excerpts = [site.raw_sql.strip() for site in _assignment_sites(info, column) if site.raw_sql.strip()]
     return "\n\n".join(excerpts)
+
+
+def _format_assignment_context(info: StructuralInfo, column: str) -> str:
+    """Present the relevant write sites in source order with lightweight
+    metadata so the LLM can see which assignment is an initial set, a
+    later fix-up, or an override branch.
+
+    The raw SQL is preserved verbatim under each numbered section; the
+    labels simply make the execution order and statement role explicit.
+    """
+    sites = _assignment_sites(info, column)
+    if not sites:
+        return ""
+
+    sections: list[str] = []
+    overview = _ordered_assignment_overview(sites)
+    if overview:
+        sections.append("[Ordered write sequence]\n" + "\n".join(f"{idx}. {line}" for idx, line in enumerate(overview, start=1)))
+    for idx, site in enumerate(sites, start=1):
+        raw = site.raw_sql.strip()
+        if not raw:
+            continue
+        stmt_ids = ",".join(str(i) for i in site.statement_indices) if site.statement_indices else "?"
+        columns = ", ".join(site.columns_written) if site.columns_written else column
+        role = _infer_assignment_role(raw)
+        hints = _assignment_decomposition_hints(raw)
+        summary = _assignment_decomposition_summary(raw)
+        sections.append(
+            f"[Assignment {idx} | role={role} | kind={site.kind} | statements={stmt_ids} | columns={columns}]\n"
+            f"{raw}"
+            + (f"\n[Decomposition summary]\n" + "\n".join(f"- {line}" for line in summary) if summary else "")
+            + (f"\n[Decomposition hints]\n" + "\n".join(f"- {hint}" for hint in hints) if hints else "")
+        )
+    return "\n\n".join(sections)
+
+
+def _ordered_assignment_overview(sites: list[_AssignmentSite]) -> list[str]:
+    overview: list[str] = []
+    for site in sites:
+        summary = _assignment_decomposition_summary(site.raw_sql)
+        compact = "; ".join(summary) if summary else site.raw_sql.strip()
+        overview.append(f"later stages stay later | role={site.kind} | {compact}")
+    return overview
+
+
+def _assignment_sites(info: StructuralInfo, column: str) -> list[_AssignmentSite]:
+    """Return ordered write sites for the target column.
+
+    Prefer statement-level assignments when available so later fix-up
+    UPDATEs remain separate from earlier MERGE calculations. Fall back to
+    the older chunk view only when the structural info does not expose
+    statements.
+    """
+    statements = getattr(info, "statements", None)
+    if statements:
+        return _assignment_sites_from_statements(statements, column)
+    return _assignment_sites_from_chunks(_relevant_chunks(info, column), column)
+
+
+def _assignment_sites_from_statements(statements: list[StatementInfo], column: str) -> list[_AssignmentSite]:
+    column_upper = column.upper()
+    sites: list[_AssignmentSite] = []
+    pending_headers: list[StatementInfo] = []
+    bridge_context: list[StatementInfo] = []
+
+    for stmt in statements:
+        writes_target = _statement_writes_column(stmt, column_upper)
+
+        if writes_target:
+            raw_parts = [s.raw_text.strip() for s in pending_headers if s.raw_text.strip()]
+            raw_parts.extend(s.raw_text.strip() for s in bridge_context if s.raw_text.strip())
+            raw_parts.append(stmt.raw_text.strip())
+            stmt_ids = [s.statement_index for s in pending_headers]
+            stmt_ids.extend(s.statement_index for s in bridge_context)
+            stmt_ids.append(stmt.statement_index)
+            sites.append(
+                _AssignmentSite(
+                    kind="CONTROL_FLOW_BLOCK" if (pending_headers or bridge_context) else stmt.statement_type,
+                    statement_indices=stmt_ids,
+                    raw_sql="\n".join(raw_parts).strip(),
+                    columns_written=[column],
+                )
+            )
+            pending_headers = []
+            bridge_context = []
+            continue
+
+        if stmt.statement_type == "CONTROL_FLOW" and not stmt.columns and not stmt.set_columns_by_table:
+            pending_headers.append(stmt)
+            continue
+
+        if pending_headers and not stmt.set_columns_by_table and not stmt.tables_written:
+            bridge_context.append(stmt)
+            continue
+
+        pending_headers = []
+        bridge_context = []
+
+    return sites
+
+
+def _assignment_sites_from_chunks(chunks: list[SmartChunk], column: str) -> list[_AssignmentSite]:
+    sites: list[_AssignmentSite] = []
+    for chunk in chunks:
+        raw = chunk.raw_sql.strip()
+        if not raw:
+            continue
+        sites.append(
+            _AssignmentSite(
+                kind=chunk.chunk_kind,
+                statement_indices=list(chunk.statement_indices),
+                raw_sql=raw,
+                columns_written=[column],
+            )
+        )
+    return sites
+
+
+def _statement_writes_column(stmt: StatementInfo, column_upper: str) -> bool:
+    for cols in stmt.set_columns_by_table.values():
+        if any(col.upper() == column_upper for col in cols):
+            return True
+    return False
+
+
+def _infer_assignment_role(raw_sql: str) -> str:
+    """Classify the write pattern generically so the prompt can describe
+    the chunk as a value-selection, initialization, or fix-up stage.
+
+    This is intentionally heuristic: it should improve source decomposition
+    for many procedures without hardcoding any specific column names.
+    """
+    upper = raw_sql.upper()
+
+    if "MERGE INTO" in upper and "USING (" in upper:
+        if "CASE WHEN" in upper or re.search(r"\bCASE\b", upper):
+            return "MERGE_USING_CASE_VALUE"
+        return "MERGE_USING"
+    if upper.startswith("MERGE"):
+        return "MERGE"
+
+    if upper.startswith("UPDATE"):
+        if re.search(r"\bSET\b.*=\s*0\b", upper, re.S):
+            return "INITIAL_RESET"
+        if re.search(r"\bSET\b.*=\s*NULL\b", upper, re.S):
+            return "NULL_RESET"
+        if "WHERE" in upper:
+            return "SEQUENTIAL_FIXUP"
+        return "UPDATE"
+
+    if "CASE WHEN" in upper or re.search(r"\bCASE\b", upper):
+        return "CASE_VALUE_SELECTION"
+
+    return "SEQUENTIAL_ASSIGNMENT"
+
+
+def _assignment_decomposition_hints(raw_sql: str) -> list[str]:
+    """Return generic notes that help the model keep guard/value/fix-up
+    logic separated when the source SQL is branch-heavy or sequential.
+    """
+    upper = raw_sql.upper()
+    hints: list[str] = []
+
+    if "MERGE INTO" in upper and "USING (" in upper:
+        hints.append("Treat the USING subquery as the value source and the MERGE ON/WHERE predicates as the outer guard.")
+        if "CASE" in upper:
+            hints.append("Preserve the CASE branch choice inside the USING subquery before applying the outer MERGE guard.")
+
+    if upper.startswith("UPDATE"):
+        if re.search(r"\bSET\b.*=\s*0\b", upper, re.S):
+            hints.append("This is an initialization/reset stage, not the final business result.")
+        if re.search(r"\bWHERE\b", upper):
+            hints.append("Keep the WHERE clause as a later row-scoping or fix-up guard instead of folding it into the value.")
+        if re.search(r"\bSET\b.*=\s*(?:[A-Za-z_][A-Za-z0-9_\.]*|NVL\s*\(|COALESCE\s*\()", upper, re.S):
+            hints.append("If this update follows an earlier write to the same column, treat it as a sequential override or backfill rather than a fresh branch tree.")
+
+    if "CASE WHEN" in upper or re.search(r"\bCASE\b", upper):
+        hints.append("Preserve the source CASE branches in order; do not flatten later branches into the first one.")
+
+    return hints
+
+
+def _assignment_decomposition_summary(raw_sql: str) -> list[str]:
+    """Extract a compact guard/value summary from a write site.
+
+    The raw SQL remains available verbatim, but the summary makes the
+    branch split explicit for MERGE/USING and sequential UPDATE patterns.
+    """
+    text = re.sub(r"\s+", " ", raw_sql.strip())
+    upper = text.upper()
+    summary: list[str] = []
+
+    if upper.startswith("MERGE") and "USING (" in upper:
+        value_match = re.search(
+            r"USING\s*\(\s*SELECT\s+.*?,\s*(?P<value>.+?)\s+AS\s+\w+\s+FROM\s+",
+            text,
+            re.IGNORECASE,
+        )
+        if value_match:
+            summary.append(f"assigned value: {value_match.group('value').strip()}")
+
+        guard_parts: list[str] = []
+        where_match = re.search(r"\bWHERE\b\s+(?P<guard>.+?)\s*\)\s*SRC\s+ON\s*\(", text, re.IGNORECASE)
+        if where_match:
+            guard_parts.append(where_match.group("guard").strip())
+        on_match = re.search(r"\bON\s*\((?P<guard>.+?)\)\s*WHEN\s+MATCHED\b", text, re.IGNORECASE)
+        if on_match:
+            guard_parts.append(on_match.group("guard").strip())
+        if guard_parts:
+            summary.append("guard: " + " AND ".join(guard_parts))
+
+    elif upper.startswith("UPDATE"):
+        set_match = re.search(r"\bSET\b\s+(?P<assign>.+?)(?:\bWHERE\b|;|$)", text, re.IGNORECASE)
+        if set_match:
+            summary.append(f"assigned value: {set_match.group('assign').strip()}")
+        where_match = re.search(r"\bWHERE\b\s+(?P<guard>.+?)(?:;|$)", text, re.IGNORECASE)
+        if where_match:
+            summary.append(f"guard: {where_match.group('guard').strip()}")
+
+    return summary
 
 
 def _source_sql_context_excerpt(source_sql: str, relevant_sql: str) -> str:
@@ -447,6 +671,13 @@ def _rewrite_isnotempty_boolean_comparisons(expression: str) -> str:
     )
 
 
+def _rewrite_postfix_isnotempty(expression: str) -> str:
+    pattern = re.compile(
+        r'(?i)(?<![A-Za-z0-9_"])((?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*(?:\.\s*(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*))*)\s+ISNOTEMPTY\b(?!\s*\()'
+    )
+    return pattern.sub(lambda m: f"ISNOTEMPTY({m.group(1).strip()})", expression)
+
+
 def _rewrite_date_function(expression: str) -> str:
     """Rewrite SQL-style DATE(...) wrappers into the documented 4X date
     constructor when the content is a single argument."""
@@ -455,6 +686,14 @@ def _rewrite_date_function(expression: str) -> str:
         return f"TODATE({inner})"
 
     return re.sub(r"(?i)\bDATE\s*\(\s*([^()]+?)\s*\)", replace, expression)
+
+
+def _rewrite_sql_date_literals(expression: str) -> str:
+    return re.sub(
+        r'(?i)\bDATE\s*["\']([^"\']+)["\']',
+        lambda match: f'TODATE("{match.group(1).strip()}")',
+        expression,
+    )
 
 
 def _rewrite_unquoted_dotted_refs(expression: str) -> str:
@@ -499,7 +738,18 @@ def _rewrite_unquoted_dotted_refs(expression: str) -> str:
                 m = l + 1
                 while m < n and expression[m].isspace():
                     m += 1
-                if m >= n or not (expression[m].isalpha() or expression[m] == "_"):
+                if m >= n:
+                    break
+                if expression[m] == '"':
+                    p = m + 1
+                    while p < n and expression[p] != '"':
+                        p += 1
+                    if p >= n:
+                        break
+                    parts.append(expression[m + 1 : p])
+                    k = p + 1
+                    continue
+                if not (expression[m].isalpha() or expression[m] == "_"):
                     break
                 p = m + 1
                 while p < n and (expression[p].isalnum() or expression[p] == "_"):
@@ -516,6 +766,14 @@ def _rewrite_unquoted_dotted_refs(expression: str) -> str:
         i += 1
 
     return "".join(result)
+
+
+def _rewrite_bundled_business_date_var(expression: str) -> str:
+    return re.sub(
+        r'("?[A-Za-z_][A-Za-z0-9_]*"?)\s*\.\s*"var_BUSINESS_DATE"',
+        r'\1."var"."BUSINESS_DATE"',
+        expression,
+    )
 
 
 def _strip_angle_bracket_placeholders(expression: str) -> str:
@@ -584,6 +842,16 @@ def _rewrite_exists_predicates(expression: str) -> str:
         result.append(ch)
         i += 1
     return "".join(result)
+
+
+def _rewrite_in_subquery_membership(expression: str) -> str:
+    """Rewrite a single-row `IN [value WHERE predicate]` subquery shape."""
+    pattern = re.compile(
+        r'(?i)\b(?P<lhs>(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)(?:\s*\.\s*(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*))*)'
+        r'\s+IN\s*\[\s*(?P<rhs>(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)(?:\s*\.\s*(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*))*)'
+        r'\s+WHERE\s+(?P<predicate>[^\]]+?)\s*\]'
+    )
+    return pattern.sub(lambda m: f'{m.group("lhs")} == {m.group("rhs")} AND ({m.group("predicate").strip()})', expression)
 
 
 def _strip_min_wrapper(expression: str) -> str:
@@ -660,6 +928,7 @@ def _repair_missing_then_parentheses(expression: str) -> str:
             depth = 1
             j = start
             local_in_double = False
+            repaired_here = False
             while j < n:
                 cur = expression[j]
                 if cur == '"':
@@ -679,16 +948,23 @@ def _repair_missing_then_parentheses(expression: str) -> str:
                             result.append(")")
                             i = j
                             changed = True
+                            repaired_here = True
                             break
                 j += 1
-            if changed:
+            # Only skip the fallthrough append when *this* IF/ELSEIF was
+            # actually repaired -- `changed` tracks whether any repair has
+            # happened anywhere in the expression so far (for the return
+            # value below) and must never gate the loop's own advancement,
+            # or a later, already-well-formed IF/ELSEIF (one that closes
+            # normally, without needing a repair) would never advance `i`
+            # once an earlier repair had set `changed = True`.
+            if repaired_here:
                 continue
 
         result.append(ch)
         i += 1
 
-    repaired = "".join(result)
-    return repaired if changed else repaired
+    return "".join(result)
 
 
 def _repair_extra_close_before_then(expression: str) -> str:
@@ -965,9 +1241,13 @@ def _normalize_expression(expression: str) -> str:
     expression = _strip_angle_bracket_placeholders(expression)
     expression = _rewrite_not_in_membership(expression)
     expression = _rewrite_is_empty_syntax(expression)
+    expression = _rewrite_postfix_isnotempty(expression)
     expression = _rewrite_isnotempty_boolean_comparisons(expression)
+    expression = _rewrite_sql_date_literals(expression)
     expression = _rewrite_date_function(expression)
+    expression = _rewrite_in_subquery_membership(expression)
     expression = _rewrite_unquoted_dotted_refs(expression)
+    expression = _rewrite_bundled_business_date_var(expression)
     expression = _rewrite_exists_predicates(expression)
     expression = _repair_extra_close_before_then(expression)
     expression = _remove_excess_closing_parens(expression)
@@ -1039,6 +1319,85 @@ def _repair_trailing_self_reference(expression: str, entity_name: str, column: s
     return candidate if candidate != expression else expression
 
 
+def _expression_should_be_rejected(validation_errors: list[str]) -> bool:
+    """Return True when the generated formula is still structurally incomplete.
+
+    These rows should stay in the review store with their validation
+    errors, but they must not be exported as if they were complete
+    formulas.
+    """
+    return any(is_incomplete_expression_error(error) for error in validation_errors)
+
+
+_ColumnJob = tuple[
+    CanonicalModel, SQLObject, StructuralInfo, str, str, LLMClient, str, "dict[int, date] | None", Optional[ChromaStore]
+]
+
+
+def _build_jobs_for_chain(
+    chain: LineageChain,
+    canonical_model: CanonicalModel,
+    objects: dict[str, SQLObject],
+    structural_infos: dict[str, StructuralInfo],
+    llm_client: LLMClient,
+    function_reference: str,
+    entity_name_map: dict[str, str] | None,
+    timekey_map: dict[int, date] | None,
+    rag_store: Optional[ChromaStore],
+) -> list[_ColumnJob]:
+    entity_name_map = entity_name_map or {}
+    jobs: list[_ColumnJob] = []
+    seen_logical_columns: set[tuple[str, str]] = set()
+    for oid in chain.order:
+        obj = objects[oid]
+        info = structural_infos[oid]
+        for target_table, columns in info.columns_written_by_table.items():
+            entity_name = entity_name_map.get(target_table, target_table)
+            for column in columns:
+                canonical_column = canonical_logical_name(column)
+                logical_key = (canonical_logical_name(entity_name), canonical_column)
+                if logical_key in seen_logical_columns:
+                    continue
+                seen_logical_columns.add(logical_key)
+                jobs.append(
+                    (
+                        canonical_model,
+                        obj,
+                        info,
+                        entity_name,
+                        canonical_column,
+                        llm_client,
+                        function_reference,
+                        timekey_map,
+                        rag_store,
+                    )
+                )
+    return jobs
+
+
+def _run_jobs(jobs: list[_ColumnJob]) -> list[DDRow]:
+    """Run every column-generation job (each one independent -- a single
+    column's worth of LLM call + validation) through a bounded worker pool
+    and flatten the results. Each job is network-bound (the LLM call), so
+    threads give real concurrency here despite the GIL.
+    """
+    if not jobs:
+        return []
+
+    max_workers = max(1, min(settings.dd_generation_max_workers, len(jobs)))
+    if max_workers == 1:
+        dd_rows: list[DDRow] = []
+        for job in jobs:
+            dd_rows.extend(_generate_column_rows(job))
+        return dd_rows
+
+    dd_rows = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for rows in executor.map(_generate_column_rows, jobs):
+            dd_rows.extend(rows)
+    return dd_rows
+
+
 def generate_dd_rows(
     chain: LineageChain,
     canonical_model: CanonicalModel,
@@ -1050,43 +1409,46 @@ def generate_dd_rows(
     timekey_map: dict[int, date] | None = None,
     rag_store: Optional[ChromaStore] = None,
 ) -> list[DDRow]:
-    entity_name_map = entity_name_map or {}
-    dd_rows: list[DDRow] = []
+    jobs = _build_jobs_for_chain(
+        chain, canonical_model, objects, structural_infos, llm_client,
+        function_reference, entity_name_map, timekey_map, rag_store,
+    )
+    return _run_jobs(jobs)
 
-    jobs: list[tuple[CanonicalModel, SQLObject, StructuralInfo, str, str, LLMClient, str, dict[int, date] | None, Optional[ChromaStore]]] = []
-    for oid in chain.order:
-        obj = objects[oid]
-        info = structural_infos[oid]
-        for target_table, columns in info.columns_written_by_table.items():
-            entity_name = entity_name_map.get(target_table, target_table)
-            for column in columns:
-                jobs.append(
-                    (
-                        canonical_model,
-                        obj,
-                        info,
-                        entity_name,
-                        column,
-                        llm_client,
-                        function_reference,
-                        timekey_map,
-                        rag_store,
-                    )
-                )
 
-    if not jobs:
-        return dd_rows
+def generate_dd_rows_for_chains(
+    chains: list[LineageChain],
+    canonical_models: list[CanonicalModel],
+    objects: dict[str, SQLObject],
+    structural_infos: dict[str, StructuralInfo],
+    llm_client: LLMClient,
+    function_reference: str,
+    entity_name_map: dict[str, str] | None = None,
+    timekey_map: dict[int, date] | None = None,
+    rag_store: Optional[ChromaStore] = None,
+) -> list[DDRow]:
+    """Same generation logic as `generate_dd_rows`, but batches every
+    column-generation job across every chain into a single worker pool
+    instead of one pool per chain.
 
-    max_workers = max(1, min(settings.dd_generation_max_workers, len(jobs)))
-    if max_workers == 1:
-        for job in jobs:
-            dd_rows.extend(_generate_column_rows(*job))
-        return dd_rows
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        for rows in executor.map(_generate_column_rows, jobs):
-            dd_rows.extend(rows)
-    return dd_rows
+    Processing chains one at a time (each with its own short-lived
+    executor) means chain N+1 can't start until every job in chain N has
+    finished, and a chain with fewer jobs than the worker limit leaves
+    workers idle instead of picking up work from the next chain. Flattening
+    the whole job list first keeps the same bounded worker count fully
+    occupied across the entire run, so multi-chain jobs (the common case --
+    a lineage chain is a *group* of related procedures) finish sooner
+    without changing what gets generated, validated, or how.
+    """
+    all_jobs: list[_ColumnJob] = []
+    for chain, model in zip(chains, canonical_models):
+        all_jobs.extend(
+            _build_jobs_for_chain(
+                chain, model, objects, structural_infos, llm_client,
+                function_reference, entity_name_map, timekey_map, rag_store,
+            )
+        )
+    return _run_jobs(all_jobs)
 
 
 def _generate_for_column(
@@ -1102,25 +1464,28 @@ def _generate_for_column(
 ) -> list[DDRow]:
     relevant_chunks = _relevant_chunks(info, column)
     relevant_sql = "\n\n".join(chunk.raw_sql.strip() for chunk in relevant_chunks if chunk.raw_sql.strip())
+    assignment_context = _format_assignment_context(info, column)
     rag_context = _retrieve_rag_context(
         rag_store, relevant_sql, canonical_model.technical_summary, canonical_model.business_summary
-    )
-
-    raw_output = llm_client.generate_formula_expression(
-        technical_summary=canonical_model.technical_summary,
-        business_summary=canonical_model.business_summary,
-        source_sql=_source_sql_context_excerpt(obj.raw_sql, relevant_sql),
-        function_reference=function_reference,
-        column_name=column,
-        entity_name=entity_name,
-        relevant_sql=relevant_sql,
-        rag_context=rag_context,
     )
 
     derivation_option = DerivationOption.FORMULA_EXPRESSION
     expression: str | None = None
     decision_table_json: str | None = None
     validation_errors: list[str] = []
+    source_sql_excerpt = _source_sql_context_excerpt(obj.raw_sql, relevant_sql)
+    if assignment_context:
+        source_sql_excerpt = _source_sql_context_excerpt(obj.raw_sql, assignment_context)
+    raw_output = llm_client.generate_formula_expression(
+        technical_summary=canonical_model.technical_summary,
+        business_summary=canonical_model.business_summary,
+        source_sql=source_sql_excerpt,
+        function_reference=function_reference,
+        column_name=column,
+        entity_name=entity_name,
+        relevant_sql=assignment_context or relevant_sql,
+        rag_context=rag_context,
+    )
 
     for attempt in range(_MAX_GENERATION_ATTEMPTS):
         derivation_option, expression, decision_table_json, parse_errors = _interpret_llm_output(raw_output)
@@ -1148,7 +1513,28 @@ def _generate_for_column(
             break
 
         validation_errors = attempt_errors
-        break
+        if attempt + 1 >= _MAX_GENERATION_ATTEMPTS:
+            break
+
+        retry_context = "\n\n".join(
+            part
+            for part in [
+                f'Target column: "{entity_name}"."{column}"',
+                f"Ordered assignment context:\n{assignment_context}" if assignment_context else "",
+                f"Relevant SQL:\n{relevant_sql}" if relevant_sql else "",
+                f"Technical summary:\n{canonical_model.technical_summary}" if canonical_model.technical_summary else "",
+                f"Business summary:\n{canonical_model.business_summary}" if canonical_model.business_summary else "",
+                f"Source SQL:\n{source_sql_excerpt}",
+                f"Platform reference:\n{function_reference}",
+                f"RAG context:\n{rag_context}" if rag_context else "",
+            ]
+            if part
+        )
+        raw_output = llm_client.retry_with_error(
+            previous_expression=expression or raw_output,
+            error="\n".join(attempt_errors),
+            context=retry_context,
+        )
 
     confidence = info.confidence if not validation_errors else min(info.confidence, 0.3)
     status = DDStatus.PENDING_REVIEW if validation_errors else DDStatus.ACTIVE
@@ -1157,15 +1543,26 @@ def _generate_for_column(
     if not periods:
         periods = [(date.today(), True, "", 0)]
 
+    if _expression_should_be_rejected(validation_errors):
+        expression = ""
+
     data_type = _infer_data_type(column)
 
     rows = []
     for eff_date, is_real_mapping, variable, representative_value in periods:
-        row_confidence = confidence if is_real_mapping else min(confidence, 0.5)
-        row_status = status if is_real_mapping else DDStatus.PENDING_REVIEW
+        row_confidence = confidence
+        row_status = status
         row_validation_errors = list(validation_errors)
+        advisory_notes: list[str] = []
+
         if not is_real_mapping:
-            row_validation_errors.append(_SYNTHETIC_DATE_REVIEW_NOTE)
+            advisory_notes.append(
+                f"Effective start date {eff_date} is a synthetic estimate because no TIMEKEY-to-calendar-date mapping was supplied for this run."
+            )
+        if not validation_errors and row_confidence < settings.output_guardrail_confidence_threshold:
+            advisory_notes.append(
+                f"Confidence {row_confidence:.3f} is below the advisory threshold {settings.output_guardrail_confidence_threshold:.3f}."
+            )
 
         row_expression = expression or ""
         # Only prune an already-clean expression -- pruning a row that's
@@ -1193,6 +1590,7 @@ def _generate_for_column(
                 source_object_ids=[obj.object_id],
                 confidence=row_confidence,
                 validation_errors=row_validation_errors,
+                advisory_notes=advisory_notes,
             )
         )
     return rows

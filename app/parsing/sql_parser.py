@@ -27,7 +27,7 @@ from sqlglot import exp
 from app.models.core import Dialect, StatementInfo
 
 _DML_KEYWORDS = ("SELECT", "UPDATE", "MERGE", "INSERT", "DELETE")
-_CONTROL_KEYWORDS = ("IF", "BEGIN", "EXCEPTION", "DECLARE", "END", "CASE", "LOOP")
+_CONTROL_KEYWORDS = ("IF", "BEGIN", "EXCEPTION", "DECLARE", "END", "CASE", "LOOP", "WHEN")
 
 _SQLGLOT_DIALECT = {Dialect.ORACLE: "oracle", Dialect.MYSQL: "mysql"}
 

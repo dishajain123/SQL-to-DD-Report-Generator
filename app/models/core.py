@@ -206,6 +206,7 @@ class DDRow(BaseModel):
     source_object_ids: list[str] = Field(default_factory=list)
     confidence: float = 1.0
     validation_errors: list[str] = Field(default_factory=list)
+    advisory_notes: list[str] = Field(default_factory=list)
 
 
 class ReviewAction(str, Enum):

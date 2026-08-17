@@ -68,20 +68,54 @@ class ChromaStore:
     def __init__(self, persist_dir: str | None = None, embedding_function=None):
         self._client = chromadb.PersistentClient(path=persist_dir or settings.chroma_persist_dir)
         self._embedding_function = embedding_function or HashingEmbeddingFunction()
+        self._collection_cache: dict[str, object] = {}
+        # Query results are pure functions of (collection contents,
+        # query_text, n_results) given the deterministic hashing embedding
+        # function, so caching by that key is always correct as long as the
+        # cache is cleared whenever a collection's contents change -- see
+        # add_documents(). This matters because the same query_text is
+        # frequently repeated: app/derivation/dd_generator.py's per-column
+        # RAG lookup issues the same domain-collection query (derived from
+        # the chain's business_summary, which is constant for every column
+        # in that chain) once per column, so without this cache a chain
+        # with N columns does N redundant embed+search round trips for a
+        # single distinct query.
+        self._query_cache: dict[tuple[str, str, int], list[str]] = {}
 
     def _collection(self, name: str):
-        return self._client.get_or_create_collection(name, embedding_function=self._embedding_function)
+        cached = self._collection_cache.get(name)
+        if cached is not None:
+            return cached
+        col = self._client.get_or_create_collection(name, embedding_function=self._embedding_function)
+        self._collection_cache[name] = col
+        return col
 
     def add_documents(self, collection: str, documents: list[str], ids: list[str], metadatas: list[dict] | None = None) -> None:
         self._collection(collection).add(documents=documents, ids=ids, metadatas=metadatas)
+        # Invalidate any cached query results for this collection -- its
+        # contents just changed, so a previously-cached answer could now be
+        # stale (e.g. an empty-result cache entry from before anything was
+        # ingested).
+        stale_keys = [key for key in self._query_cache if key[0] == collection]
+        for key in stale_keys:
+            del self._query_cache[key]
 
     def query(self, collection: str, query_text: str, n_results: int = 3) -> list[str]:
+        cache_key = (collection, query_text, n_results)
+        cached = self._query_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         col = self._collection(collection)
-        if col.count() == 0:
+        count = col.count()
+        if count == 0:
+            self._query_cache[cache_key] = []
             return []
-        results = col.query(query_texts=[query_text], n_results=min(n_results, col.count()))
+        results = col.query(query_texts=[query_text], n_results=min(n_results, count))
         docs = results.get("documents", [[]])
-        return docs[0] if docs else []
+        found = docs[0] if docs else []
+        self._query_cache[cache_key] = found
+        return found
 
     def count(self, collection: str) -> int:
         return self._collection(collection).count()
