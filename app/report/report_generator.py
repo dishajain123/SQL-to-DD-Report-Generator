@@ -223,7 +223,6 @@ def _summarize_process_overview(job_plan: JobPlan, canonical_models: list[Canoni
         f"Company: {job_plan.company}",
         f"Platform: {job_plan.platform}",
         f"Intent: {job_plan.intent.value}",
-        f"Include DD Excel: {'Yes' if job_plan.include_dd_excel else 'No'}",
     ]
     if unique_source_procedures:
         inputs.append("Source files: " + ", ".join(unique_source_procedures))
@@ -326,6 +325,91 @@ def _aggregation_lines(rule_groups: list[_RuleGroup]) -> list[str]:
     return lines
 
 
+def _business_rule_explanation_lines(rule: _RuleGroup) -> list[str]:
+    expr = rule.formula.upper()
+    lines: list[str] = []
+
+    if "TODATE(" in expr and "1900-01-01" in expr:
+        lines.append(
+            "This rule clears placeholder dates so downstream calculations do not treat 1 Jan 1900 as a real business date."
+        )
+    if "P_TIMEKEY" in expr and "26267" in expr:
+        lines.append(
+            "This rule changes behavior after a period cutoff, which means the business logic was revised for later processing dates."
+        )
+    if "AQUA_SCHEME" in expr or "SCHEMETYPE" in expr:
+        lines.append(
+            "This rule gives special treatment to Aqua/ODA accounts so those products follow their own processing rules instead of the normal one."
+        )
+    if "SOURCEALT_KEY" in expr and "==6" in expr:
+        lines.append(
+            "This rule keeps a special zero-day adjustment for SourceAlt_Key 6, so that branch follows the documented exception."
+        )
+    if "MAX(" in expr:
+        lines.append(
+            "This rule compares the eligible drivers and keeps the highest one, because the business outcome depends on the most severe applicable value."
+        )
+    if "COALESCE(" in expr:
+        lines.append(
+            "This rule uses fallback values when a field is blank, so missing data does not break the calculation."
+        )
+    if "ELSEIF(" in expr or "CASE" in expr:
+        lines.append(
+            "This rule is branch-based, so the final value depends on which source condition is true first."
+        )
+    if "SP_EXPIRYDATE" in expr or "RESTRUCTUREDT" in expr or "PRERESTRUCTURENPA_DATE" in expr:
+        lines.append(
+            "This rule checks whether a restructure or expiry is still active, then chooses the appropriate NPA-related date."
+        )
+    if "REFPERIOD" in expr:
+        lines.append(
+            "This rule preserves the period-specific reference amount tied to the chosen DPD driver, then carries that value forward into later calculations."
+        )
+    if "NULL" in expr and "ELSE(NULL)" in expr:
+        lines.append(
+            "This rule intentionally returns no value when none of the business conditions match, which prevents a false positive result."
+        )
+    if not lines:
+        lines.append(
+            "This rule follows the source procedure exactly and maps the source conditions into a business decision for the target column."
+        )
+
+    if len(rule.rows) > 1:
+        lines.append(
+            f"The same rule appears on multiple effective dates ({rule.effective_dates}), which means the business logic was revised over time and both versions are preserved."
+        )
+
+    return lines
+
+
+def _business_rules_section(rule_groups: list[_RuleGroup]) -> list[str]:
+    lines: list[str] = []
+    lines.append("## 6. Business Rules / Logic Explanation")
+    lines.append("")
+    if not rule_groups:
+        lines.append("- No generated rules were available for explanation.")
+        return lines
+
+    for entity_name, rules in _rules_by_entity(rule_groups):
+        lines.append(f"### {entity_name}")
+        lines.append("")
+        lines.append("| Rule ID | Column | Business Logic | Special Cases | Effective Dates |")
+        lines.append("|---|---|---|---|---|")
+        for rule in rules:
+            details = _business_rule_explanation_lines(rule)
+            summary = rule.business_meaning
+            special_cases = "; ".join(details)
+            if rule.status == "PENDING_REVIEW":
+                summary = f"PENDING_REVIEW: {summary}"
+            elif rule.advisory_notes:
+                summary = f"{summary} (advisory)"
+            lines.append(
+                f"| {rule.rule_id} | {rule.column_name} | {summary} | {_flatten_for_table_cell(special_cases)} | {rule.effective_dates} |"
+            )
+        lines.append("")
+    return lines
+
+
 def _period_rule_rows(rule_groups: list[_RuleGroup]) -> list[tuple[str, str, str, str, str]]:
     rows: list[tuple[str, str, str, str, str]] = []
     for rule in rule_groups:
@@ -361,10 +445,7 @@ def _traceability_lines(job_plan: JobPlan, canonical_models: list[CanonicalModel
     if advisory:
         notes.append(f"- {len(advisory)} rows carry advisory notes only and remain auto-validated.")
 
-    if job_plan.include_dd_excel:
-        notes.append("- The reviewed DD Excel export can be regenerated from the current saved rows.")
-    else:
-        notes.append("- DD Excel export was not requested for this job.")
+    notes.append("- The reviewed DD CSV export can be regenerated from the current saved rows.")
 
     return source_refs or ["- No source reference metadata was available."], notes
 
@@ -484,6 +565,9 @@ def generate_report(
             lines.append(f"- {row.entity_name}.{row.column_name} [{row.effective_start_date}]: {notes}")
     else:
         lines.append("- None.")
+
+    lines.append("")
+    lines.extend(_business_rules_section(rule_groups))
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)

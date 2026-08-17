@@ -1,9 +1,8 @@
 from datetime import date
-
-import openpyxl
+import csv
 
 from app.models.core import ColumnType, DDRow, DDStatus, DerivationOption
-from app.report.excel_export import COLUMNS, export_dd_rows
+from app.report.excel_export import COLUMNS, export_dd_rows, read_existing_dd_excel
 
 
 def _sample_row(**overrides) -> DDRow:
@@ -22,30 +21,25 @@ def _sample_row(**overrides) -> DDRow:
     return DDRow(**defaults)
 
 
+def _read_csv(path):
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        return list(csv.DictReader(f))
+
+
 def test_export_writes_correct_headers(tmp_path):
-    out = export_dd_rows([_sample_row()], tmp_path / "dd.xlsx")
-    wb = openpyxl.load_workbook(out)
-    ws = wb.active
-    headers = [ws.cell(1, c).value for c in range(1, len(COLUMNS) + 1)]
-    assert headers == COLUMNS
+    out = export_dd_rows([_sample_row()], tmp_path / "dd.csv")
+    rows = _read_csv(out)
+    assert list(rows[0].keys()) == COLUMNS
 
 
 def test_export_writes_row_data(tmp_path):
     row = _sample_row()
-    out = export_dd_rows([row], tmp_path / "dd.xlsx")
-    wb = openpyxl.load_workbook(out)
-    ws = wb.active
-    assert ws.cell(2, 1).value == "FCT_NPA_PRODUCT"
-    assert ws.cell(2, 2).value == "DPD_Overdue"
-    assert ws.cell(2, 4).value == "Formula Expression"
-    assert ws.cell(2, 5).value == row.display_derivation_expression
-
-
-def test_export_freezes_header_row(tmp_path):
-    out = export_dd_rows([_sample_row()], tmp_path / "dd.xlsx")
-    wb = openpyxl.load_workbook(out)
-    ws = wb.active
-    assert ws.freeze_panes == "A2"
+    out = export_dd_rows([row], tmp_path / "dd.csv")
+    rows = _read_csv(out)
+    assert rows[0]["Entity Name"] == "FCT_NPA_PRODUCT"
+    assert rows[0]["Column Name"] == "DPD_Overdue"
+    assert rows[0]["Derivation Option"] == "Formula Expression"
+    assert rows[0]["Display Derivation Expression"] == row.display_derivation_expression
 
 
 def test_export_handles_decision_table_rows(tmp_path):
@@ -54,53 +48,45 @@ def test_export_handles_decision_table_rows(tmp_path):
         display_derivation_expression="",
         decision_table_json='{"buckets": [{"max_dpd": 0, "label": "Standard"}]}',
     )
-    out = export_dd_rows([row], tmp_path / "dd.xlsx")
-    wb = openpyxl.load_workbook(out)
-    ws = wb.active
-    assert ws.cell(2, 9).value == row.decision_table_json
+    out = export_dd_rows([row], tmp_path / "dd.csv")
+    rows = _read_csv(out)
+    assert rows[0]["Decision Table Json"] == row.decision_table_json
 
 
 def test_merge_preserves_unrelated_existing_rows(tmp_path):
-    from app.report.excel_export import read_existing_dd_excel
-
-    # First run: two unrelated columns.
     row_a = _sample_row(column_name="DPD_Overdue")
     row_b = _sample_row(column_name="DPD_Renewal")
-    first_path = tmp_path / "dd.xlsx"
+    first_path = tmp_path / "dd.csv"
     export_dd_rows([row_a, row_b], first_path)
 
-    # Second run: only regenerates DPD_Overdue (e.g. one proc changed).
     updated_a = _sample_row(
         column_name="DPD_Overdue",
         display_derivation_expression='IF(ISNOTEMPTY("A"."X"))THEN(1)ELSE(0)',
     )
-    second_path = tmp_path / "dd_v2.xlsx"
+    second_path = tmp_path / "dd_v2.csv"
     export_dd_rows([updated_a], second_path, existing_dd_path=first_path)
 
     merged = read_existing_dd_excel(second_path)
     by_column = {r["column_name"]: r for r in merged}
 
-    # DPD_Renewal was untouched by the second run -- must still be present.
     assert "DPD_Renewal" in by_column
-    # DPD_Overdue must be the NEW expression, not duplicated.
     assert sum(1 for r in merged if r["column_name"] == "DPD_Overdue") == 1
     assert by_column["DPD_Overdue"]["display_derivation_expression"] == updated_a.display_derivation_expression
 
 
 def test_merge_with_no_existing_file_behaves_like_fresh_export(tmp_path):
     row = _sample_row()
-    out = export_dd_rows([row], tmp_path / "dd.xlsx", existing_dd_path=tmp_path / "does_not_exist.xlsx")
-    wb = openpyxl.load_workbook(out)
-    assert wb.active.max_row == 2  # header + one row
+    out = export_dd_rows([row], tmp_path / "dd.csv", existing_dd_path=tmp_path / "does_not_exist.csv")
+    assert len(_read_csv(out)) == 1
 
 
 def test_export_dedupes_equivalent_rows_across_effective_dates(tmp_path):
     row_a = _sample_row(effective_start_date=date(2026, 1, 1))
     row_b = _sample_row(effective_start_date=date(2026, 3, 1))
-    out = export_dd_rows([row_a, row_b], tmp_path / "dd.xlsx")
-    wb = openpyxl.load_workbook(out)
-    assert wb.active.max_row == 2
-    assert wb.active.cell(2, 6).value == "01-01-2026"
+    out = export_dd_rows([row_a, row_b], tmp_path / "dd.csv")
+    rows = _read_csv(out)
+    assert len(rows) == 1
+    assert rows[0]["Effective Start Date"] == "01-01-2026"
 
 
 def test_export_dedupes_case_variant_logical_columns(tmp_path):
@@ -112,14 +98,11 @@ def test_export_dedupes_case_variant_logical_columns(tmp_path):
         column_name="REFPeriodMax",
         display_derivation_expression='IF(ISEMPTY(REFPeriodMax))THEN(0)ELSE(REFPeriodMax)',
     )
-    out = export_dd_rows([row_a, row_b], tmp_path / "dd.xlsx")
-    wb = openpyxl.load_workbook(out)
-    ws = wb.active
-    assert ws.max_row == 2
-    assert ws.cell(2, 2).value.upper() == "REFPERIODMAX"
+    out = export_dd_rows([row_a, row_b], tmp_path / "dd.csv")
+    rows = _read_csv(out)
+    assert len(rows) == 1
+    assert rows[0]["Column Name"].upper() == "REFPERIODMAX"
 
 
 def test_read_existing_dd_excel_returns_empty_for_missing_file(tmp_path):
-    from app.report.excel_export import read_existing_dd_excel
-
-    assert read_existing_dd_excel(tmp_path / "nope.xlsx") == []
+    assert read_existing_dd_excel(tmp_path / "nope.csv") == []

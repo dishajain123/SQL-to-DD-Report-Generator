@@ -20,7 +20,7 @@ from app.parsing.dialect import detect_dialect
 from app.parsing.object_splitter import split_objects
 from app.parsing.structural_analysis import analyze_object
 from app.rag.chroma_store import ChromaStore
-from app.report.excel_export import export_dd_rows
+from app.report.excel_export import export_dd_rows_csv
 from app.report.report_generator import generate_report
 from app.utils import db
 from app.utils.config import settings
@@ -42,8 +42,8 @@ class PipelineState(TypedDict, total=False):
     function_reference: str
     entity_name_map: dict[str, str]
     report_path: str
-    excel_path: str
-    existing_dd_excel_path: str
+    csv_path: str
+    existing_dd_csv_path: str
 
 
 def node_split_and_parse(state: PipelineState) -> PipelineState:
@@ -191,17 +191,16 @@ def node_report_and_export(state: PipelineState) -> PipelineState:
     )
     state["report_path"] = str(report_path)
 
-    if job_plan.include_dd_excel and state.get("dd_rows"):
-        excel_output_path = output_dir / "dd_export.xlsx"
-        existing_path = state.get("existing_dd_excel_path")
-        excel_path = export_dd_rows(state["dd_rows"], excel_output_path, existing_dd_path=existing_path)
-        state["excel_path"] = str(excel_path)
+    if state.get("dd_rows"):
+        csv_output_path = output_dir / "dd_export.csv"
+        existing_path = state.get("existing_dd_csv_path")
+        csv_path = export_dd_rows_csv(state["dd_rows"], csv_output_path, existing_dd_path=existing_path)
+        state["csv_path"] = str(csv_path)
 
     db.update_job_status(
         job_plan.job_id,
         "COMPLETED",
         report_path=state.get("report_path"),
-        excel_path=state.get("excel_path"),
     )
     return state
 

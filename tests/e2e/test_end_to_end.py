@@ -14,7 +14,7 @@ def test_full_pipeline_generate_dd(
 
     job_plan = JobPlan(
         job_id="job-e2e-1", intent=Intent.GENERATE_DD, company="Acme Bank",
-        platform="4X", include_dd_excel=True,
+        platform="4X",
     )
     pipeline = build_pipeline(llm_client=mock_llm_client)
 
@@ -48,13 +48,11 @@ def test_full_pipeline_generate_dd(
     assert "DD Conditions" in report_text
     assert "DPD_Calculation" in report_text or "MaxDPD_ReferencePeriod_Calculation" in report_text
 
-    # Excel export happened because include_dd_excel was True
-    assert result.get("excel_path")
-    import openpyxl
-    wb = openpyxl.load_workbook(result["excel_path"])
-    ws = wb.active
-    assert ws.cell(1, 1).value == "Entity Name"
-    assert ws.max_row > 1
+    # CSV export happened because DD generation produced rows.
+    assert result.get("csv_path")
+    csv_text = open(result["csv_path"]).read()
+    assert "Entity Name,Column Name,Column Type" in csv_text.splitlines()[0]
+    assert len(csv_text.splitlines()) > 1
 
 
 def test_full_pipeline_skips_dd_generation_for_explain_intent(

@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import streamlit as st
 
 from app.review import review_store
-from app.report.excel_export import export_reviewed_dd_rows_for_job, export_reviewed_dd_rows_for_job_csv
+from app.report.excel_export import export_reviewed_dd_rows_for_job_csv
 from app.utils import db
 from app.utils.config import settings
 
@@ -193,7 +193,7 @@ def _render_business_understanding_download(api_base_url: str, job_id: str, fina
 def _list_jobs() -> list[dict]:
     with db.get_connection() as conn:
         rows = conn.execute(
-            "SELECT job_id, company, platform, intent, status, run_number, report_path, excel_path, created_at, updated_at "
+            "SELECT job_id, company, platform, intent, status, run_number, report_path, created_at, updated_at "
             "FROM jobs ORDER BY COALESCE(run_number, 0) DESC, updated_at DESC"
         ).fetchall()
     return [dict(row) for row in rows]
@@ -206,30 +206,6 @@ def _get_job_dd_rows(job_id: str) -> list[dict]:
             (job_id,),
         ).fetchall()
     return [dict(row) for row in rows]
-
-
-def _download_reviewed_excel(api_base_url: str, job_id: str) -> None:
-    excel_url = api_base_url.rstrip("/") + f"/api/jobs/{job_id}/excel"
-    try:
-        status, payload = _get_bytes(excel_url)
-    except RuntimeError as exc:
-        st.warning(f"Could not fetch the reviewed Excel from the API: {exc}. Falling back to a local export.")
-        fallback_path = export_reviewed_dd_rows_for_job(job_id, db.get_job_output_dir(job_id) / "dd_export.xlsx")
-        payload = fallback_path.read_bytes()
-        status = 200
-
-    if status >= 400:
-        fallback_path = export_reviewed_dd_rows_for_job(job_id, db.get_job_output_dir(job_id) / "dd_export.xlsx")
-        payload = fallback_path.read_bytes()
-        status = 200
-
-    st.download_button(
-        label="Download Reviewed Excel",
-        data=payload,
-        file_name=f"dd_export_{job_id}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key=f"download-reviewed-excel-{job_id}",
-    )
 
 
 def _download_reviewed_csv(api_base_url: str, job_id: str) -> None:
@@ -262,7 +238,6 @@ def _render_submission_tab() -> None:
 
     with st.form("job_submission_form", clear_on_submit=False):
         api_base_url = st.text_input("API base URL", value=DEFAULT_API_BASE_URL)
-        include_dd_excel = st.checkbox("Include DD Excel export", value=False)
         uploaded_files = st.file_uploader(
             "SQL files",
             type=["sql"],
@@ -323,7 +298,6 @@ def _render_submission_tab() -> None:
         "company": settings.default_company_name,
         "platform": settings.default_platform_name,
         "intent": settings.default_intent,
-        "include_dd_excel": include_dd_excel,
         "function_reference": function_reference,
         "entity_name_map": entity_name_map,
         "files": files,
@@ -408,14 +382,13 @@ def _render_review_tab() -> None:
     m1, m2, m3 = st.columns(3)
     m1.metric("DD rows", len(dd_rows))
     m2.metric("Pending review", len(pending))
-    m3.metric("Excel ready", "Yes" if selected_job_row.get("excel_path") else "No")
+    m3.metric("CSV ready", "Yes" if selected_job_row.get("report_path") else "No")
 
     st.caption(
         f"Run #{selected_job_row.get('run_number', '-') or '-'} | Company: {selected_job_row['company']} | "
         f"Platform: {selected_job_row['platform']} | Intent: {selected_job_row['intent']}"
     )
 
-    _download_reviewed_excel(review_api_base_url, selected_job)
     _download_reviewed_csv(review_api_base_url, selected_job)
 
     if not pending:

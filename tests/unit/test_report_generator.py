@@ -22,7 +22,7 @@ def _row(**overrides) -> DDRow:
 
 
 def test_report_uses_required_structure_and_rule_ids(tmp_path):
-    job_plan = JobPlan(job_id="job-1", intent=Intent.GENERATE_DD, company="Acme", platform="4X", include_dd_excel=True)
+    job_plan = JobPlan(job_id="job-1", intent=Intent.GENERATE_DD, company="Acme", platform="4X")
     model = CanonicalModel(
         chain_id="chain-1",
         job_id="job-1",
@@ -55,16 +55,19 @@ def test_report_uses_required_structure_and_rule_ids(tmp_path):
     assert "## 3. Business Logic" in text
     assert "## 4. Column-Level Derivations & DD Conditions" in text
     assert "## 5. Process Control & Traceability" in text
+    assert "## 6. Business Rules / Logic Explanation" in text
+    assert "| Rule ID | Column | Business Logic | Special Cases | Effective Dates |" in text
     assert "| Rule ID | Entity | Column | Effective Dates | Period Logic |" in text
     assert "| Column | Business Meaning | Depends On | Rule ID | Platform Formula | Effective Dates |" in text
     assert "BR-001" in text
     assert "BR-002" not in text  # only one logical rule group because the formulas differ only by case
     assert text.count("BR-001") >= 2
     assert "IF(ISEMPTY(\"FCT_NPA_PRODUCT\".\"REFPERIODMAX\"))THEN(0)ELSE(\"FCT_NPA_PRODUCT\".\"REFPERIODMAX\")" in text
+    assert "This rule preserves the period-specific reference amount" in text
 
 
 def test_report_marks_pending_review_items_without_altering_formula(tmp_path):
-    job_plan = JobPlan(job_id="job-2", intent=Intent.GENERATE_DD, company="Acme", platform="4X", include_dd_excel=False)
+    job_plan = JobPlan(job_id="job-2", intent=Intent.GENERATE_DD, company="Acme", platform="4X")
     model = CanonicalModel(
         chain_id="chain-2",
         job_id="job-2",

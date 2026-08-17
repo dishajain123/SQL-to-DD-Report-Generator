@@ -1,7 +1,7 @@
 """Core domain models shared across the pipeline.
 
 These are the objects that flow between pipeline stages (parsing -> lineage ->
-derivation -> report/excel). Keeping them centralized avoids each module
+derivation -> report/CSV). Keeping them centralized avoids each module
 inventing its own shape for the same concept.
 """
 from __future__ import annotations
@@ -50,7 +50,6 @@ class JobPlan(BaseModel):
     intent: Intent
     company: str
     platform: str
-    include_dd_excel: bool = False
 
     @property
     def requires_dd_generation(self) -> bool:

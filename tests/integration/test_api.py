@@ -77,7 +77,6 @@ def test_submit_job_passes_optional_context_to_pipeline(client, dpd_calculation_
             "company": "Acme",
             "platform": "4X",
             "intent": "Generate DD",
-            "include_dd_excel": True,
             "function_reference": "IF / THEN / ELSE reference",
             "entity_name_map": {"AccountCal_Stg": "FCT_NPA_PRODUCT"},
             "files": {"dpd.sql": dpd_calculation_sql},

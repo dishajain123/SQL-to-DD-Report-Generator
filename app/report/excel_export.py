@@ -1,22 +1,9 @@
-"""Architecture step 18: DD Excel Export.
+"""Architecture step 18: DD CSV Export.
 
-Writes DD rows to .xlsx using the exact column schema observed in the
-platform's own Derivations export (Entity Name, Column Name, Column Type,
-Derivation Option, Display Derivation Expression, Effective Start Date,
-Status, Data Type, Decision Table Json, Conditional Json).
-
-Supports merging into an existing DD export: rows not touched by this run
-are preserved untouched; rows this run regenerated (same Entity+Column+
-Effective Start Date) are replaced, not duplicated. This matters because a
-DD Excel is a living document — re-running the pipeline on one changed
-procedure should not wipe out everything else the team has already
-reviewed and accepted.
-
-The existing DD export can be supplied either as a real .xlsx/.xlsm
-workbook or as a .csv export of the exact same column schema (e.g. a CSV
-saved out of Excel) — both are read into the same internal row shape before
-merging, so which format the platform's own DD export happens to be saved
-in does not matter as long as the column names/order match.
+Writes DD rows to a CSV file using the exact column schema observed in the
+platform's Derivations export. The exported CSV is treated as the
+human-editable, round-trippable artifact for this pipeline; no spreadsheet
+workbook is generated anywhere in this codebase.
 """
 from __future__ import annotations
 
@@ -24,11 +11,6 @@ import csv
 import json
 from datetime import date
 from pathlib import Path
-
-import openpyxl
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill
-from openpyxl.utils import get_column_letter
 
 from app.models.core import DDRow
 from app.utils.identity import canonical_expression_key, canonical_logical_name
@@ -59,11 +41,6 @@ _COLUMN_KEYS = {
     "Decision Table Json": "decision_table_json",
     "Conditional Json": "conditional_json",
 }
-
-# File extensions treated as CSV-style exports of the Derivations schema,
-# rather than real spreadsheet workbooks.
-_CSV_EXTENSIONS = {".csv"}
-
 
 def dd_row_to_dict(dd: DDRow) -> dict:
     return {
@@ -147,17 +124,6 @@ def _dedupe_equivalent_rows(rows: list[dict]) -> list[dict]:
     return list(grouped.values())
 
 
-def _read_existing_dd_xlsx(path: Path) -> list[dict]:
-    wb = openpyxl.load_workbook(path)
-    ws = wb.active
-    header = [cell.value for cell in ws[1]]
-    rows = []
-    for row_cells in ws.iter_rows(min_row=2, values_only=True):
-        row_dict = dict(zip(header, row_cells))
-        rows.append({_COLUMN_KEYS[h]: row_dict.get(h, "") for h in COLUMNS if h in _COLUMN_KEYS})
-    return rows
-
-
 def _read_existing_dd_csv(path: Path) -> list[dict]:
     rows = []
     with path.open("r", encoding="utf-8-sig", newline="") as f:
@@ -170,21 +136,17 @@ def _read_existing_dd_csv(path: Path) -> list[dict]:
 
 
 def read_existing_dd_excel(path: str | Path) -> list[dict]:
-    """Read an existing DD export back into plain dict rows, keyed the same
-    way dd_row_to_dict produces them, so it can be merged against new rows.
+    """Backward-compatible name retained for callers/tests.
 
-    Accepts either a real .xlsx/.xlsm workbook or a .csv export of the same
-    column schema (matched purely by file extension — the column
-    names/order in the file are what actually define compatibility, not
-    the container format). Returns [] if the file doesn't exist yet (first
-    run)."""
+    Reads a CSV DD export back into plain dict rows, keyed the same way
+    `dd_row_to_dict` produces them, so it can be merged against new rows.
+    Returns [] if the file doesn't exist yet (first run).
+    """
     path = Path(path)
     if not path.exists():
         return []
 
-    if path.suffix.lower() in _CSV_EXTENSIONS:
-        return _read_existing_dd_csv(path)
-    return _read_existing_dd_xlsx(path)
+    return _read_existing_dd_csv(path)
 
 
 def merge_dd_rows(existing: list[dict], new_rows: list[DDRow]) -> list[dict]:
@@ -206,41 +168,6 @@ def export_dd_rows(
     else:
         merged = _dedupe_equivalent_rows([dd_row_to_dict(r) for r in dd_rows])
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Derivations"
-
-    header_font = Font(name="Arial", bold=True, color="FFFFFF")
-    header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
-    for col_idx, header in enumerate(COLUMNS, start=1):
-        cell = ws.cell(row=1, column=col_idx, value=header)
-        cell.font = header_font
-        cell.fill = header_fill
-
-    for row_idx, row_dict in enumerate(merged, start=2):
-        for col_idx, header in enumerate(COLUMNS, start=1):
-            key = _COLUMN_KEYS[header]
-            ws.cell(row=row_idx, column=col_idx, value=row_dict.get(key, ""))
-
-    for col_idx in range(1, len(COLUMNS) + 1):
-        ws.column_dimensions[get_column_letter(col_idx)].width = 26
-    ws.freeze_panes = "A2"
-
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(output_path)
-    return output_path
-
-
-def export_dd_rows_csv(
-    dd_rows: list[DDRow], output_path: str | Path, existing_dd_path: str | Path | None = None
-) -> Path:
-    if existing_dd_path is not None:
-        existing = read_existing_dd_excel(existing_dd_path)
-        merged = merge_dd_rows(existing, dd_rows)
-    else:
-        merged = _dedupe_equivalent_rows([dd_row_to_dict(r) for r in dd_rows])
-
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8", newline="") as f:
@@ -249,6 +176,12 @@ def export_dd_rows_csv(
         for row in merged:
             writer.writerow({header: row.get(_COLUMN_KEYS[header], "") for header in COLUMNS})
     return output_path
+
+
+def export_dd_rows_csv(
+    dd_rows: list[DDRow], output_path: str | Path, existing_dd_path: str | Path | None = None
+) -> Path:
+    return export_dd_rows(dd_rows, output_path, existing_dd_path=existing_dd_path)
 
 
 def export_reviewed_dd_rows_for_job(
