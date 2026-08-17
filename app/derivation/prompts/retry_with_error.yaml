@@ -35,6 +35,25 @@ system: |
   - If the error is about self-reference, only keep the target column in
     the expression when the source SQL explicitly preserves that same
     target column with NVL/COALESCE or an increment pattern.
+  - Never emit literal angle-bracket placeholders like `<entity_name>` or
+    `<FCT_NPA_PRODUCT>`; replace them with the actual entity name used in
+    the target column context.
+  - Every `THEN(...)` and `ELSE(...)` must be wrapped in its OWN single
+    pair of parentheses spanning the entire value, immediately after the
+    `THEN`/`ELSE` keyword with no space or other character in between. A
+    common mistake ported from SQL `CASE WHEN ... THEN x + 1 ELSE y END`
+    is leaving an inner arithmetic grouping paren (e.g. `THEN (a - b) + 1
+    ELSE 0`) without adding the outer 4X wrapper — the whole value,
+    including anything added or compared after an inner grouping, must
+    sit inside one `THEN(...)` or `ELSE(...)`, e.g.
+    `THEN((a - b) + 1)ELSE(0)`. If the error points at a position after a
+    `+`, `-`, arithmetic operator, or a bare value following `THEN` or
+    `ELSE`, this is almost always the cause — add the missing outer
+    parentheses around the complete value rather than changing the logic
+    itself.
+  - If you see `IF(cond))THEN(...)`, remove the extra `)` before `THEN`.
+    The `IF` condition must close exactly once, immediately before
+    `THEN`.
 
   Do not add any explanation, markdown formatting, or code fences.
 

@@ -115,8 +115,8 @@ def download_business_understanding_report(job_id: str) -> FileResponse:
         raise HTTPException(status_code=404, detail="Job not found")
 
     job = dict(row)
-    status = job.get("status")
-    report_path = job.get("report_path")
+    status = job["status"]
+    report_path = job["report_path"]
 
     if status != "COMPLETED":
         raise HTTPException(
@@ -177,7 +177,7 @@ def download_reviewed_dd_csv(job_id: str) -> FileResponse:
 
     output_path = db.get_job_output_dir(job_id) / "dd_export.csv"
     exported_path = export_reviewed_dd_rows_for_job_csv(job_id, output_path)
-    db.update_job_status(job_id, job["status"], excel_path=job.get("excel_path"))
+    db.update_job_status(job_id, job["status"], excel_path=job["excel_path"])
 
     if not exported_path.exists():
         raise HTTPException(status_code=404, detail="CSV export could not be generated")

@@ -9,7 +9,7 @@ from typing import Any, Optional, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from app.derivation.canonical_model import build_canonical_model
-from app.derivation.dd_generator import generate_dd_rows
+from app.derivation.dd_generator import flag_duplicate_dd_rows, generate_dd_rows
 from app.derivation.llm_client import LLMClient
 from app.guardrails.output_guardrails import check_dd_row
 from app.guardrails.structural_guardrails import check_structural_info
@@ -127,6 +127,7 @@ def node_dd_generation(
                 row.status = row.status.__class__.PENDING_REVIEW
             all_rows.append(row)
 
+    all_rows = flag_duplicate_dd_rows(all_rows)
     state["dd_rows"] = all_rows
     for i, row in enumerate(all_rows):
         db.record_dd_row(state["job_plan"].job_id, row.source_chain_id, i, row.model_dump())

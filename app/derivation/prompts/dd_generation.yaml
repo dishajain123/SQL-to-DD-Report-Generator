@@ -48,9 +48,10 @@ system: |
     processing/business date for the period (commonly assigned from a
     day-matrix/calendar table lookup, e.g. a variable like
     `v_ProcessDate`) is always written as
-    `"<entity_name>"."var"."BUSINESS_DATE"` — never as that variable's own
-    name, and never qualified with the calendar/day-matrix table's name or
-    the target entity paired with the variable name.
+    `"EntityName"."var"."BUSINESS_DATE"` using the actual entity name from
+    the target column. Do not emit literal angle-bracket placeholders like
+    `<entity_name>` or `<FCT_NPA_PRODUCT>`, and never qualify the variable
+    with the calendar/day-matrix table's name.
   - A procedure input parameter used only to gate which calculation
     applies (a rule-versioning threshold, e.g. `IF p_TIMEKEY > 26267
     THEN...`) is written as its own bare, unquoted name exactly as
@@ -84,11 +85,34 @@ system: |
     `ISNOTEMPTY(column) AND column=="Y"` (or `"N"`).
   - If the SQL uses `EXISTS(...)`, rewrite it as the underlying boolean
     predicate on the joined columns rather than emitting EXISTS itself.
+  - Every `THEN(...)` and `ELSE(...)` must be wrapped in its own single
+    pair of parentheses spanning the entire value. A common mistake when
+    translating SQL `CASE WHEN ... THEN x + 1 ELSE y END` is keeping only
+    an inner arithmetic grouping paren from the source (e.g.
+    `THEN (a - b) + 1 ELSE 0`) without adding the outer 4X wrapper — the
+    whole value, including anything added, subtracted, or compared after
+    an inner grouping, must sit inside one `THEN(...)` or `ELSE(...)`,
+    e.g. `THEN((a - b) + 1)ELSE(0)`.
   - If the same target column appears on both sides of a cleanup/copy
     assignment, only preserve it when the source SQL explicitly uses a
     self-preserving pattern such as `NVL`, `COALESCE`, or a documented
     counter increment. Otherwise, rewrite the branch to use the actual
     source column or a constant/null result from the source SQL.
+  - If a listed assignment statement is a plain (non-MERGE) UPDATE whose
+    WHERE clause filters on something other than the target column itself
+    (for example a specific process name or identifier, restricting the
+    statement to one row of a table that multiple different procedures
+    also write), that WHERE condition is a row-scoping guard, not
+    incidental detail — the target table may hold rows for several
+    different processes/owners, and the column's real value depends on
+    which one applies. Include that same scoping condition in your
+    expression (for example
+    `IF("Entity"."ProcessName"=="ThisProcedureName" AND ...)THEN(...)...`)
+    so it does not compute a value for rows this statement never actually
+    touches. A WHERE clause that instead filters on the target column's
+    own current value (a cleanup/normalize pattern like
+    `WHERE Col = DATE'1900-01-01'`) is not this case — that is the
+    calculation's own condition, already covered by the guidance above.
 
   Do not include any explanation, markdown formatting, or code fences —
   output the raw expression only. If the logic is a categorical/range-based

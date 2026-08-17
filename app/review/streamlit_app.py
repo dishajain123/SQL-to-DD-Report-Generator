@@ -95,7 +95,7 @@ def _post_json(url: str, payload: dict) -> tuple[int, dict]:
         except json.JSONDecodeError:
             parsed = {"detail": raw or exc.reason}
         return exc.code, parsed
-    except (error.URLError, TimeoutError, socket.timeout) as exc:
+    except (error.URLError, TimeoutError, socket.timeout, ConnectionResetError, ConnectionError, OSError) as exc:
         reason = getattr(exc, "reason", str(exc))
         raise RuntimeError(f"Could not reach the API at {url}: {reason}") from exc
 
@@ -113,7 +113,7 @@ def _get_json(url: str) -> tuple[int, dict]:
         except json.JSONDecodeError:
             parsed = {"detail": raw or exc.reason}
         return exc.code, parsed
-    except (error.URLError, TimeoutError, socket.timeout) as exc:
+    except (error.URLError, TimeoutError, socket.timeout, ConnectionResetError, ConnectionError, OSError) as exc:
         reason = getattr(exc, "reason", str(exc))
         raise RuntimeError(f"Could not reach the API at {url}: {reason}") from exc
 
@@ -127,7 +127,7 @@ def _get_bytes(url: str) -> tuple[int, bytes]:
             return resp.status, resp.read()
     except error.HTTPError as exc:
         return exc.code, exc.read()
-    except (error.URLError, TimeoutError, socket.timeout) as exc:
+    except (error.URLError, TimeoutError, socket.timeout, ConnectionResetError, ConnectionError, OSError) as exc:
         reason = getattr(exc, "reason", str(exc))
         raise RuntimeError(f"Could not reach the API at {url}: {reason}") from exc
 

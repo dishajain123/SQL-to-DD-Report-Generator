@@ -454,6 +454,20 @@ def _rewrite_unquoted_dotted_refs(expression: str) -> str:
     return "".join(result)
 
 
+def _strip_angle_bracket_placeholders(expression: str) -> str:
+    """Remove literal `<...>` placeholder wrappers from identifiers.
+
+    Prompt examples use placeholder notation like `<entity_name>`, and the
+    model sometimes copies those angle brackets verbatim into output.
+    This is never part of the actual 4X grammar, so stripping them is a
+    safe mechanical cleanup as long as the bracketed text is an
+    identifier-like token.
+    """
+    expression = re.sub(r'"<([A-Za-z_][A-Za-z0-9_]*)>"', r'"\1"', expression)
+    expression = re.sub(r'(?<![A-Za-z0-9_"])<([A-Za-z_][A-Za-z0-9_]*)>(?![A-Za-z0-9_"])', r"\1", expression)
+    return expression
+
+
 def _rewrite_null_predicates(expression: str) -> str:
     expression = re.sub(
         r'(?i)\b([A-Za-z_][A-Za-z0-9_".]*?)\s+IS\s+NOT\s+NULL\b',
@@ -543,92 +557,133 @@ def _strip_min_wrapper(expression: str) -> str:
 
 
 def _repair_missing_then_parentheses(expression: str) -> str:
-    """Close an unterminated IF/ELSEIF condition immediately before THEN.
+    """Insert a missing `)` before THEN only when the IF/ELSEIF condition
+    is still open at that point.
 
-    Some LLM outputs drop the `)` before `THEN`, producing malformed but
-    otherwise recoverable control-flow syntax. Repairing it here keeps the
-    retry loop focused on real logic issues instead of a mechanical typo.
+    This is intentionally conservative: if the condition already closes
+    before THEN, the expression is left untouched.
     """
 
-    def find_then(text: str, start: int) -> int:
-        depth = 1
-        in_string = False
-        i = start
-        while i < len(text):
-            ch = text[i]
-            if ch == '"':
-                in_string = not in_string
-                i += 1
-                continue
-            if in_string:
-                i += 1
-                continue
-            if ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-            elif depth >= 1 and text[i : i + 4].upper() == "THEN":
-                before = text[i - 1] if i > 0 else ""
-                after = text[i + 4] if i + 4 < len(text) else ""
-                if not (before.isalnum() or before == "_") and not (after.isalnum() or after == "_"):
-                    return i
-            i += 1
-        return -1
+    if "THEN" not in expression.upper() or ("IF(" not in expression.upper() and "ELSEIF(" not in expression.upper()):
+        return expression
 
     result: list[str] = []
     i = 0
-    in_string = False
-    while i < len(expression):
+    n = len(expression)
+    in_double = False
+    changed = False
+
+    while i < n:
         ch = expression[i]
         if ch == '"':
-            in_string = not in_string
+            in_double = not in_double
+            result.append(ch)
+            i += 1
+            continue
+        if in_double:
             result.append(ch)
             i += 1
             continue
 
-        if not in_string and (
-            expression[i : i + 3].upper() == "IF(" or expression[i : i + 7].upper() == "ELSEIF("
-        ):
-            start = i + (3 if expression[i : i + 3].upper() == "IF(" else 7)
-            then_index = find_then(expression, start)
-            if then_index != -1:
-                depth = 1
-                local_in_string = False
-                j = start
-                while j < then_index:
-                    cur = expression[j]
-                    if cur == '"':
-                        local_in_string = not local_in_string
-                    elif not local_in_string:
-                        if cur == "(":
-                            depth += 1
-                        elif cur == ")":
-                            depth -= 1
-                    j += 1
-                prefix = expression[i:then_index]
-                if depth > 1:
-                    result.append(prefix)
-                    result.append(")" * (depth - 1))
-                    i = then_index
-                    continue
-                if depth < 1:
-                    trim_count = 1 - depth
-                    trimmed_prefix = prefix
-                    while trim_count > 0 and trimmed_prefix.endswith(")"):
-                        trimmed_prefix = trimmed_prefix[:-1]
-                        trim_count -= 1
-                    if trim_count == 0:
-                        result.append(trimmed_prefix)
-                        i = then_index
-                        continue
-                if depth == 1:
-                    result.append(prefix)
-                    i = then_index
-                    continue
+        token = None
+        if expression[i : i + 7].upper() == "ELSEIF(" and (i == 0 or not (expression[i - 1].isalnum() or expression[i - 1] == "_")):
+            token = "ELSEIF("
+        elif expression[i : i + 3].upper() == "IF(" and (i == 0 or not (expression[i - 1].isalnum() or expression[i - 1] == "_")):
+            token = "IF("
+
+        if token:
+            start = i + len(token)
+            depth = 1
+            j = start
+            local_in_double = False
+            while j < n:
+                cur = expression[j]
+                if cur == '"':
+                    local_in_double = not local_in_double
+                elif not local_in_double:
+                    if cur == "(":
+                        depth += 1
+                    elif cur == ")":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    elif depth == 1 and expression[j : j + 4].upper() == "THEN":
+                        before = expression[j - 1] if j > 0 else ""
+                        after = expression[j + 4] if j + 4 < n else ""
+                        if not (before.isalnum() or before == "_") and not (after.isalnum() or after == "_"):
+                            result.append(expression[i:j])
+                            result.append(")")
+                            i = j
+                            changed = True
+                            break
+                j += 1
+            if changed:
+                continue
 
         result.append(ch)
         i += 1
-    return "".join(result)
+
+    repaired = "".join(result)
+    return repaired if changed else repaired
+
+
+def _repair_extra_close_before_then(expression: str) -> str:
+    """Remove a spurious extra `)` that appears between an IF/ELSEIF
+    condition and its `THEN(` keyword.
+
+    The model sometimes emits `IF(cond))THEN(...)` or
+    `ELSEIF(cond))THEN(...)`. That extra close cannot be valid because the
+    condition's own closing parenthesis must be followed directly by
+    `THEN`. This pass removes only that single extra close and leaves the
+    surrounding branch structure untouched.
+    """
+
+    previous = expression
+    for _ in range(3):
+        result: list[str] = []
+        i = 0
+        n = len(previous)
+        in_double = False
+        changed = False
+        while i < n:
+            ch = previous[i]
+            if ch == '"':
+                in_double = not in_double
+                result.append(ch)
+                i += 1
+                continue
+            if in_double:
+                result.append(ch)
+                i += 1
+                continue
+
+            token = None
+            if previous[i : i + 7].upper() == "ELSEIF(" and (i == 0 or not (previous[i - 1].isalnum() or previous[i - 1] == "_")):
+                token = "ELSEIF("
+            elif previous[i : i + 3].upper() == "IF(" and (i == 0 or not (previous[i - 1].isalnum() or previous[i - 1] == "_")):
+                token = "IF("
+
+            if token:
+                open_index = i + len(token) - 1
+                close_index = _find_matching_paren(previous, open_index)
+                if close_index != -1:
+                    j = close_index + 1
+                    while j < n and previous[j].isspace():
+                        j += 1
+                    if j < n and previous[j] == ")" and previous[j + 1 :].lstrip().startswith("THEN("):
+                        result.append(previous[i : close_index + 1])
+                        i = j + 1
+                        changed = True
+                        continue
+
+            result.append(ch)
+            i += 1
+
+        repaired = "".join(result)
+        if not changed:
+            return repaired
+        previous = repaired
+    return previous
 
 
 def _remove_excess_closing_parens(expression: str) -> str:
@@ -843,12 +898,14 @@ def _normalize_expression(expression: str) -> str:
     expression = _normalize_sql_style_syntax(expression)
     expression = _normalize_sql_functions(expression)
     expression = _normalize_legacy_if_syntax(expression)
+    expression = _strip_angle_bracket_placeholders(expression)
     expression = _rewrite_not_in_membership(expression)
     expression = _rewrite_is_empty_syntax(expression)
     expression = _rewrite_isnotempty_boolean_comparisons(expression)
     expression = _rewrite_date_function(expression)
     expression = _rewrite_unquoted_dotted_refs(expression)
     expression = _rewrite_exists_predicates(expression)
+    expression = _repair_extra_close_before_then(expression)
     expression = _remove_excess_closing_parens(expression)
     expression = _fix_unbalanced_trailing_parens(expression)
     expression = _repair_missing_then_parentheses(expression)
@@ -1108,3 +1165,55 @@ def _infer_data_type(column_name: str) -> str:
     if any(token in lowered for token in ("flag", "flg", "ind", "check", "reason")):
         return "string"
     return "number"
+
+
+def flag_duplicate_dd_rows(dd_rows: list[DDRow]) -> list[DDRow]:
+    """Detect DD rows sharing the same (entity_name, column_name,
+    effective_start_date) identity -- the exact key
+    app/report/excel_export.py::merge_dd_rows uses to decide whether a row
+    is "the same row" -- coming from more than one source. A column
+    normally has exactly one derivation per effective date; more than one
+    commonly means two different source procedures both write the same
+    shared table+column (each correctly reflecting its own procedure's own
+    logic, often each scoped to different rows by its own guard condition
+    -- see check_dropped_override_conditions' row-scoping check), and nothing
+    in this pipeline can know on its own whether they should be combined
+    into a single formula or whether one is simply wrong for this column.
+
+    Rather than silently exporting duplicate rows for the same key --
+    which the platform's own schema does not expect, and which
+    merge_dd_rows' last-one-wins-by-key merge would otherwise let one
+    silently overwrite the other with no record that a conflict ever
+    existed -- every row sharing a duplicated key is routed to
+    PENDING_REVIEW with a note identifying the other source chain(s) it
+    conflicts with, so a reviewer resolves it explicitly instead of the
+    pipeline guessing or the report/Excel silently picking one.
+
+    Rows are never dropped, merged, or rewritten here -- only status,
+    confidence, and validation_errors are updated -- so this can never
+    lose or alter derivation logic, and a column with only one source
+    (the overwhelmingly common case) is completely unaffected.
+    """
+    key_to_rows: dict[tuple[str, str, object], list[DDRow]] = {}
+    for row in dd_rows:
+        key = (row.entity_name, row.column_name, row.effective_start_date)
+        key_to_rows.setdefault(key, []).append(row)
+
+    for rows in key_to_rows.values():
+        if len(rows) < 2:
+            continue
+        distinct_chains = sorted({r.source_chain_id for r in rows})
+        for row in rows:
+            other_chains = [c for c in distinct_chains if c != row.source_chain_id] or distinct_chains
+            row.status = DDStatus.PENDING_REVIEW
+            row.confidence = min(row.confidence, 0.3)
+            row.validation_errors.append(
+                f'Another derivation for "{row.entity_name}"."{row.column_name}" '
+                f"effective {row.effective_start_date} was generated from a "
+                f"different source ({', '.join(other_chains)}). Multiple "
+                "procedures/statements write this column for this "
+                "effective date -- reconcile into a single formula (for "
+                "example, guard each with its own row-scoping condition) "
+                "before accepting any of them."
+            )
+    return dd_rows

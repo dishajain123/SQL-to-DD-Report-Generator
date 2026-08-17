@@ -179,6 +179,13 @@ def _rewrite_unquoted_dotted_refs(expression: str) -> str:
     return "".join(result)
 
 
+def _strip_angle_bracket_placeholders(expression: str) -> str:
+    """Remove placeholder angle brackets from identifier-like tokens."""
+    expression = re.sub(r'"<([A-Za-z_][A-Za-z0-9_]*)>"', r'"\1"', expression)
+    expression = re.sub(r'(?<![A-Za-z0-9_"])<([A-Za-z_][A-Za-z0-9_]*)>(?![A-Za-z0-9_"])', r"\1", expression)
+    return expression
+
+
 def _rewrite_legacy_if_syntax(expression: str) -> str:
     def split_top_level_args(text: str) -> list[str] | None:
         args: list[str] = []
@@ -277,85 +284,69 @@ def _repair_missing_then_parentheses(expression: str) -> str:
     issue, so we repair it mechanically before grammar validation.
     """
 
-    def find_then(text: str, start: int) -> int:
-        depth = 1
-        in_string = False
-        i = start
-        while i < len(text):
-            ch = text[i]
-            if ch == '"':
-                in_string = not in_string
-                i += 1
-                continue
-            if in_string:
-                i += 1
-                continue
-            if ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-            elif depth >= 1 and text[i : i + 4].upper() == "THEN":
-                before = text[i - 1] if i > 0 else ""
-                after = text[i + 4] if i + 4 < len(text) else ""
-                if not (before.isalnum() or before == "_") and not (after.isalnum() or after == "_"):
-                    return i
-            i += 1
-        return -1
+    upper = expression.upper()
+    if "THEN" not in upper or ("IF(" not in upper and "ELSEIF(" not in upper):
+        return expression
 
     result: list[str] = []
     i = 0
-    in_string = False
-    while i < len(expression):
+    n = len(expression)
+    in_double = False
+
+    while i < n:
         ch = expression[i]
         if ch == '"':
-            in_string = not in_string
+            in_double = not in_double
+            result.append(ch)
+            i += 1
+            continue
+        if in_double:
             result.append(ch)
             i += 1
             continue
 
-        if not in_string and (
-            expression[i : i + 3].upper() == "IF(" or expression[i : i + 7].upper() == "ELSEIF("
-        ):
-            token = "IF(" if expression[i : i + 3].upper() == "IF(" else "ELSEIF("
+        token = None
+        if expression[i : i + 7].upper() == "ELSEIF(" and (i == 0 or not (expression[i - 1].isalnum() or expression[i - 1] == "_")):
+            token = "ELSEIF("
+        elif expression[i : i + 3].upper() == "IF(" and (i == 0 or not (expression[i - 1].isalnum() or expression[i - 1] == "_")):
+            token = "IF("
+
+        if token:
             start = i + len(token)
-            then_index = find_then(expression, start)
-            if then_index != -1:
-                depth = 1
-                local_in_string = False
-                j = start
-                while j < then_index:
-                    cur = expression[j]
-                    if cur == '"':
-                        local_in_string = not local_in_string
-                    elif not local_in_string:
-                        if cur == "(":
-                            depth += 1
-                        elif cur == ")":
-                            depth -= 1
-                    j += 1
-                prefix = expression[i:then_index]
-                if depth > 1:
-                    result.append(prefix)
-                    result.append(")" * (depth - 1))
-                    i = then_index
-                    continue
-                if depth < 1:
-                    trim_count = 1 - depth
-                    trimmed_prefix = prefix
-                    while trim_count > 0 and trimmed_prefix.endswith(")"):
-                        trimmed_prefix = trimmed_prefix[:-1]
-                        trim_count -= 1
-                    if trim_count == 0:
-                        result.append(trimmed_prefix)
-                        i = then_index
-                        continue
-                if depth == 1:
-                    result.append(prefix)
-                    i = then_index
-                    continue
+            depth = 1
+            j = start
+            local_in_double = False
+            while j < n:
+                cur = expression[j]
+                if cur == '"':
+                    local_in_double = not local_in_double
+                elif not local_in_double:
+                    if cur == "(":
+                        depth += 1
+                    elif cur == ")":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    elif depth == 1 and expression[j : j + 4].upper() == "THEN":
+                        before = expression[j - 1] if j > 0 else ""
+                        after = expression[j + 4] if j + 4 < n else ""
+                        if not (before.isalnum() or before == "_") and not (after.isalnum() or after == "_"):
+                            result.append(expression[i:j])
+                            result.append(")")
+                            i = j
+                            break
+                j += 1
+            else:
+                result.append(ch)
+                i += 1
+                continue
+
+            if i != j:
+                continue
 
         result.append(ch)
         i += 1
+
     return "".join(result)
 
 
@@ -370,6 +361,7 @@ def _normalize_expression(expression: str) -> str:
     normalized = _rewrite_unquoted_dotted_refs(normalized)
     normalized = _rewrite_exists_predicates(normalized)
     normalized = _rewrite_legacy_if_syntax(normalized)
+    normalized = _strip_angle_bracket_placeholders(normalized)
     normalized = _repair_missing_then_parentheses(normalized)
     return normalized
 

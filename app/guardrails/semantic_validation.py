@@ -8,13 +8,16 @@ specific to any one procedure or column):
 
 - self-reference: the expression must not reference the very column it is
   computing.
-- invented references: every quoted column-reference segment in the
-  expression must actually appear somewhere in the source SQL.
+- invented references: every column-reference segment in the expression
+  (quoted or bare) must actually appear somewhere in the source SQL.
 - invented numeric literals: every non-trivial number in the expression
   must actually appear somewhere in the source SQL.
 - dropped override/exception conditions: if the column is assigned via an
   override (a MERGE) or an exception handler in addition to its main
   calculation, the expression must show some trace of that too.
+- dropped row-scoping WHERE guard: if the column is assigned via a plain
+  UPDATE whose WHERE clause scopes it to specific rows (not the target
+  column's own value), the expression must show some trace of that too.
 """
 from __future__ import annotations
 
@@ -52,10 +55,34 @@ _KNOWN_4X_SYMBOLS = {
 
 _OVERRIDE_SIGNAL_KEYWORDS = ("MERGE", "EXCEPTION", "WHEN OTHERS")
 
+# A plain (non-MERGE) UPDATE's WHERE clause, e.g.
+# "WHERE RUNNINGPROCESSNAME = 'DPD_Calculation'". Matches up to the
+# statement's own terminating semicolon (or end of text) so it never
+# spills into a following statement.
+_WHERE_CLAUSE_RE = re.compile(r"(?is)\bWHERE\b(.+?)(?:;|$)")
+
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _NUMBER_RE = re.compile(r"(?<![A-Za-z0-9_])\d+(?:\.\d+)?(?![A-Za-z0-9_])")
 _QUOTED_SEGMENT_RE = re.compile(r'"([^"]+)"')
 _LITERAL_LIKE_QUOTED_VALUES = {"Y", "N", "YES", "NO", "TRUE", "FALSE", "NULL"}
+
+# Bare (unquoted) column_ref NAME tokens, per the grammar's
+# `column_ref: STRING ("." STRING)* | NAME` -- the quoted form is not the
+# only legal reference shape, so hallucination checking must cover both,
+# or a fabricated bare identifier (e.g. a made-up flag name standing in
+# for "an exception occurred") slips through undetected.
+_BARE_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _is_function_call_name(text: str, match: re.Match[str]) -> bool:
+    """True if the identifier `match` is immediately followed by '(' --
+    i.e. it's a function call name, not a column reference -- so function
+    names (COALESCE, ISNOTEMPTY, a documented helper, etc.) are never
+    mistaken for invented columns."""
+    j = match.end()
+    while j < len(text) and text[j] == " ":
+        j += 1
+    return j < len(text) and text[j] == "("
 
 
 def _looks_like_identifier_reference(candidate: str) -> bool:
@@ -202,11 +229,12 @@ def check_self_reference(
 
 
 def check_invented_references(expression: str, source_text: str, entity_name: str = "") -> list[str]:
-    """Every quoted column-reference segment the expression uses must
-    actually appear somewhere in the source SQL it was derived from --
-    otherwise it's a hallucinated field name. The mapped entity name itself
-    is exempt, since that's an intentional platform-side mapping and is not
-    expected to appear literally in the source SQL."""
+    """Every column-reference segment the expression uses -- quoted
+    ("Entity"."Column") or bare (a plain NAME, also a valid column_ref per
+    the grammar) -- must actually appear somewhere in the source SQL it was
+    derived from, otherwise it's a hallucinated field name. The mapped
+    entity name itself is exempt, since that's an intentional platform-side
+    mapping and is not expected to appear literally in the source SQL."""
     errors: list[str] = []
     source_tokens = _extract_identifiers(source_text)
     entity_upper = entity_name.strip().upper()
@@ -225,6 +253,26 @@ def check_invented_references(expression: str, source_text: str, entity_name: st
             continue
         candidate_upper = candidate.upper()
         if candidate_upper in _KEYWORD_STOPWORDS or candidate_upper in _KNOWN_4X_SYMBOLS:
+            continue
+        if entity_upper and candidate_upper == entity_upper:
+            continue
+        if candidate_upper not in source_tokens:
+            errors.append(
+                f'Expression references "{candidate}", which does not appear '
+                "anywhere in the source SQL for this column."
+            )
+
+    # Bare identifiers: the grammar's column_ref also permits an unquoted
+    # NAME, so a fabricated bare token (never wrapped in quotes) must be
+    # checked the same way, or it silently bypasses hallucination
+    # detection entirely.
+    expression_no_quotes = _QUOTED_SEGMENT_RE.sub(lambda m: " " * (m.end() - m.start()), expression)
+    for match in _BARE_IDENTIFIER_RE.finditer(expression_no_quotes):
+        candidate = match.group(0)
+        candidate_upper = candidate.upper()
+        if candidate_upper in _KEYWORD_STOPWORDS or candidate_upper in _KNOWN_4X_SYMBOLS:
+            continue
+        if _is_function_call_name(expression_no_quotes, match):
             continue
         if entity_upper and candidate_upper == entity_upper:
             continue
@@ -255,7 +303,17 @@ def check_invented_numeric_literals(expression: str, source_text: str) -> list[s
     return errors
 
 
-def check_dropped_override_conditions(expression: str, relevant_chunks: list[SmartChunk]) -> list[str]:
+def _extract_where_clause(raw_sql: str) -> str | None:
+    match = _WHERE_CLAUSE_RE.search(raw_sql)
+    if not match:
+        return None
+    clause = match.group(1).strip()
+    return clause or None
+
+
+def check_dropped_override_conditions(
+    expression: str, relevant_chunks: list[SmartChunk], column: str = ""
+) -> list[str]:
     """If the column is assigned via an override-style block (a MERGE
     statement) or an exception handler, in addition to its main
     calculation, the generated expression must show some trace of that
@@ -263,36 +321,73 @@ def check_dropped_override_conditions(expression: str, relevant_chunks: list[Sma
     (rather than every branch of an ordinary IF/CASE) to avoid flagging a
     normal multi-branch calculation that a single formula legitimately and
     correctly represents as one expression.
+
+    Separately, a plain (non-MERGE) UPDATE's own WHERE clause is checked
+    when it does not reference the target column itself -- that shape is a
+    row-scoping guard (for example `WHERE RUNNINGPROCESSNAME =
+    'DPD_Calculation'`, restricting the statement to one specific
+    process's row in a table shared by several procedures), not a
+    self-referential cleanup/normalize filter like `WHERE Col =
+    DATE'1900-01-01'` (which is already handled by the self-reference
+    preservation logic elsewhere and is not flagged here). If the
+    expression shows no trace of that scoping condition, it would as
+    written apply to every row of the entity rather than just the one the
+    source SQL actually updates, which is exactly the kind of dropped
+    guard this check exists to catch.
     """
     errors: list[str] = []
-    if len(relevant_chunks) < 2:
-        return errors
-
     expr_tokens = _extract_identifiers(expression)
+    column_upper = column.strip().upper()
 
     for chunk in relevant_chunks:
         raw_upper = chunk.raw_sql.upper()
         is_override_chunk = chunk.chunk_kind == "MERGE" or any(
             keyword in raw_upper for keyword in _OVERRIDE_SIGNAL_KEYWORDS
         )
-        if not is_override_chunk:
+
+        if is_override_chunk:
+            if len(relevant_chunks) < 2:
+                continue
+            chunk_tokens: set[str] = set()
+            for condition in chunk.conditions:
+                chunk_tokens |= _extract_identifiers(condition)
+            chunk_tokens |= _extract_identifiers(chunk.raw_sql)
+
+            if not chunk_tokens or (chunk_tokens & expr_tokens):
+                continue
+
+            snippet = next((line.strip() for line in chunk.raw_sql.splitlines() if line.strip()), "")[:120]
+            errors.append(
+                "Expression does not appear to reflect an override/exception "
+                f'statement found in the source for this column (starting: "{snippet}"). '
+                "If this column is overridden by a special case or an "
+                "error-handling path, the expression must combine that with the "
+                "main calculation."
+            )
             continue
 
-        chunk_tokens: set[str] = set()
-        for condition in chunk.conditions:
-            chunk_tokens |= _extract_identifiers(condition)
-        chunk_tokens |= _extract_identifiers(chunk.raw_sql)
-
-        if not chunk_tokens or (chunk_tokens & expr_tokens):
+        if chunk.chunk_kind == "MERGE":
             continue
 
-        snippet = next((line.strip() for line in chunk.raw_sql.splitlines() if line.strip()), "")[:120]
+        where_clause = _extract_where_clause(chunk.raw_sql)
+        if not where_clause:
+            continue
+
+        where_tokens = _extract_identifiers(where_clause)
+        if column_upper and column_upper in where_tokens:
+            # References the target column itself -- a self-referential
+            # cleanup/normalize filter, not a row-scoping guard.
+            continue
+        if not where_tokens or (where_tokens & expr_tokens):
+            continue
+
         errors.append(
-            "Expression does not appear to reflect an override/exception "
-            f'statement found in the source for this column (starting: "{snippet}"). '
-            "If this column is overridden by a special case or an "
-            "error-handling path, the expression must combine that with the "
-            "main calculation."
+            "Expression does not appear to reflect a row-scoping WHERE "
+            f'condition found in the source for this column (WHERE {where_clause[:120]}). '
+            "If this statement only applies to specific rows (for example a "
+            "specific process name or table identifier), the expression "
+            "must include that same scoping condition so it does not "
+            "over-apply to unrelated rows."
         )
     return errors
 
@@ -313,6 +408,6 @@ def check_semantic_consistency(
     errors.extend(check_self_reference(expression, column, entity_name, source_sql))
     errors.extend(check_invented_references(expression, source_text, entity_name))
     errors.extend(check_invented_numeric_literals(expression, source_text))
-    errors.extend(check_dropped_override_conditions(expression, relevant_chunks))
+    errors.extend(check_dropped_override_conditions(expression, relevant_chunks, column))
 
     return GuardrailResult(passed=not errors, errors=errors)
