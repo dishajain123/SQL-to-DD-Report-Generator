@@ -25,6 +25,11 @@ def test_valid_nested_datediff_translation_of_dpd_overdue():
     assert validate_expression(expr).valid
 
 
+def test_valid_numeric_addition_is_still_allowed():
+    expr = 'IF(("A"."X"+1)>0)THEN(1)ELSE(0)'
+    assert validate_expression(expr).valid
+
+
 def test_valid_and_or_not_operators():
     expr = 'IF(OR(NOT(ISEMPTY("A"."X")),"A"."Y" IN ["a","b"]))THEN(1)ELSE(0)'
     assert validate_expression(expr).valid
@@ -100,4 +105,37 @@ def test_repairs_postfix_isnotempty_and_quoted_dotted_refs():
 
 def test_repairs_postfix_isnotempty():
     expr = 'IF("A"."X" ISNOTEMPTY)THEN(1)ELSE(0)'
+    assert validate_expression(expr).valid
+
+
+def test_valid_mixed_qualified_identifier_segments():
+    expr = (
+        'IF(("AccountCal_Stg".FINALASSETCLASSALT_KEY > 1) '
+        'AND (Table_Name."COLUMN_NAME" <= 3))THEN("YES")ELSE("NO")'
+    )
+    assert validate_expression(expr).valid
+
+
+def test_rejects_truncated_mixed_qualified_identifier_expression():
+    result = validate_expression(
+        'IF(("AccountCal_Stg".FINALASSETCLASSALT_KEY > 1 OR )THEN("YES")ELSE("NO")'
+    )
+    assert not result.valid
+    assert "Unexpected end-of-input" in result.error or "No terminal matches" in result.error
+
+
+def test_rejects_string_literal_addition_and_recommends_concat():
+    result = validate_expression('IF(DEGREASON + "," + DEFAULT_REASON)THEN("Y")ELSE("N")')
+    assert not result.valid
+    assert "numeric-only operators" in result.error
+    assert "CONCAT(...)" in result.error
+
+
+def test_repairs_misused_isnotempty_with_default_argument():
+    expr = 'IF(ISNOTEMPTY("A"."ASSET_NORM","NORMAL")<>"ALWYS_STD")THEN(1)ELSE(0)'
+    assert validate_expression(expr).valid
+
+
+def test_repairs_extra_closing_parens_before_then():
+    expr = 'IF(ISNOTEMPTY("A"."X") AND ("A"."Y">0))))THEN(1)ELSE(0)'
     assert validate_expression(expr).valid

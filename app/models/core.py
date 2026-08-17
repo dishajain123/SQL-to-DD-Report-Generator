@@ -164,6 +164,7 @@ class CanonicalModel(BaseModel):
     object_ids: list[str]
     technical_summary: str
     business_summary: str
+    glossary_terms: list["GlossaryTerm"] = Field(default_factory=list)
     derived_rules: list[str] = Field(default_factory=list)
     evidence: list[str] = Field(default_factory=list)
     confidence: float = 1.0
@@ -199,6 +200,7 @@ class DDRow(BaseModel):
     data_type: str
     decision_table_json: Optional[str] = None
     conditional_json: Optional[str] = None
+    business_meaning: str = ""
 
     # Traceability (not in the platform export, used internally / in the report)
     source_chain_id: str
@@ -221,3 +223,8 @@ class ReviewDecision(BaseModel):
     edited_expression: Optional[str] = None
     reviewer: str = "unassigned"
     comment: str = ""
+
+
+class GlossaryTerm(BaseModel):
+    term: str
+    definition: str

@@ -52,8 +52,10 @@ membership: arith
 function_call: FUNC_NAME "(" [arg_list] ")"
 arg_list: expr ("," expr)*
 
-column_ref: STRING ("." STRING)*
-          | NAME
+path_part: STRING
+         | NAME
+
+column_ref: path_part ("." path_part)*
 
 value_list: value ("," value)*
 value: STRING | NUMBER

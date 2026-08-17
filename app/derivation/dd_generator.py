@@ -37,6 +37,9 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Optional
 
+import sqlglot
+from sqlglot import exp
+
 from app.derivation.llm_client import LLMClient
 from app.derivation.period_pruning import prune_expression_for_period
 from app.derivation.versioning import effective_periods_for_column
@@ -54,6 +57,7 @@ from app.models.core import (
     StatementInfo,
     StructuralInfo,
 )
+from app.parsing.sql_parser import classify_statement, split_statements
 from app.utils.identity import canonical_logical_name
 from app.rag.chroma_store import ChromaStore, DOMAIN_COLLECTION, PLATFORM_COLLECTION
 from app.utils.config import settings
@@ -462,6 +466,60 @@ def _retrieve_rag_context(
     return "\n\n".join(sections)
 
 
+def _derive_business_meaning(
+    llm_client: LLMClient,
+    technical_summary: str,
+    business_summary: str,
+    source_sql: str,
+    function_reference: str,
+    entity_name: str,
+    column_name: str,
+    relevant_sql: str,
+    formula: str,
+) -> str:
+    fallback = _business_meaning_from_formula(column_name, formula)
+    explanation_method = getattr(llm_client, "rule_explanation", None)
+    if not callable(explanation_method):
+        return fallback
+
+    try:
+        explanation = explanation_method(
+            technical_summary=technical_summary,
+            business_summary=business_summary,
+            source_sql=source_sql,
+            function_reference=function_reference,
+            column_name=column_name,
+            entity_name=entity_name,
+            relevant_sql=relevant_sql,
+            formula=formula,
+        )
+    except Exception:
+        return fallback
+
+    if isinstance(explanation, str) and explanation.strip():
+        return explanation.strip()
+    return fallback
+
+
+def _business_meaning_from_formula(column_name: str, expression: str) -> str:
+    expr = expression.upper()
+    column = column_name.strip()
+
+    if "MAX(" in expr:
+        return f"Chooses the highest applicable value for {column} from the source drivers."
+    if "MIN(" in expr:
+        return f"Chooses the lowest applicable value for {column} from the source drivers."
+    if "DATEDIFF(" in expr:
+        return f"Measures elapsed time for {column} from the relevant business date and source date."
+    if "COALESCE(" in expr or "ISEMPTY(" in expr or "ISNOTEMPTY(" in expr:
+        return f"Uses null-handling and fallback logic to populate {column} from the source fields."
+    if "THEN(" in expr and "ELSEIF(" in expr:
+        return f"Applies branch-based rules to determine {column} from the source conditions."
+    if "THEN(" in expr:
+        return f"Applies a conditional rule to derive {column} from the source conditions."
+    return f"SQL-derived logic for {column} based on the available source dependencies."
+
+
 def _flatten_whitespace(expression: str) -> str:
     """Collapse all internal whitespace (including newlines and
     indentation) into single spaces.
@@ -678,6 +736,86 @@ def _rewrite_postfix_isnotempty(expression: str) -> str:
     return pattern.sub(lambda m: f"ISNOTEMPTY({m.group(1).strip()})", expression)
 
 
+def _rewrite_misused_empty_functions(expression: str) -> str:
+    """Rewrite accidentally multi-argument `ISNOTEMPTY` / `ISEMPTY` calls.
+
+    The platform functions are unary. When the model copies a SQL null
+    fallback shape into the wrong function name, the only safe repair is
+    to treat the call as a `COALESCE(...)`-style fallback instead of
+    trying to interpret it as a boolean existence check.
+    """
+
+    def rewrite_calls(text: str, func_name: str) -> str:
+        result: list[str] = []
+        i = 0
+        n = len(text)
+        in_double = False
+
+        while i < n:
+            ch = text[i]
+            if in_double:
+                result.append(ch)
+                if ch == '"':
+                    in_double = False
+                i += 1
+                continue
+
+            if ch == '"':
+                in_double = True
+                result.append(ch)
+                i += 1
+                continue
+
+            if text[i : i + len(func_name)].upper() == func_name and (
+                i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")
+            ):
+                start = i + len(func_name)
+                if start < n and text[start] == "(":
+                    depth = 1
+                    j = start + 1
+                    local_in_double = False
+                    args: list[str] = []
+                    current: list[str] = []
+
+                    while j < n and depth > 0:
+                        cur = text[j]
+                        if cur == '"':
+                            local_in_double = not local_in_double
+                            current.append(cur)
+                        elif not local_in_double and cur == "(":
+                            depth += 1
+                            current.append(cur)
+                        elif not local_in_double and cur == ")":
+                            depth -= 1
+                            if depth == 0:
+                                break
+                            current.append(cur)
+                        elif not local_in_double and cur == "," and depth == 1:
+                            args.append("".join(current).strip())
+                            current = []
+                        else:
+                            current.append(cur)
+                        j += 1
+
+                    if depth == 0:
+                        args.append("".join(current).strip())
+                        if len(args) > 1:
+                            result.append(f"COALESCE({', '.join(args)})")
+                        else:
+                            result.append(f"{func_name}({', '.join(args)})")
+                        i = j + 1
+                        continue
+
+            result.append(ch)
+            i += 1
+
+        return "".join(result)
+
+    expression = rewrite_calls(expression, "ISNOTEMPTY")
+    expression = rewrite_calls(expression, "ISEMPTY")
+    return expression
+
+
 def _rewrite_date_function(expression: str) -> str:
     """Rewrite SQL-style DATE(...) wrappers into the documented 4X date
     constructor when the content is a single argument."""
@@ -692,6 +830,183 @@ def _rewrite_sql_date_literals(expression: str) -> str:
     return re.sub(
         r'(?i)\bDATE\s*["\']([^"\']+)["\']',
         lambda match: f'TODATE("{match.group(1).strip()}")',
+        expression,
+    )
+
+
+def _rewrite_sql_not_equal_operator(expression: str) -> str:
+    """Normalize SQL's `<>` inequality operator to `!=`."""
+
+    result: list[str] = []
+    i = 0
+    n = len(expression)
+    in_double = False
+
+    while i < n:
+        ch = expression[i]
+        if ch == '"':
+            in_double = not in_double
+            result.append(ch)
+            i += 1
+            continue
+        if not in_double and ch == "<" and i + 1 < n and expression[i + 1] == ">":
+            result.append("!=")
+            i += 2
+            continue
+        result.append(ch)
+        i += 1
+
+    return "".join(result)
+
+
+def _rewrite_string_concatenation(expression: str) -> str:
+    """Rewrite text concatenation written with `+` into `CONCAT(...)`.
+
+    The model sometimes copies SQL-style string concatenation into a 4X
+    formula. The platform only documents `+` for numeric arithmetic, so a
+    chain that contains a quoted string literal is repaired to
+    `CONCAT(...)` before validation. Pure numeric addition is left alone.
+    """
+
+    def contains_direct_string_literal(segment: str) -> bool:
+        stripped = segment.strip()
+        if not stripped:
+            return False
+        if re.fullmatch(r'"[^"]*"', stripped):
+            return True
+        if re.fullmatch(r'\(\s*"[^"]*"\s*\)', stripped):
+            return True
+        return False
+
+    def split_top_level_additions(text: str) -> tuple[list[str], bool]:
+        parts: list[str] = []
+        current: list[str] = []
+        depth = 0
+        in_double = False
+        saw_plus = False
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch == '"':
+                in_double = not in_double
+                current.append(ch)
+                i += 1
+                continue
+            if in_double:
+                current.append(ch)
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+                current.append(ch)
+            elif ch == ")":
+                depth -= 1
+                current.append(ch)
+            elif ch == "+" and depth == 0:
+                parts.append("".join(current).strip())
+                current = []
+                saw_plus = True
+            else:
+                current.append(ch)
+            i += 1
+        parts.append("".join(current).strip())
+        return parts, saw_plus
+
+    def rewrite(text: str) -> str:
+        collapsed: list[str] = []
+        i = 0
+        n = len(text)
+        in_double = False
+
+        while i < n:
+            ch = text[i]
+            if ch == '"':
+                in_double = not in_double
+                collapsed.append(ch)
+                i += 1
+                continue
+            if in_double:
+                collapsed.append(ch)
+                i += 1
+                continue
+            if ch == "(":
+                close_index = _find_matching_paren(text, i)
+                if close_index != -1:
+                    inner = rewrite(text[i + 1 : close_index])
+                    collapsed.append("(")
+                    collapsed.append(inner)
+                    collapsed.append(")")
+                    i = close_index + 1
+                    continue
+            collapsed.append(ch)
+            i += 1
+
+        collapsed_text = "".join(collapsed)
+        parts, saw_plus = split_top_level_additions(collapsed_text)
+        if saw_plus and len(parts) > 1 and any(contains_direct_string_literal(part) for part in parts):
+            return f"CONCAT({', '.join(parts)})"
+        return collapsed_text
+
+    return rewrite(expression)
+
+
+def _rewrite_sqlglot_date_functions(expression: str) -> str:
+    """Normalize SQLGlot-rendered date helpers into documented 4X TODATE."""
+    expression = re.sub(
+        r"(?i)\bDATE_STR_TO_DATE\s*\(\s*'([^']+)'\s*\)",
+        lambda match: f'TODATE("{match.group(1).strip()}")',
+        expression,
+    )
+
+    def replace_str_to_date(match: re.Match[str]) -> str:
+        raw_date = match.group(1).strip()
+        raw_format = match.group(2).strip()
+        format_map = {
+            "%d/%m/%Y": "DD/MM/YYYY",
+            "%m/%d/%Y": "MM/DD/YYYY",
+            "%Y-%m-%d": "YYYY-MM-DD",
+            "%d-%m-%Y": "DD-MM-YYYY",
+            "%m-%d-%Y": "MM-DD-YYYY",
+        }
+        mapped_format = format_map.get(raw_format, raw_format)
+        if mapped_format:
+            return f'TODATE("{raw_date}","{mapped_format}")'
+        return f'TODATE("{raw_date}")'
+
+    expression = re.sub(
+        r"(?i)\bSTR_TO_DATE\s*\(\s*'([^']+)'\s*,\s*'([^']+)'\s*\)",
+        replace_str_to_date,
+        expression,
+    )
+    return expression
+
+
+def _rewrite_to_date_function(expression: str) -> str:
+    """Normalize Oracle TO_DATE(date, format) into documented 4X TODATE."""
+
+    def replace(match: re.Match[str]) -> str:
+        raw_date = match.group(1).strip().strip("'\"")
+        raw_format = match.group(2).strip().strip("'\"")
+        format_map = {
+            "%d/%m/%Y": "DD/MM/YYYY",
+            "%m/%d/%Y": "MM/DD/YYYY",
+            "%Y-%m-%d": "YYYY-MM-DD",
+            "%d-%m-%Y": "DD-MM-YYYY",
+            "%m-%d-%Y": "MM-DD-YYYY",
+            "DD/MM/YYYY": "DD/MM/YYYY",
+            "MM/DD/YYYY": "MM/DD/YYYY",
+            "YYYY-MM-DD": "YYYY-MM-DD",
+            "DD-MM-YYYY": "DD-MM-YYYY",
+            "MM-DD-YYYY": "MM-DD-YYYY",
+        }
+        mapped_format = format_map.get(raw_format, raw_format)
+        if mapped_format:
+            return f'TODATE("{raw_date}","{mapped_format}")'
+        return f'TODATE("{raw_date}")'
+
+    return re.sub(
+        r"(?i)\bTO_DATE\s*\(\s*('(?:[^']|''|\\')*'|[^,()]+)\s*,\s*('(?:[^']|''|\\')*'|[^)]+)\s*\)",
+        replace,
         expression,
     )
 
@@ -1069,9 +1384,12 @@ def _repair_extra_close_before_then(expression: str) -> str:
                     j = close_index + 1
                     while j < n and previous[j].isspace():
                         j += 1
-                    if j < n and previous[j] == ")" and previous[j + 1 :].lstrip().startswith("THEN("):
+                    extra_close_end = j
+                    while extra_close_end < n and previous[extra_close_end] == ")":
+                        extra_close_end += 1
+                    if extra_close_end > j and previous[extra_close_end:].lstrip().startswith("THEN("):
                         result.append(previous[i : close_index + 1])
-                        i = j + 1
+                        i = extra_close_end
                         changed = True
                         continue
 
@@ -1301,8 +1619,13 @@ def _normalize_expression(expression: str, source_text: str = "") -> str:
     expression = _rewrite_not_in_membership(expression)
     expression = _rewrite_is_empty_syntax(expression)
     expression = _rewrite_postfix_isnotempty(expression)
+    expression = _rewrite_misused_empty_functions(expression)
+    expression = _rewrite_sql_not_equal_operator(expression)
+    expression = _rewrite_string_concatenation(expression)
     expression = _rewrite_isnotempty_boolean_comparisons(expression)
     expression = _rewrite_sql_date_literals(expression)
+    expression = _rewrite_sqlglot_date_functions(expression)
+    expression = _rewrite_to_date_function(expression)
     expression = _rewrite_date_function(expression)
     expression = _rewrite_in_subquery_membership(expression)
     expression = _rewrite_bundled_alias_column_refs(expression, source_text)
@@ -1355,6 +1678,167 @@ def _source_allows_target_reference(source_sql: str, entity_name: str, column: s
         return True
 
     return False
+
+
+def _is_simple_stage_value(expression: str) -> bool:
+    """Return True when a statement assigns a simple literal, NULL, or
+    direct column reference that can be composed deterministically.
+
+    Complex CASE/IF/aggregate expressions should still flow through the
+    LLM path so we do not oversimplify legitimate business logic.
+    """
+    text = expression.strip()
+    if not text:
+        return False
+    upper = text.upper()
+    if upper in {"NULL", "0", "1"}:
+        return True
+    if re.fullmatch(r'"[^"]+"(?:\s*\.\s*"[^"]+")*', text):
+        return True
+    if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)*', text):
+        return True
+    if re.fullmatch(r"\(?\s*[-+]?\d+(?:\.\d+)?\s*\)?", text):
+        return True
+    return False
+
+
+def _strip_leading_comments(text: str) -> str:
+    """Remove leading SQL comments so simple statement parsing can start
+    at the first real keyword."""
+    pos = 0
+    n = len(text)
+    while pos < n:
+        if text[pos].isspace():
+            pos += 1
+        elif text[pos : pos + 2] == "--":
+            nl = text.find("\n", pos)
+            pos = n if nl == -1 else nl + 1
+        elif text[pos : pos + 2] == "/*":
+            end = text.find("*/", pos + 2)
+            pos = n if end == -1 else end + 2
+        else:
+            break
+    return text[pos:]
+
+
+def _parse_simple_assignment_stage(raw_sql: str, target_column: str) -> tuple[str, str, str] | None:
+    """Extract a deterministic guard/value pair for a simple UPDATE or
+    MERGE write to `target_column`.
+
+    Returns `(guard, value, source_target_name)` when the statement only
+    assigns a simple literal, NULL, or direct column reference. More
+    complex CASE/IF formulas are intentionally left to the LLM path.
+    """
+    candidates = split_statements(raw_sql)
+    stmt = ""
+    for candidate in reversed(candidates):
+        if classify_statement(candidate) in {"UPDATE", "MERGE"}:
+            stmt = _strip_leading_comments(candidate).strip()
+            break
+    if not stmt:
+        stmt = _strip_leading_comments(raw_sql).strip()
+    if not stmt:
+        return None
+
+    try:
+        tree = sqlglot.parse_one(stmt, read="oracle")
+    except Exception:
+        return None
+
+    target_upper = target_column.upper()
+
+    if isinstance(tree, exp.Update):
+        guard = ""
+        where = tree.args.get("where")
+        if where is not None:
+            guard = where.this.sql(dialect="oracle")
+
+        for assignment in tree.args.get("expressions", []) or []:
+            if not isinstance(assignment, exp.EQ) or not isinstance(assignment.this, exp.Column):
+                continue
+            if assignment.this.name.upper() != target_upper:
+                continue
+            value = assignment.expression.sql(dialect="oracle")
+            if not _is_simple_stage_value(value):
+                return None
+            return guard, value, assignment.this.name
+        return None
+
+    if isinstance(tree, exp.Merge):
+        guard_parts: list[str] = []
+        using = tree.args.get("using")
+        if isinstance(using, exp.Subquery) and isinstance(using.this, exp.Select):
+            where = using.this.args.get("where")
+            if where is not None:
+                guard_parts.append(where.this.sql(dialect="oracle"))
+        on_clause = tree.args.get("on")
+        if on_clause is not None:
+            guard_parts.append(on_clause.sql(dialect="oracle"))
+
+        whens = tree.args.get("whens")
+        when_list = whens.expressions if whens is not None else []
+        for when in when_list:
+            then = when.args.get("then")
+            if not isinstance(then, exp.Update):
+                continue
+            when_cond = when.args.get("condition")
+            for assignment in then.args.get("expressions", []) or []:
+                if not isinstance(assignment, exp.EQ) or not isinstance(assignment.this, exp.Column):
+                    continue
+                if assignment.this.name.upper() != target_upper:
+                    continue
+                value = assignment.expression.sql(dialect="oracle")
+                if not _is_simple_stage_value(value):
+                    return None
+                if when_cond is not None:
+                    guard_parts.append(when_cond.sql(dialect="oracle"))
+                guard = " AND ".join(f"({part})" for part in guard_parts if part)
+                return guard, value, assignment.this.name
+        return None
+
+    return None
+
+
+def _compose_simple_assignment_expression(
+    assignment_sites: list[_AssignmentSite],
+    entity_name: str,
+    fallback_column: str,
+) -> str | None:
+    """Compose a sequential 4X expression from deterministic assignment
+    sites when each stage is only a simple guard/value write.
+
+    The composition preserves source order exactly: earlier stages become
+    the outer branches and later fix-ups stay nested later.
+    """
+    if not assignment_sites:
+        return None
+
+    stages: list[tuple[str, str, str]] = []
+    for site in assignment_sites:
+        stage = _parse_simple_assignment_stage(site.raw_sql, fallback_column)
+        if stage is None:
+            return None
+        stages.append(stage)
+
+    if not stages:
+        return None
+
+    current_target = stages[0][2] or fallback_column
+    expression = f'"{entity_name}"."{current_target}"' if entity_name else f'"{current_target}"'
+
+    for guard, value, source_target in stages:
+        source_target = source_target or current_target
+        current_target = source_target
+        normalized_value = _normalize_expression(value, "")
+        if not _is_simple_stage_value(normalized_value):
+            return None
+        if not guard.strip():
+            expression = normalized_value
+            continue
+        normalized_guard = _normalize_expression(guard, "")
+        expression = f"IF({normalized_guard})THEN({normalized_value})ELSE({expression})"
+
+    return _normalize_expression(expression, "")
 
 
 def _repair_trailing_self_reference(expression: str, entity_name: str, column: str, source_sql: str) -> str:
@@ -1536,65 +2020,90 @@ def _generate_for_column(
     source_sql_excerpt = _source_sql_context_excerpt(obj.raw_sql, relevant_sql)
     if assignment_context:
         source_sql_excerpt = assignment_context
-    raw_output = llm_client.generate_formula_expression(
+
+    deterministic_expression = _compose_simple_assignment_expression(_assignment_sites(info, column), entity_name, column)
+    if deterministic_expression:
+        grammar_result = validate_expression(deterministic_expression)
+        semantic_result = check_semantic_consistency(
+            deterministic_expression, column, entity_name, relevant_chunks, obj.raw_sql
+        )
+        if grammar_result.valid and semantic_result.passed:
+            expression = deterministic_expression
+            validation_errors = []
+        else:
+            deterministic_expression = None
+
+    if expression is None:
+        raw_output = llm_client.generate_formula_expression(
+            technical_summary=canonical_model.technical_summary,
+            business_summary=canonical_model.business_summary,
+            source_sql=source_sql_excerpt,
+            function_reference=function_reference,
+            column_name=column,
+            entity_name=entity_name,
+            relevant_sql=assignment_context or relevant_sql,
+            rag_context=rag_context,
+        )
+        for attempt in range(_MAX_GENERATION_ATTEMPTS):
+            derivation_option, expression, decision_table_json, parse_errors = _interpret_llm_output(raw_output)
+            if expression:
+                expression = _normalize_expression(expression, obj.raw_sql)
+                repaired = _repair_trailing_self_reference(expression, entity_name, column, obj.raw_sql)
+                if repaired != expression and validate_expression(repaired).valid:
+                    expression = repaired
+
+            attempt_errors = list(parse_errors)
+
+            if expression and not attempt_errors:
+                grammar_result = validate_expression(expression)
+                if not grammar_result.valid:
+                    attempt_errors.append(f"Grammar validation failed: {grammar_result.error}")
+                else:
+                    semantic_result = check_semantic_consistency(
+                        expression, column, entity_name, relevant_chunks, obj.raw_sql
+                    )
+                    if not semantic_result.passed:
+                        attempt_errors.extend(f"Semantic validation: {e}" for e in semantic_result.errors)
+
+            if not attempt_errors:
+                validation_errors = []
+                break
+
+            validation_errors = attempt_errors
+            if attempt + 1 >= _MAX_GENERATION_ATTEMPTS:
+                break
+
+            retry_context = "\n\n".join(
+                part
+                for part in [
+                    f'Target column: "{entity_name}"."{column}"',
+                    f"Ordered assignment context:\n{assignment_context}" if assignment_context else "",
+                    f"Relevant SQL:\n{relevant_sql}" if relevant_sql else "",
+                    f"Technical summary:\n{canonical_model.technical_summary}" if canonical_model.technical_summary else "",
+                    f"Business summary:\n{canonical_model.business_summary}" if canonical_model.business_summary else "",
+                    f"Source SQL:\n{source_sql_excerpt}",
+                    f"Platform reference:\n{function_reference}",
+                    f"RAG context:\n{rag_context}" if rag_context else "",
+                ]
+                if part
+            )
+            raw_output = llm_client.retry_with_error(
+                previous_expression=expression or raw_output,
+                error="\n".join(attempt_errors),
+                context=retry_context,
+            )
+
+    business_meaning = _derive_business_meaning(
+        llm_client=llm_client,
         technical_summary=canonical_model.technical_summary,
         business_summary=canonical_model.business_summary,
         source_sql=source_sql_excerpt,
         function_reference=function_reference,
-        column_name=column,
         entity_name=entity_name,
+        column_name=column,
         relevant_sql=assignment_context or relevant_sql,
-        rag_context=rag_context,
+        formula=expression or deterministic_expression or "",
     )
-
-    for attempt in range(_MAX_GENERATION_ATTEMPTS):
-        derivation_option, expression, decision_table_json, parse_errors = _interpret_llm_output(raw_output)
-        if expression:
-            expression = _normalize_expression(expression, obj.raw_sql)
-            repaired = _repair_trailing_self_reference(expression, entity_name, column, obj.raw_sql)
-            if repaired != expression and validate_expression(repaired).valid:
-                expression = repaired
-
-        attempt_errors = list(parse_errors)
-
-        if expression and not attempt_errors:
-            grammar_result = validate_expression(expression)
-            if not grammar_result.valid:
-                attempt_errors.append(f"Grammar validation failed: {grammar_result.error}")
-            else:
-                semantic_result = check_semantic_consistency(
-                    expression, column, entity_name, relevant_chunks, obj.raw_sql
-                )
-                if not semantic_result.passed:
-                    attempt_errors.extend(f"Semantic validation: {e}" for e in semantic_result.errors)
-
-        if not attempt_errors:
-            validation_errors = []
-            break
-
-        validation_errors = attempt_errors
-        if attempt + 1 >= _MAX_GENERATION_ATTEMPTS:
-            break
-
-        retry_context = "\n\n".join(
-            part
-            for part in [
-                f'Target column: "{entity_name}"."{column}"',
-                f"Ordered assignment context:\n{assignment_context}" if assignment_context else "",
-                f"Relevant SQL:\n{relevant_sql}" if relevant_sql else "",
-                f"Technical summary:\n{canonical_model.technical_summary}" if canonical_model.technical_summary else "",
-                f"Business summary:\n{canonical_model.business_summary}" if canonical_model.business_summary else "",
-                f"Source SQL:\n{source_sql_excerpt}",
-                f"Platform reference:\n{function_reference}",
-                f"RAG context:\n{rag_context}" if rag_context else "",
-            ]
-            if part
-        )
-        raw_output = llm_client.retry_with_error(
-            previous_expression=expression or raw_output,
-            error="\n".join(attempt_errors),
-            context=retry_context,
-        )
 
     confidence = info.confidence if not validation_errors else min(info.confidence, 0.3)
     status = DDStatus.PENDING_REVIEW if validation_errors else DDStatus.ACTIVE
@@ -1651,6 +2160,7 @@ def _generate_for_column(
                 confidence=row_confidence,
                 validation_errors=row_validation_errors,
                 advisory_notes=advisory_notes,
+                business_meaning=business_meaning,
             )
         )
     return rows

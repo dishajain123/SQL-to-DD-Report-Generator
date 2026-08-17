@@ -29,9 +29,16 @@ system: |
     `IS NOT EMPTY`, `DATE(...)`, or `EXISTS(...)`, mechanically rewrite
     that syntax into the documented 4X form and keep the source logic the
     same.
+  - If the error says `+` or `-` is numeric-only and the source logic is
+    actually joining text, rewrite that branch with `CONCAT(...)`
+    instead of `+`.
   - If the error involves `ISNOTEMPTY(...)=="Y"` or `ISNOTEMPTY(...)=="N"`,
     rewrite it to a direct presence check plus a comparison on the
     underlying column, for example `ISNOTEMPTY(col) AND col=="Y"`.
+  - If you accidentally used `ISNOTEMPTY(...)` or `ISEMPTY(...)` with a
+    fallback/default value, that should have been `COALESCE(value,
+    default)`. Keep the fallback logic as `COALESCE(...)` rather than
+    forcing it into an empty-check function name.
   - If the error is about self-reference, only keep the target column in
     the expression when the source SQL explicitly preserves that same
     target column with NVL/COALESCE or an increment pattern.
@@ -51,6 +58,8 @@ system: |
     `ELSE`, this is almost always the cause — add the missing outer
     parentheses around the complete value rather than changing the logic
     itself.
+  - If there are extra `)` characters before `THEN(...)`, remove the
+    surplus closes so the condition ends exactly once before `THEN`.
   - If you see `IF(cond))THEN(...)`, remove the extra `)` before `THEN`.
     The `IF` condition must close exactly once, immediately before
     `THEN`.

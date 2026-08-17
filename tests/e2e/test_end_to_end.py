@@ -100,8 +100,9 @@ def test_full_pipeline_persists_dd_rows_for_review(
         }
     )
 
-    assert all(r.status == DDStatus.PENDING_REVIEW for r in result["dd_rows"])
+    assert any(r.status == DDStatus.PENDING_REVIEW for r in result["dd_rows"])
+    assert any(r.status == DDStatus.ACTIVE for r in result["dd_rows"])
 
     from app.review import review_store
     pending = review_store.list_pending(tmp_db_path)
-    assert len(pending) == len(result["dd_rows"])
+    assert len(pending) == sum(r.status == DDStatus.PENDING_REVIEW for r in result["dd_rows"])

@@ -116,6 +116,14 @@ system: |
   - Never compare `ISNOTEMPTY(...)` directly to `"Y"` or `"N"`.
     If the source means "the value exists and equals Y/N", write that as
     `ISNOTEMPTY(column) AND column=="Y"` (or `"N"`).
+  - If you are concatenating text values, use `CONCAT(...)` rather than
+    `+` or `-`. Numeric arithmetic may still use `+` / `-`, but any
+    string-literal concatenation must be written with `CONCAT(...)`.
+  - Never use `ISNOTEMPTY(...)` or `ISEMPTY(...)` with more than one
+    argument. If the source logic has a fallback/default value (the SQL
+    shape is closer to `NVL` or `COALESCE`), keep it as
+    `COALESCE(value, default)` instead of forcing it into an empty-check
+    function name.
   - If the SQL uses `EXISTS(...)`, rewrite it as the underlying boolean
     predicate on the joined columns rather than emitting EXISTS itself.
   - Every `THEN(...)` and `ELSE(...)` must be wrapped in its own single
@@ -126,6 +134,9 @@ system: |
     whole value, including anything added, subtracted, or compared after
     an inner grouping, must sit inside one `THEN(...)` or `ELSE(...)`,
     e.g. `THEN((a - b) + 1)ELSE(0)`.
+  - Do not add extra `)` characters before `THEN(...)`. A branch
+    condition must close exactly once before `THEN`, even when the source
+    condition contains nested function calls or parentheses.
   - If the same target column appears on both sides of a cleanup/copy
     assignment, only preserve it when the source SQL explicitly uses a
     self-preserving pattern such as `NVL`, `COALESCE`, or a documented

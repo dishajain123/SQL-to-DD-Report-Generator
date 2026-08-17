@@ -113,6 +113,80 @@ def _rewrite_postfix_isnotempty(expression: str) -> str:
     return pattern.sub(lambda m: f"ISNOTEMPTY({m.group(1).strip()})", expression)
 
 
+def _rewrite_misused_empty_functions(expression: str) -> str:
+    """Rewrite malformed multi-argument empty-check calls into COALESCE."""
+
+    def rewrite_calls(text: str, func_name: str) -> str:
+        result: list[str] = []
+        i = 0
+        n = len(text)
+        in_double = False
+
+        while i < n:
+            ch = text[i]
+            if in_double:
+                result.append(ch)
+                if ch == '"':
+                    in_double = False
+                i += 1
+                continue
+
+            if ch == '"':
+                in_double = True
+                result.append(ch)
+                i += 1
+                continue
+
+            if text[i : i + len(func_name)].upper() == func_name and (
+                i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")
+            ):
+                start = i + len(func_name)
+                if start < n and text[start] == "(":
+                    depth = 1
+                    j = start + 1
+                    local_in_double = False
+                    args: list[str] = []
+                    current: list[str] = []
+
+                    while j < n and depth > 0:
+                        cur = text[j]
+                        if cur == '"':
+                            local_in_double = not local_in_double
+                            current.append(cur)
+                        elif not local_in_double and cur == "(":
+                            depth += 1
+                            current.append(cur)
+                        elif not local_in_double and cur == ")":
+                            depth -= 1
+                            if depth == 0:
+                                break
+                            current.append(cur)
+                        elif not local_in_double and cur == "," and depth == 1:
+                            args.append("".join(current).strip())
+                            current = []
+                        else:
+                            current.append(cur)
+                        j += 1
+
+                    if depth == 0:
+                        args.append("".join(current).strip())
+                        if len(args) > 1:
+                            result.append(f"COALESCE({', '.join(args)})")
+                        else:
+                            result.append(f"{func_name}({', '.join(args)})")
+                        i = j + 1
+                        continue
+
+            result.append(ch)
+            i += 1
+
+        return "".join(result)
+
+    expression = rewrite_calls(expression, "ISNOTEMPTY")
+    expression = rewrite_calls(expression, "ISEMPTY")
+    return expression
+
+
 def _rewrite_null_predicates(expression: str) -> str:
     expression = re.sub(
         r'(?i)\b([A-Za-z_][A-Za-z0-9_".]*?)\s+IS\s+NOT\s+NULL\b',
@@ -142,6 +216,52 @@ def _rewrite_sql_date_literals(expression: str) -> str:
         lambda match: f'TODATE("{match.group(1).strip()}")',
         expression,
     )
+
+
+def _rewrite_sql_not_equal_operator(expression: str) -> str:
+    """Normalize SQL's `<>` inequality operator to 4X `!=`."""
+
+    result: list[str] = []
+    i = 0
+    n = len(expression)
+    in_double = False
+
+    while i < n:
+        ch = expression[i]
+        if ch == '"':
+            in_double = not in_double
+            result.append(ch)
+            i += 1
+            continue
+        if not in_double and ch == "<" and i + 1 < n and expression[i + 1] == ">":
+            result.append("!=")
+            i += 2
+            continue
+        result.append(ch)
+        i += 1
+
+    return "".join(result)
+
+
+def _find_matching_paren(text: str, open_index: int) -> int:
+    """Find the matching closing parenthesis, ignoring quoted text."""
+
+    depth = 0
+    in_double = False
+    for idx in range(open_index, len(text)):
+        ch = text[idx]
+        if ch == '"':
+            in_double = not in_double
+            continue
+        if in_double:
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return idx
+    return -1
 
 
 def _rewrite_exists_predicates(expression: str) -> str:
@@ -542,12 +662,68 @@ def _repair_missing_then_parentheses(expression: str) -> str:
     return "".join(result)
 
 
+def _repair_extra_close_before_then(expression: str) -> str:
+    """Remove any surplus `)` characters immediately before THEN."""
+
+    previous = expression
+    for _ in range(3):
+        result: list[str] = []
+        i = 0
+        n = len(previous)
+        in_double = False
+        changed = False
+        while i < n:
+            ch = previous[i]
+            if ch == '"':
+                in_double = not in_double
+                result.append(ch)
+                i += 1
+                continue
+            if in_double:
+                result.append(ch)
+                i += 1
+                continue
+
+            token = None
+            if previous[i : i + 7].upper() == "ELSEIF(" and (i == 0 or not (previous[i - 1].isalnum() or previous[i - 1] == "_")):
+                token = "ELSEIF("
+            elif previous[i : i + 3].upper() == "IF(" and (i == 0 or not (previous[i - 1].isalnum() or previous[i - 1] == "_")):
+                token = "IF("
+
+            if token:
+                open_index = i + len(token) - 1
+                close_index = _find_matching_paren(previous, open_index)
+                if close_index != -1:
+                    j = close_index + 1
+                    while j < n and previous[j].isspace():
+                        j += 1
+                    extra_close_end = j
+                    while extra_close_end < n and previous[extra_close_end] == ")":
+                        extra_close_end += 1
+                    if extra_close_end > j and previous[extra_close_end:].lstrip().startswith("THEN("):
+                        result.append(previous[i : close_index + 1])
+                        i = extra_close_end
+                        changed = True
+                        continue
+
+            result.append(ch)
+            i += 1
+
+        repaired = "".join(result)
+        if not changed:
+            return repaired
+        previous = repaired
+    return previous
+
+
 def _normalize_expression(expression: str) -> str:
     normalized = _flatten_whitespace(expression)
     normalized = _rewrite_legacy_else_if(normalized)
     normalized = _rewrite_not_in_membership(normalized)
     normalized = _rewrite_is_empty_syntax(normalized)
     normalized = _rewrite_postfix_isnotempty(normalized)
+    normalized = _rewrite_misused_empty_functions(normalized)
+    normalized = _rewrite_sql_not_equal_operator(normalized)
     normalized = _rewrite_isnotempty_boolean_comparisons(normalized)
     normalized = _rewrite_null_predicates(normalized)
     normalized = _rewrite_sql_date_literals(normalized)
@@ -559,6 +735,7 @@ def _normalize_expression(expression: str) -> str:
     normalized = _rewrite_legacy_if_syntax(normalized)
     normalized = _strip_angle_bracket_placeholders(normalized)
     normalized = _repair_missing_then_parentheses(normalized)
+    normalized = _repair_extra_close_before_then(normalized)
     return normalized
 
 
@@ -581,6 +758,18 @@ def validate_expression(expression: str) -> ValidationResult:
             valid=False,
             error=f"Unknown function(s) not in the 4X library: {', '.join(sorted(unknown))}",
         )
+
+    string_arithmetic_ops = _find_string_literal_add_sub_expressions(tree)
+    if string_arithmetic_ops:
+        unique_ops = sorted(set(string_arithmetic_ops))
+        op_text = " and ".join(f"'{op}'" for op in unique_ops)
+        return ValidationResult(
+            valid=False,
+            error=(
+                f"{op_text} are documented as numeric-only operators on this platform; "
+                "use CONCAT(...) to join text values, not + or -."
+            ),
+        )
     return ValidationResult(valid=True)
 
 
@@ -591,3 +780,26 @@ def _find_unknown_functions(tree) -> set[str]:
         if func_name.upper() not in KNOWN_FUNCTIONS:
             unknown.add(func_name)
     return unknown
+
+
+def _unwrap_single_child_node(node):
+    while hasattr(node, "children") and len(node.children) == 1:
+        node = node.children[0]
+    return node
+
+
+def _contains_string_literal_operand(node) -> bool:
+    node = _unwrap_single_child_node(node)
+    return getattr(node, "type", None) == "STRING"
+
+
+def _find_string_literal_add_sub_expressions(tree) -> list[str]:
+    offenders: list[str] = []
+    for rule_name in ("add", "sub"):
+        for node in tree.find_data(rule_name):
+            children = list(node.children)
+            if len(children) != 2:
+                continue
+            if _contains_string_literal_operand(children[0]) or _contains_string_literal_operand(children[1]):
+                offenders.append("+" if rule_name == "add" else "-")
+    return offenders

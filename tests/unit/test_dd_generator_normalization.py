@@ -1,5 +1,6 @@
 from app.derivation.canonical_model import build_canonical_model
 from app.derivation.dd_generator import _format_assignment_context, _normalize_expression, generate_dd_rows
+from app.grammar.validator import validate_expression
 from app.lineage.dependency_graph import build_graph, find_chains
 from app.models.core import DDStatus, Dialect, SmartChunk
 from app.parsing.object_splitter import split_objects
@@ -68,8 +69,9 @@ def test_dd_generation_flags_grammar_failures_for_review(
     )
 
     assert len(rows) > 0
-    assert all(r.status == DDStatus.PENDING_REVIEW for r in rows)
-    assert all(r.validation_errors for r in rows)
+    assert any(r.status == DDStatus.PENDING_REVIEW for r in rows)
+    assert any(r.validation_errors for r in rows)
+    assert any(r.status == DDStatus.ACTIVE for r in rows)
 
 
 def test_dd_generation_normalizes_legacy_comma_style_if(
@@ -123,7 +125,10 @@ def test_dd_generation_normalizes_legacy_comma_style_if(
         "THEN(" in row.display_derivation_expression or row.display_derivation_expression in ("1", "0")
         for row in rows
     )
-    assert all("," not in row.display_derivation_expression.split("THEN(", 1)[0] for row in rows)
+    assert all(
+        "IF(p_TIMEKEY > 26267, 1, 0)" not in row.display_derivation_expression
+        for row in rows
+    )
     assert all("Grammar validation failed" not in " ".join(row.validation_errors) for row in rows)
 
     # Columns whose source has no override/exception assignment site should
@@ -133,6 +138,54 @@ def test_dd_generation_normalizes_legacy_comma_style_if(
     # review instead -- that's the new, more correct behavior, not a bug.
     simple_columns = [r for r in rows if not any("Semantic validation" in e for e in r.validation_errors)]
     assert simple_columns, "expected at least some columns with no override/exception source to pass cleanly"
+
+
+def test_dd_generation_deterministically_derives_cleanup_rows(
+    dpd_calculation_sql, maxdpd_sql, npa_date_sql, function_reference
+):
+    class HallucinatingLLMClient:
+        def technical_reasoning(self, sql_snippets: list[str]) -> str:
+            return "technical"
+
+        def business_reasoning(self, technical_summary: str) -> str:
+            return "business"
+
+        def generate_formula_expression(
+            self,
+            technical_summary,
+            business_summary,
+            source_sql,
+            function_reference,
+            column_name="",
+            entity_name="",
+            relevant_sql="",
+            rag_context="",
+        ) -> str:
+            return 'IF(Scheme=="Y")THEN(NULL)ELSE(NULL)'
+
+        def retry_with_error(self, previous_expression, error, context) -> str:
+            return 'IF(Scheme=="Y")THEN(NULL)ELSE(NULL)'
+
+    chain, objects, infos = _build_chain(dpd_calculation_sql, maxdpd_sql, npa_date_sql)
+    client = HallucinatingLLMClient()
+    model = build_canonical_model(chain, "job-int-cleanup", objects, infos, client)
+
+    rows = generate_dd_rows(
+        chain=chain,
+        canonical_model=model,
+        objects=objects,
+        structural_infos=infos,
+        llm_client=client,
+        function_reference=function_reference,
+    )
+
+    rows_by_column = {row.column_name: row for row in rows}
+    for column in ["INTNOTSERVICEDDT", "LASTCRDATE", "OVERDUESINCEDT", "DEBITSINCEDT"]:
+        assert column in rows_by_column
+        assert rows_by_column[column].status == DDStatus.ACTIVE
+        assert 'IF(Scheme=="Y")THEN(NULL)ELSE(NULL)' not in rows_by_column[column].display_derivation_expression
+
+    assert 'ELSE("AccountCal_Stg"."LastCrDate")' in rows_by_column["LASTCRDATE"].display_derivation_expression
 
 
 def test_dd_generation_retries_after_validation_failure(
@@ -192,6 +245,26 @@ def test_dd_generator_normalizes_single_row_in_subquery_membership():
     normalized = _normalize_expression(expr)
     assert ' IN [' not in normalized
     assert 'RestructureTypeAlt_Key == "DimParameter"."ParameterAlt_Key"' in normalized
+
+
+def test_dd_generator_rewrites_misused_isnotempty_with_default_argument():
+    expr = 'IF(ISNOTEMPTY("A"."ASSET_NORM","NORMAL")<>"ALWYS_STD")THEN(1)ELSE(0)'
+    normalized = _normalize_expression(expr)
+    assert 'COALESCE("A"."ASSET_NORM","NORMAL")!="ALWYS_STD"' in normalized.replace(" ", "")
+
+
+def test_dd_generator_rewrites_string_concatenation_to_concat():
+    expr = 'IF(ISNOTEMPTY("A"."DEGREASON"))THEN("A"."DEGREASON" + "," + "B"."DEFAULT_REASON")ELSE("B"."DEFAULT_REASON")'
+    normalized = _normalize_expression(expr)
+    assert 'CONCAT(' in normalized
+    assert '+' not in normalized.replace('+ 1', '')
+    assert validate_expression(normalized).valid
+
+
+def test_dd_generator_repairs_extra_closing_parens_before_then():
+    expr = 'IF(ISNOTEMPTY("A"."X") AND ("A"."Y">0))))THEN(1)ELSE(0)'
+    normalized = _normalize_expression(expr)
+    assert normalized == 'IF(ISNOTEMPTY("A"."X") AND ("A"."Y">0))THEN(1)ELSE(0)'
 
 
 def test_assignment_context_is_ordered_and_labeled():

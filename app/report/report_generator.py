@@ -63,10 +63,87 @@ _KEYWORDS = {
     "DATE",
 }
 
+_HOW_TO_READ_A_CONDITION = """## How to Read a Condition
+
+Every rule below is written as a simple decision chain:
+
+```
+IF (condition A) THEN (use this value)
+ELSEIF (condition B) THEN (use this value instead)
+ELSE (use this fallback value)
+```
+
+Read it top to bottom, like a flowchart: check the first condition - if it's true, that's the answer.
+If not, move to the next condition. If nothing matches, use the final `ELSE` value.
+
+`"TableName"."ColumnName"` just means a specific field in a specific table."""
+
 
 def _flatten_for_table_cell(text: str) -> str:
     flattened = " ".join(text.split())
     return flattened.replace("|", "\\|")
+
+
+def _first_sentence(text: str) -> str:
+    stripped = " ".join(text.split()).strip()
+    if not stripped:
+        return ""
+    match = re.search(r"^(.+?[.!?])(?:\s|$)", stripped)
+    if match:
+        return match.group(1).strip()
+    return stripped
+
+
+def _render_glossary_lines(canonical_models: list[CanonicalModel]) -> list[str]:
+    glossary: dict[str, tuple[str, str]] = {}
+    order: list[str] = []
+    for model in canonical_models:
+        for term in getattr(model, "glossary_terms", []):
+            name = _normalize_display_name(getattr(term, "term", "")).strip()
+            definition = " ".join(getattr(term, "definition", "").split()).strip()
+            if not name or not definition:
+                continue
+            key = canonical_logical_name(name)
+            if key not in glossary:
+                order.append(key)
+            glossary[key] = (name, definition)
+
+    if not order:
+        return []
+
+    lines = ["## Glossary", ""]
+    lines.append("| Term | Plain-English meaning |")
+    lines.append("|---|---|")
+    for key in order:
+        term, definition = glossary[key]
+        lines.append(f"| {term} | {definition} |")
+    lines.append("")
+    return lines
+
+
+def _is_operational_entity(entity_name: str, rules: list["_RuleGroup"]) -> bool:
+    entity = canonical_logical_name(entity_name).upper()
+    if any(token in entity for token in ("RUNNINGPROCESS", "AUDIT", "PROCESSLOG", "BATCHLOG")):
+        return True
+
+    rule_text = " ".join(
+        " ".join(
+            [
+                rule.column_name,
+                rule.business_meaning,
+                rule.formula,
+                " ".join(rule.validation_notes.split()),
+            ]
+        )
+        for rule in rules
+    ).upper()
+    if "JOB" in entity and any(token in rule_text for token in ("COMPLETED", "ERROR", "STATUS", "MONITOR", "RUN")):
+        return True
+    if "STATUS" in entity and all(
+        token in rule_text for token in ("ERROR", "STATUS", "COUNT", "COMPLETED")
+    ):
+        return True
+    return False
 
 
 def _format_effective_dates(rows: list[DDRow]) -> str:
@@ -208,6 +285,11 @@ def _business_meaning_from_formula(column_name: str, expression: str) -> str:
     return f"SQL-derived logic for {column} based on the listed dependencies."
 
 
+def _is_fallback_business_meaning(rule: "_RuleGroup") -> bool:
+    fallback = _business_meaning_from_formula(rule.column_name, rule.formula).strip()
+    return " ".join(rule.business_meaning.split()).strip() == " ".join(fallback.split()).strip()
+
+
 def _rule_summary_from_formula(expression: str) -> str:
     expr = _flatten_for_table_cell(expression)
     if len(expr) <= 180:
@@ -253,13 +335,16 @@ def _build_rule_groups(dd_rows: list[DDRow]) -> list[_RuleGroup]:
         rule_id = f"BR-{counter:03d}"
         counter += 1
         formula = first.display_derivation_expression or ""
+        business_meaning = first.business_meaning.strip() if getattr(first, "business_meaning", "").strip() else ""
+        if not business_meaning:
+            business_meaning = _business_meaning_from_formula(first.column_name, formula)
         rule_groups.append(
             _RuleGroup(
                 rule_id=rule_id,
                 entity_name=first.entity_name,
                 column_name=first.column_name,
                 rows=rows,
-                business_meaning=_business_meaning_from_formula(first.column_name, formula),
+                business_meaning=business_meaning,
                 depends_on=_extract_dependencies(formula),
                 formula=formula,
                 effective_dates=_format_effective_dates(rows),
@@ -327,6 +412,8 @@ def _aggregation_lines(rule_groups: list[_RuleGroup]) -> list[str]:
 
 def _business_rule_explanation_lines(rule: _RuleGroup) -> list[str]:
     expr = rule.formula.upper()
+    if not _is_fallback_business_meaning(rule):
+        return []
     lines: list[str] = []
 
     if "TODATE(" in expr and "1900-01-01" in expr:
@@ -384,7 +471,7 @@ def _business_rule_explanation_lines(rule: _RuleGroup) -> list[str]:
 
 def _business_rules_section(rule_groups: list[_RuleGroup]) -> list[str]:
     lines: list[str] = []
-    lines.append("## 6. Business Rules / Logic Explanation")
+    lines.append("## 4. Business Rules / Logic Explanation")
     lines.append("")
     if not rule_groups:
         lines.append("- No generated rules were available for explanation.")
@@ -393,19 +480,17 @@ def _business_rules_section(rule_groups: list[_RuleGroup]) -> list[str]:
     for entity_name, rules in _rules_by_entity(rule_groups):
         lines.append(f"### {entity_name}")
         lines.append("")
-        lines.append("| Rule ID | Column | Business Logic | Special Cases | Effective Dates |")
-        lines.append("|---|---|---|---|---|")
         for rule in rules:
             details = _business_rule_explanation_lines(rule)
             summary = rule.business_meaning
-            special_cases = "; ".join(details)
             if rule.status == "PENDING_REVIEW":
                 summary = f"PENDING_REVIEW: {summary}"
             elif rule.advisory_notes:
                 summary = f"{summary} (advisory)"
-            lines.append(
-                f"| {rule.rule_id} | {rule.column_name} | {summary} | {_flatten_for_table_cell(special_cases)} | {rule.effective_dates} |"
-            )
+            lines.append(f"- {rule.rule_id} {rule.column_name}: {summary}")
+            for detail in details:
+                lines.append(f"  - {detail}")
+            lines.append(f"  - Effective dates: {rule.effective_dates}")
         lines.append("")
     return lines
 
@@ -461,51 +546,36 @@ def generate_report(
     objects = objects or {}
     rule_groups = _build_rule_groups(dd_rows)
     entity_groups = _rules_by_entity(rule_groups)
-    process_overview_lines, source_procedures = _summarize_process_overview(job_plan, canonical_models, objects)
-    source_refs, traceability_notes = _traceability_lines(job_plan, canonical_models, dd_rows)
+    business_groups: list[_RuleGroup] = []
+    technical_groups: list[_RuleGroup] = []
+    for entity_name, rules in entity_groups:
+        if _is_operational_entity(entity_name, rules):
+            technical_groups.extend(rules)
+        else:
+            business_groups.extend(rules)
+
+    process_name = _process_name(job_plan, canonical_models, objects)
+    top_summary = _first_sentence(next((model.business_summary for model in canonical_models if model.business_summary.strip()), ""))
+    glossary_lines = _render_glossary_lines(canonical_models)
 
     lines: list[str] = []
-    lines.append(f"# DD Automation Report — {process_overview_lines[0]}")
+    lines.append(f"# DD Automation Report — {process_name}")
+    lines.append("")
+    if top_summary:
+        lines.append(f"> **What this process does, in one line:** {top_summary}")
+        lines.append("")
+
+    lines.extend(_HOW_TO_READ_A_CONDITION.splitlines())
+    lines.append("")
+    if glossary_lines:
+        lines.extend(glossary_lines)
+
+    lines.append("## 1. Business Flow / Process Overview")
     lines.append("")
 
-    lines.append("## 1. Process Overview")
-    lines.append(f"- Purpose: Generate DD conditions and review-ready derivations for {job_plan.company} on {job_plan.platform}.")
-    lines.append(f"- Inputs / Parameters: {', '.join(process_overview_lines[1:])}")
-    lines.append(f"- Source Procedure(s): {', '.join(source_procedures) if source_procedures else 'None identified'}")
-    lines.append("")
-
-    lines.append("## 2. How to Read a DD Condition")
-    lines.append("- Platform syntax explanation: DD formulas use the 4X expression form, including `IF(condition)THEN(true_expr)ELSE(false_expr)` and documented functions such as `ISNOTEMPTY`, `ISEMPTY`, `COALESCE`, `DATEDIFF`, and `TODATE`.")
-    lines.append("- Field reference explanation: Quoted entity/field references preserve source-table lineage, while bare parameters such as `p_TIMEKEY` represent procedure inputs.")
-    lines.append("- Effective-date explanation: Rows with multiple effective dates represent the same logical rule across versioned thresholds; the same Rule ID stays attached to every period-specific instance of that rule.")
-    lines.append("")
-
-    lines.append("## 3. Business Logic")
-    lines.append("### Business Flow")
-    lines.extend(_business_flow_lines(rule_groups, canonical_models))
-    lines.append("")
-    lines.append("### Special Cases")
-    lines.extend(_special_case_lines(rule_groups))
-    lines.append("")
-    lines.append("### Period-Specific Rules")
-    period_rows = _period_rule_rows(rule_groups)
-    if period_rows:
-        lines.append("| Rule ID | Entity | Column | Effective Dates | Period Logic |")
-        lines.append("|---|---|---|---|---|")
-        for rule_id, entity, column, effective_dates, logic in period_rows:
-            lines.append(
-                f"| {rule_id} | {entity} | {column} | {effective_dates} | {_flatten_for_table_cell(logic)} |"
-            )
-    else:
-        lines.append("- No period-specific rule changes were detected.")
-    lines.append("")
-    lines.append("### Aggregation / Max Logic")
-    lines.extend(_aggregation_lines(rule_groups))
-    lines.append("")
-
-    lines.append("## 4. Column-Level Derivations & DD Conditions")
-    if entity_groups:
-        for entity_name, rules in entity_groups:
+    lines.append("## 2. Column-Level Derivations & DD Conditions")
+    if business_groups or technical_groups:
+        for entity_name, rules in _rules_by_entity(business_groups):
             lines.append("")
             lines.append(f"### {entity_name}")
             lines.append("")
@@ -522,52 +592,58 @@ def generate_report(
                 lines.append(
                     f"| {rule.column_name} | {business_meaning} | {depends_on} | {rule.rule_id} | `{_flatten_for_table_cell(formula)}` | {rule.effective_dates} |"
                 )
+
+        if technical_groups:
+            technical_by_entity = _rules_by_entity(technical_groups)
+            for entity_name, rules in technical_by_entity:
+                lines.append("")
+                lines.append(f"### {entity_name} — technical housekeeping, not business logic")
+                lines.append("")
+                lines.append(
+                    "> These rows are operational monitoring fields and are excluded from the business-rules count below."
+                )
+                lines.append("")
+                lines.append("| Column | Business Meaning | Depends On | Rule ID | Platform Formula | Effective Dates |")
+                lines.append("|---|---|---|---|---|---|")
+                for rule in rules:
+                    depends_on = ", ".join(rule.depends_on) if rule.depends_on else "(not confidently extracted)"
+                    formula = rule.formula or "(pending review)"
+                    business_meaning = rule.business_meaning
+                    if rule.status == "PENDING_REVIEW" and rule.validation_notes:
+                        business_meaning = f"PENDING_REVIEW: {business_meaning}"
+                    elif rule.advisory_notes:
+                        business_meaning = f"{business_meaning} (advisory)"
+                    lines.append(
+                        f"| {rule.column_name} | {business_meaning} | {depends_on} | {rule.rule_id} | `{_flatten_for_table_cell(formula)}` | {rule.effective_dates} |"
+                    )
     else:
         lines.append("- No DD rows were generated for this job.")
     lines.append("")
 
-    lines.append("## 5. Process Control & Traceability")
-    lines.append("### Success / Error Handling")
-    if traceability_notes:
-        lines.extend(traceability_notes)
+    lines.append("## 3. Business Rules / Logic Explanation")
+    lines.append("")
+    if business_groups:
+        lines.append("- The rules below explain why each business derivation matters, not just how the formula is written.")
+        if technical_groups:
+            lines.append("- Technical housekeeping rows are documented above and excluded from this section.")
+        lines.append("")
+        for entity_name, rules in _rules_by_entity(business_groups):
+            lines.append(f"### {entity_name}")
+            lines.append("")
+            for rule in rules:
+                details = _business_rule_explanation_lines(rule)
+                summary = rule.business_meaning
+                if rule.status == "PENDING_REVIEW":
+                    summary = f"PENDING_REVIEW: {summary}"
+                elif rule.advisory_notes:
+                    summary = f"{summary} (advisory)"
+                lines.append(f"- {rule.rule_id} {rule.column_name}: {summary}")
+                for detail in details:
+                    lines.append(f"  - {detail}")
+                lines.append(f"  - Effective dates: {rule.effective_dates}")
+            lines.append("")
     else:
-        lines.append("- No traceability notes were available.")
-    lines.append("")
-    lines.append("### Source Reference")
-    lines.extend(source_refs)
-    lines.append("")
-    lines.append("### Conversion Notes / Caveats")
-    if dd_rows:
-        caveats = []
-        for row in dd_rows:
-            if row.status.value == "PENDING_REVIEW" or row.validation_errors:
-                caveats.append(
-                    f"- {row.entity_name}.{row.column_name} ({row.effective_start_date}): "
-                    + ("; ".join(row.validation_errors) if row.validation_errors else "Marked PENDING_REVIEW.")
-                )
-            elif row.advisory_notes:
-                caveats.append(
-                    f"- {row.entity_name}.{row.column_name} ({row.effective_start_date}): "
-                    + "; ".join(row.advisory_notes)
-                )
-        if caveats:
-            lines.extend(caveats)
-        else:
-            lines.append("- No conversion caveats were recorded.")
-    else:
-        lines.append("- No DD rows were generated.")
-    lines.append("")
-    lines.append("### Validation / PENDING_REVIEW Items")
-    pending_items = [row for row in dd_rows if row.status.value == "PENDING_REVIEW" or row.validation_errors]
-    if pending_items:
-        for row in pending_items:
-            notes = "; ".join(row.validation_errors) if row.validation_errors else "Marked PENDING_REVIEW."
-            lines.append(f"- {row.entity_name}.{row.column_name} [{row.effective_start_date}]: {notes}")
-    else:
-        lines.append("- None.")
-
-    lines.append("")
-    lines.extend(_business_rules_section(rule_groups))
+        lines.append("- No business rules were available for explanation.")
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)

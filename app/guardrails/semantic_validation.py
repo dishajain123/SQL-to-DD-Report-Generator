@@ -81,6 +81,26 @@ _NUMBER_LITERAL_COMPARISON_RE = re.compile(
 )
 
 
+def _leading_keyword_ignoring_comments(text: str) -> str:
+    stripped = text.lstrip()
+    while True:
+        if stripped.startswith("--"):
+            nl = stripped.find("\n")
+            if nl == -1:
+                return ""
+            stripped = stripped[nl + 1 :].lstrip()
+            continue
+        if stripped.startswith("/*"):
+            end = stripped.find("*/")
+            if end == -1:
+                return ""
+            stripped = stripped[end + 2 :].lstrip()
+            continue
+        break
+    match = re.match(r"[A-Za-z]+", stripped)
+    return match.group(0).upper() if match else ""
+
+
 def _is_function_call_name(text: str, match: re.Match[str]) -> bool:
     """True if the identifier `match` is immediately followed by '(' --
     i.e. it's a function call name, not a column reference -- so function
@@ -513,9 +533,8 @@ def check_dropped_override_conditions(
 
     for chunk in relevant_chunks:
         raw_upper = chunk.raw_sql.upper()
-        is_override_chunk = chunk.chunk_kind == "MERGE" or any(
-            keyword in raw_upper for keyword in _OVERRIDE_SIGNAL_KEYWORDS
-        )
+        leading_keyword = _leading_keyword_ignoring_comments(chunk.raw_sql)
+        is_override_chunk = chunk.chunk_kind == "MERGE" or leading_keyword in {"MERGE", "EXCEPTION", "WHEN"}
 
         if is_override_chunk:
             if len(relevant_chunks) < 2:

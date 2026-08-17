@@ -218,10 +218,29 @@ def _unwrap_to_leaf_or_column_ref(node):
     return node
 
 
+def _node_text(node) -> str | None:
+    """Return the normalized text for a token/tree leaf we can compare."""
+    node = _unwrap_to_leaf_or_column_ref(node)
+    if isinstance(node, Token):
+        return str(node).strip('"')
+    if isinstance(node, Tree) and node.data in {"column_ref", "path_part"}:
+        parts: list[str] = []
+        for child in node.children:
+            text = _node_text(child)
+            if text is None:
+                return None
+            parts.append(text)
+        return ".".join(parts)
+    return None
+
+
 def _as_variable_name(node) -> str | None:
     node = _unwrap_to_leaf_or_column_ref(node)
     if isinstance(node, Tree) and node.data == "column_ref":
-        segments = [str(child).strip('"') for child in node.children]
+        text = _node_text(node)
+        if text is None:
+            return None
+        segments = [segment for segment in text.split(".") if segment]
         return segments[-1] if segments else None
     if isinstance(node, Token) and node.type == "NAME":
         return str(node)

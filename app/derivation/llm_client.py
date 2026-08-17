@@ -24,6 +24,7 @@ import yaml
 
 from app.utils.config import settings
 from app.utils.logging_config import get_logger
+from app.models.core import GlossaryTerm
 
 logger = get_logger(__name__)
 
@@ -33,6 +34,7 @@ _PROMPT_FILE_SPECS = {
     "technical_reasoning": _PROMPTS_DIR / "technical_reasoning.yaml",
     "business_reasoning": _PROMPTS_DIR / "business_reasoning.yaml",
     "dd_generation": _PROMPTS_DIR / "dd_generation.yaml",
+    "rule_explanation": _PROMPTS_DIR / "rule_explanation.yaml",
     "retry_with_error": _PROMPTS_DIR / "retry_with_error.yaml",
 }
 
@@ -40,12 +42,19 @@ _PROMPT_KEY_MAP = {
     "technical_reasoning": ("technical_reasoning_system", "technical_reasoning_user"),
     "business_reasoning": ("business_reasoning_system", "business_reasoning_user"),
     "dd_generation": ("dd_generation_system", "dd_generation_user"),
+    "rule_explanation": ("rule_explanation_system", "rule_explanation_user"),
     "retry_with_error": ("retry_with_error_system", "retry_with_error_user"),
 }
 
 
 class _ModelRejectedError(RuntimeError):
     """Raised when a provider rejects a candidate model and fallback is okay."""
+
+
+@dataclass
+class BusinessReasoningResult:
+    summary: str
+    glossary_terms: list[GlossaryTerm]
 
 
 @lru_cache(maxsize=1)
@@ -94,6 +103,46 @@ def _parse_json_payload(raw_output: str) -> dict[str, object]:
     if not isinstance(parsed, dict):
         raise ValueError("Expected a JSON object")
     return parsed
+
+
+def _parse_business_reasoning_output(raw_output: str) -> BusinessReasoningResult:
+    stripped = _strip_markdown_fences(raw_output).strip()
+    if not stripped:
+        return BusinessReasoningResult(summary="", glossary_terms=[])
+
+    parsed = None
+    for candidate in (stripped, stripped[stripped.find("{") : stripped.rfind("}") + 1] if "{" in stripped and "}" in stripped else ""):
+        if not candidate:
+            continue
+        try:
+            parsed = json.loads(candidate)
+            break
+        except json.JSONDecodeError:
+            continue
+
+    if parsed is None:
+        return BusinessReasoningResult(summary=stripped, glossary_terms=[])
+
+    if not isinstance(parsed, dict):
+        return BusinessReasoningResult(summary=stripped, glossary_terms=[])
+
+    summary = parsed.get("business_summary")
+    if not isinstance(summary, str) or not summary.strip():
+        summary = parsed.get("summary") if isinstance(parsed.get("summary"), str) else stripped
+    summary = str(summary).strip()
+
+    glossary_terms: list[GlossaryTerm] = []
+    raw_terms = parsed.get("glossary_terms")
+    if isinstance(raw_terms, list):
+        for term in raw_terms:
+            if not isinstance(term, dict):
+                continue
+            name = term.get("term")
+            definition = term.get("definition")
+            if isinstance(name, str) and name.strip() and isinstance(definition, str) and definition.strip():
+                glossary_terms.append(GlossaryTerm(term=name.strip(), definition=definition.strip()))
+
+    return BusinessReasoningResult(summary=summary, glossary_terms=glossary_terms)
 
 
 def _normalize_provider(raw_provider: str, model: str, base_url: str) -> str:
@@ -352,10 +401,40 @@ class LLMClient:
         return self._complete(system, user, max_tokens=768)
 
     def business_reasoning(self, technical_summary: str) -> str:
+        return self.business_reasoning_details(technical_summary).summary
+
+    def business_reasoning_details(self, technical_summary: str) -> BusinessReasoningResult:
         prompts = _load_prompts()
         system, user_template = _prompt_pair(prompts, "business_reasoning")
         user = _render_prompt(user_template, technical_summary=technical_summary)
-        return self._complete(system, user, max_tokens=512)
+        raw = self._complete(system, user, max_tokens=512)
+        return _parse_business_reasoning_output(raw)
+
+    def rule_explanation(
+        self,
+        technical_summary: str,
+        business_summary: str,
+        source_sql: str,
+        function_reference: str,
+        column_name: str = "",
+        entity_name: str = "",
+        relevant_sql: str = "",
+        formula: str = "",
+    ) -> str:
+        prompts = _load_prompts()
+        system, user_template = _prompt_pair(prompts, "rule_explanation")
+        user = _render_prompt(
+            user_template,
+            technical_summary=technical_summary,
+            business_summary=business_summary,
+            source_sql=source_sql,
+            function_reference=function_reference,
+            column_name=column_name,
+            entity_name=entity_name,
+            relevant_sql=relevant_sql.strip(),
+            formula=formula.strip(),
+        )
+        return self._complete(system, user, max_tokens=256)
 
     def generate_formula_expression(
         self,
