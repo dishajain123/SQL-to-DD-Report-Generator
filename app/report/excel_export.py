@@ -21,6 +21,8 @@ in does not matter as long as the column names/order match.
 from __future__ import annotations
 
 import csv
+import json
+from datetime import date
 from pathlib import Path
 
 import openpyxl
@@ -29,6 +31,7 @@ from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from app.models.core import DDRow
+from app.utils import db
 
 COLUMNS = [
     "Entity Name",
@@ -74,6 +77,38 @@ def dd_row_to_dict(dd: DDRow) -> dict:
         "decision_table_json": dd.decision_table_json or "",
         "conditional_json": dd.conditional_json or "",
     }
+
+
+def _row_dict_to_dd_row(row: dict) -> DDRow:
+    effective_start = row.get("effective_start_date")
+    if isinstance(effective_start, date):
+        effective_date = effective_start
+    else:
+        effective_date = date.fromisoformat(str(effective_start))
+
+    validation_errors = row.get("validation_errors") or []
+    if isinstance(validation_errors, str):
+        try:
+            validation_errors = json.loads(validation_errors)
+        except json.JSONDecodeError:
+            validation_errors = [validation_errors]
+
+    return DDRow(
+        entity_name=str(row.get("entity_name", "")),
+        column_name=str(row.get("column_name", "")),
+        column_type=row.get("column_type") if isinstance(row.get("column_type"), str) else str(row.get("column_type", "Physical")),
+        derivation_option=row.get("derivation_option") if isinstance(row.get("derivation_option"), str) else str(row.get("derivation_option", "Formula Expression")),
+        display_derivation_expression=str(row.get("expression") or row.get("display_derivation_expression") or ""),
+        effective_start_date=effective_date,
+        status=row.get("status") if isinstance(row.get("status"), str) else str(row.get("status", "PENDING_REVIEW")),
+        data_type=str(row.get("data_type") or ""),
+        decision_table_json=row.get("decision_table_json") or None,
+        conditional_json=row.get("conditional_json") or None,
+        source_chain_id=str(row.get("chain_id") or ""),
+        source_object_ids=[],
+        confidence=float(row.get("confidence") or 0.0),
+        validation_errors=list(validation_errors),
+    )
 
 
 def _row_key(row: dict) -> tuple:
@@ -163,3 +198,38 @@ def export_dd_rows(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)
     return output_path
+
+
+def export_dd_rows_csv(
+    dd_rows: list[DDRow], output_path: str | Path, existing_dd_path: str | Path | None = None
+) -> Path:
+    if existing_dd_path is not None:
+        existing = read_existing_dd_excel(existing_dd_path)
+        merged = merge_dd_rows(existing, dd_rows)
+    else:
+        merged = [dd_row_to_dict(r) for r in dd_rows]
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=COLUMNS)
+        writer.writeheader()
+        for row in merged:
+            writer.writerow({header: row.get(_COLUMN_KEYS[header], "") for header in COLUMNS})
+    return output_path
+
+
+def export_reviewed_dd_rows_for_job(
+    job_id: str, output_path: str | Path, db_path: str | None = None
+) -> Path:
+    rows = db.get_dd_rows_for_job(job_id, db_path=db_path)
+    dd_rows = [_row_dict_to_dd_row(dict(row)) for row in rows]
+    return export_dd_rows(dd_rows, output_path)
+
+
+def export_reviewed_dd_rows_for_job_csv(
+    job_id: str, output_path: str | Path, db_path: str | None = None
+) -> Path:
+    rows = db.get_dd_rows_for_job(job_id, db_path=db_path)
+    dd_rows = [_row_dict_to_dd_row(dict(row)) for row in rows]
+    return export_dd_rows_csv(dd_rows, output_path)

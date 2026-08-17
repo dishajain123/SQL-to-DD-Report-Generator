@@ -4,28 +4,16 @@ One document per job: technical + business + derivation summary for every
 lineage chain, plus a DD Conditions section (included only when DD
 Generation actually ran for that chain).
 
-The report also includes a "Known Limitations / Needs Review" section per
-chain, generated directly from the automated analysis (StructuralInfo's
-unsupported_constructs and the chain's overall confidence) rather than from
-the AI narrative — this surfaces real, system-detected gaps (e.g. SQL that
-could not be fully parsed) without any hallucination risk, so a
-non-technical reader knows exactly what to have double-checked before
-finalizing a DD built from this report.
+The generated report is intentionally presentation-focused. Validation
+status, review-queue metadata, and other internal processing details stay
+in the app/export workflow, not in the user-facing report.
 """
 from __future__ import annotations
 
+from collections import defaultdict
 from pathlib import Path
 
 from app.models.core import CanonicalModel, DDRow, JobPlan, SQLObject, StructuralInfo
-
-# Below this confidence, the report calls out that a human should review the
-# chain before the DD is finalized.
-_CONFIDENCE_REVIEW_THRESHOLD = 0.7
-
-# Individual unsupported-construct notes can be long fragments of raw SQL;
-# truncate them so the report stays readable for a business user.
-_MAX_NOTE_LENGTH = 200
-
 
 def _flatten_for_table_cell(text: str) -> str:
     """Markdown table cells cannot contain a literal newline (it would
@@ -37,6 +25,27 @@ def _flatten_for_table_cell(text: str) -> str:
     is displayed in this Markdown table."""
     flattened = " ".join(text.split())
     return flattened.replace("|", "\\|")
+
+
+def _format_effective_dates(rows: list[DDRow]) -> str:
+    ordered_dates = sorted({row.effective_start_date for row in rows})
+    return ", ".join(d.isoformat() for d in ordered_dates)
+
+
+def _group_dd_rows_for_report(dd_rows: list[DDRow]) -> list[list[DDRow]]:
+    grouped: dict[tuple[str, str, str, str, str | None, str | None], list[DDRow]] = defaultdict(list)
+    for row in dd_rows:
+        expression = row.display_derivation_expression or ""
+        key = (
+            row.entity_name,
+            row.column_name,
+            row.derivation_option.value,
+            expression,
+            row.decision_table_json,
+            row.conditional_json,
+        )
+        grouped[key].append(row)
+    return list(grouped.values())
 
 
 def generate_report(
@@ -72,10 +81,9 @@ def generate_report(
                 lines.append(f"- {rule}")
             lines.append("")
 
-        lines.extend(_known_limitations_lines(model, structural_infos))
-
         chain_dd_rows = dd_by_chain.get(model.chain_id, [])
         if chain_dd_rows:
+            grouped_rows = _group_dd_rows_for_report(chain_dd_rows)
             lines.append(
                 "_The Business Summary above describes each column's logic in "
                 "plain language; the exact, grammar-validated platform formula "
@@ -86,17 +94,15 @@ def generate_report(
             lines.append("")
             lines.append("### DD Conditions")
             lines.append("")
-            lines.append("| Entity | Column | Option | Expression | Effective Start Date | Status | Review Notes |")
-            lines.append("|---|---|---|---|---|---|---|")
-            for dd in chain_dd_rows:
-                expr = dd.display_derivation_expression or "(see Decision Table Json)"
+            lines.append("| Entity | Column | Option | Expression | Effective Start Dates |")
+            lines.append("|---|---|---|---|---|")
+            for grouped in grouped_rows:
+                first = grouped[0]
+                expr = first.display_derivation_expression or "(see Decision Table Json)"
                 expr = _flatten_for_table_cell(expr)
-                review_notes = (
-                    _flatten_for_table_cell("; ".join(dd.validation_errors)) if dd.validation_errors else ""
-                )
                 lines.append(
-                    f"| {dd.entity_name} | {dd.column_name} | {dd.derivation_option.value} "
-                    f"| `{expr}` | {dd.effective_start_date} | {dd.status.value} | {review_notes} |"
+                    f"| {first.entity_name} | {first.column_name} | {first.derivation_option.value} "
+                    f"| `{expr}` | {_format_effective_dates(grouped)} |"
                 )
             lines.append("")
         else:
@@ -108,65 +114,3 @@ def generate_report(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text("\n".join(lines), encoding="utf-8")
     return output_path
-
-
-def _collect_unsupported_constructs(
-    model: CanonicalModel, structural_infos: dict[str, StructuralInfo]
-) -> list[str]:
-    """Pull real parse-time gaps for every object in this chain, deduplicated
-    and lightly cleaned up for readability. This reports what the automated
-    analysis actually could not handle — it never guesses."""
-    notes: list[str] = []
-    seen: set[str] = set()
-    for oid in model.object_ids:
-        info = structural_infos.get(oid)
-        if not info:
-            continue
-        for construct in info.unsupported_constructs:
-            cleaned = " ".join(construct.split())
-            if len(cleaned) > _MAX_NOTE_LENGTH:
-                cleaned = cleaned[:_MAX_NOTE_LENGTH].rstrip() + "..."
-            if cleaned and cleaned not in seen:
-                seen.add(cleaned)
-                notes.append(cleaned)
-    return notes
-
-
-def _known_limitations_lines(
-    model: CanonicalModel, structural_infos: dict[str, StructuralInfo] | None
-) -> list[str]:
-    if not structural_infos:
-        return []
-
-    unsupported = _collect_unsupported_constructs(model, structural_infos)
-    low_confidence = model.confidence < _CONFIDENCE_REVIEW_THRESHOLD
-
-    if not unsupported and not low_confidence:
-        return []
-
-    lines = ["### Known Limitations / Needs Review", ""]
-    lines.append(
-        "_This section is generated directly from the automated analysis "
-        "(not from the narrative above), so it only reports things the "
-        "system actually detected — nothing here is guessed._"
-    )
-    lines.append("")
-
-    if low_confidence:
-        lines.append(
-            f"- Overall confidence in this chain's analysis is "
-            f"{model.confidence:.0%}. Have someone familiar with the source "
-            "procedures review this chain before finalizing the DD."
-        )
-
-    if unsupported:
-        lines.append(
-            "- The following parts of the source logic could not be fully "
-            "analyzed automatically and should be checked manually before "
-            "the DD is finalized:"
-        )
-        for note in unsupported:
-            lines.append(f"  - {note}")
-
-    lines.append("")
-    return lines

@@ -33,7 +33,7 @@ _KEYWORD_STOPWORDS = {
     # Known 4X function names -- these are called as bare FUNC_NAME(...) in
     # the grammar, never quoted, but excluding them here too costs nothing
     # and avoids any edge-case false positive if one shows up unquoted.
-    "ISEMPTY", "ISNOTEMPTY", "MAX", "COALESCE", "SUBSTR", "LOWER", "UPPER",
+    "ISEMPTY", "ISNOTEMPTY", "MAX", "MIN", "COALESCE", "SUBSTR", "LOWER", "UPPER",
     "LEN", "CONVERT", "REGEX", "CONCAT", "TRIM", "REPLACE", "SOM", "EOM",
     "SOY", "EOY", "SOFY", "EOFY", "DATEPART", "DATEDIFF", "TODATE",
     "ADDDAY", "PERIOD", "SOQ", "EOQ", "ROUND", "ABS", "FLOOR", "CEIL",
@@ -55,6 +55,55 @@ _OVERRIDE_SIGNAL_KEYWORDS = ("MERGE", "EXCEPTION", "WHEN OTHERS")
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _NUMBER_RE = re.compile(r"(?<![A-Za-z0-9_])\d+(?:\.\d+)?(?![A-Za-z0-9_])")
 _QUOTED_SEGMENT_RE = re.compile(r'"([^"]+)"')
+_LITERAL_LIKE_QUOTED_VALUES = {"Y", "N", "YES", "NO", "TRUE", "FALSE", "NULL"}
+
+
+def _looks_like_identifier_reference(candidate: str) -> bool:
+    candidate = candidate.strip()
+    if not candidate:
+        return False
+    if candidate.upper() in _LITERAL_LIKE_QUOTED_VALUES:
+        return False
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*", candidate):
+        return False
+    return True
+
+
+def _source_allows_target_reference(source_sql: str, column: str) -> bool:
+    """Allow self-looking references only when the source SQL itself
+    clearly describes a preservation or increment pattern.
+
+    Some update statements intentionally keep the prior value when the new
+    source value is missing, or increment a running counter. Those are not
+    hallucinations; they are direct translations of the source logic.
+    """
+    if not source_sql or not column:
+        return False
+
+    source_upper = source_sql.upper()
+    column_upper = re.escape(column.upper())
+
+    preservation_patterns = (
+        rf"\bNVL\s*\(\s*(?:[A-Z_][A-Z0-9_]*\s*\.\s*)?\"?{column_upper}\"?\s*,",
+        rf"\bCOALESCE\s*\(\s*(?:[A-Z_][A-Z0-9_]*\s*\.\s*)?\"?{column_upper}\"?\s*,",
+    )
+    if any(re.search(pattern, source_upper) for pattern in preservation_patterns):
+        return True
+
+    if column_upper == "COUNT" and re.search(
+        rf"\bNVL\s*\(\s*\"?{column_upper}\"?\s*,\s*0\s*\)\s*\+\s*1",
+        source_upper,
+    ):
+        return True
+
+    # Cleanup/update-style DD rows often rewrite the same target column in
+    # a set-based statement (for example, "SET Col = NULL WHERE Col = ...").
+    # In that case, a self-reference in the generated formula is not a
+    # hallucination -- it is the source column being cleaned or preserved.
+    if re.search(rf"\b(?:SET|UPDATE\s+SET)\b.*\b{column_upper}\s*=", source_upper, re.S):
+        return True
+
+    return False
 
 
 def _extract_identifiers(text: str) -> set[str]:
@@ -110,14 +159,40 @@ def _strip_sql_comments(text: str) -> str:
     return "".join(result)
 
 
-def check_self_reference(expression: str, column: str) -> list[str]:
+def check_self_reference(
+    expression: str,
+    column: str,
+    entity_name: str = "",
+    source_sql: str = "",
+) -> list[str]:
     """A Formula Expression must not reference the very column it is
     computing -- there is no prior-period/running value available in this
     single-pass derivation model, so any such reference is either a
     fabricated circular formula or a copy-paste mistake."""
     if not column:
         return []
-    if column.upper() in _extract_identifiers(expression):
+    column_upper = column.upper()
+    expression_upper = expression.upper()
+    expression_without_quotes = _QUOTED_SEGMENT_RE.sub(" ", expression_upper)
+
+    # Only flag the truly circular cases: the target column referenced by
+    # itself, either as a bare column name or qualified with the same
+    # entity/table that is being derived. References to a different source
+    # table's column with the same name are legitimate and should not be
+    # rejected.
+    bare_quoted = re.search(rf'(?<!\.)"{re.escape(column_upper)}"(?!\s*\.)', expression_upper)
+    bare_unquoted = re.search(rf'(?<![A-Z0-9_]){re.escape(column_upper)}(?![A-Z0-9_])', expression_without_quotes)
+    qualified_self = bool(
+        entity_name
+        and re.search(
+            rf'"{re.escape(entity_name.upper())}"\s*\.\s*"{re.escape(column_upper)}"',
+            expression_upper,
+        )
+    )
+
+    if bare_quoted or bare_unquoted or qualified_self:
+        if _source_allows_target_reference(source_sql, column):
+            return []
         return [
             f"Expression references its own target column '{column}', which "
             "is never a valid source for a single-pass Formula Expression "
@@ -136,9 +211,17 @@ def check_invented_references(expression: str, source_text: str, entity_name: st
     source_tokens = _extract_identifiers(source_text)
     entity_upper = entity_name.strip().upper()
 
-    for quoted in _QUOTED_SEGMENT_RE.findall(expression):
-        candidate = quoted.strip()
+    for match in _QUOTED_SEGMENT_RE.finditer(expression):
+        candidate = match.group(1).strip()
         if not candidate:
+            continue
+        if not _looks_like_identifier_reference(candidate):
+            continue
+        tail = expression[match.end() :].lstrip()
+        if tail.startswith("."):
+            # Namespace/table aliases in expressions are often mapped
+            # targets rather than literal source identifiers, so only the
+            # final path segment is checked against the source text.
             continue
         candidate_upper = candidate.upper()
         if candidate_upper in _KEYWORD_STOPWORDS or candidate_upper in _KNOWN_4X_SYMBOLS:
@@ -227,7 +310,7 @@ def check_semantic_consistency(
     )
 
     errors: list[str] = []
-    errors.extend(check_self_reference(expression, column))
+    errors.extend(check_self_reference(expression, column, entity_name, source_sql))
     errors.extend(check_invented_references(expression, source_text, entity_name))
     errors.extend(check_invented_numeric_literals(expression, source_text))
     errors.extend(check_dropped_override_conditions(expression, relevant_chunks))

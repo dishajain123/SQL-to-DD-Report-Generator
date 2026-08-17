@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import streamlit as st
 
 from app.review import review_store
+from app.report.excel_export import export_reviewed_dd_rows_for_job, export_reviewed_dd_rows_for_job_csv
 from app.utils import db
 from app.utils.config import settings
 
@@ -189,6 +190,72 @@ def _render_business_understanding_download(api_base_url: str, job_id: str, fina
     )
 
 
+def _list_jobs() -> list[dict]:
+    with db.get_connection() as conn:
+        rows = conn.execute(
+            "SELECT job_id, company, platform, intent, status, run_number, report_path, excel_path, created_at, updated_at "
+            "FROM jobs ORDER BY COALESCE(run_number, 0) DESC, updated_at DESC"
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _get_job_dd_rows(job_id: str) -> list[dict]:
+    with db.get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM dd_rows WHERE job_id = ? ORDER BY row_index, id",
+            (job_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _download_reviewed_excel(api_base_url: str, job_id: str) -> None:
+    excel_url = api_base_url.rstrip("/") + f"/api/jobs/{job_id}/excel"
+    try:
+        status, payload = _get_bytes(excel_url)
+    except RuntimeError as exc:
+        st.warning(f"Could not fetch the reviewed Excel from the API: {exc}. Falling back to a local export.")
+        fallback_path = export_reviewed_dd_rows_for_job(job_id, db.get_job_output_dir(job_id) / "dd_export.xlsx")
+        payload = fallback_path.read_bytes()
+        status = 200
+
+    if status >= 400:
+        fallback_path = export_reviewed_dd_rows_for_job(job_id, db.get_job_output_dir(job_id) / "dd_export.xlsx")
+        payload = fallback_path.read_bytes()
+        status = 200
+
+    st.download_button(
+        label="Download Reviewed Excel",
+        data=payload,
+        file_name=f"dd_export_{job_id}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key=f"download-reviewed-excel-{job_id}",
+    )
+
+
+def _download_reviewed_csv(api_base_url: str, job_id: str) -> None:
+    csv_url = api_base_url.rstrip("/") + f"/api/jobs/{job_id}/csv"
+    try:
+        status, payload = _get_bytes(csv_url)
+    except RuntimeError as exc:
+        st.warning(f"Could not fetch the reviewed CSV from the API: {exc}. Falling back to a local export.")
+        fallback_path = export_reviewed_dd_rows_for_job_csv(job_id, db.get_job_output_dir(job_id) / "dd_export.csv")
+        payload = fallback_path.read_bytes()
+        status = 200
+
+    if status >= 400:
+        fallback_path = export_reviewed_dd_rows_for_job_csv(job_id, db.get_job_output_dir(job_id) / "dd_export.csv")
+        payload = fallback_path.read_bytes()
+        status = 200
+
+    st.download_button(
+        label="Download Reviewed CSV",
+        data=payload,
+        file_name=f"dd_export_{job_id}.csv",
+        mime="text/csv",
+        key=f"download-reviewed-csv-{job_id}",
+    )
+
+
 def _render_submission_tab() -> None:
     st.subheader("1. DD Intake")
     st.caption("Upload SQL files and submit.")
@@ -206,6 +273,8 @@ def _render_submission_tab() -> None:
 
     if not submitted:
         return
+
+    st.session_state["review_api_base_url"] = api_base_url
 
     st.session_state["ui_logs"] = []
     _log("Preparing submission...")
@@ -308,47 +377,89 @@ def _render_submission_tab() -> None:
 
 def _render_review_tab() -> None:
     st.subheader("2. Human Review Queue")
-
-    pending = review_store.list_pending()
-
-    if not pending:
-        st.success("No items pending review.")
+    jobs = _list_jobs()
+    if not jobs:
+        st.info("No jobs have been submitted yet.")
         return
 
-    st.write(f"{len(pending)} item(s) pending review.")
+    review_api_base_url = st.session_state.get("review_api_base_url", DEFAULT_API_BASE_URL)
+    default_job = st.session_state.get("last_submission", {}).get("job_id")
+    job_options = [job["job_id"] for job in jobs]
+    if default_job not in job_options:
+        default_job = job_options[0]
 
-    for item in pending:
+    job_labels = {
+        job["job_id"]: f"{job['job_id']} - {job['company']} ({job['status']})"
+        for job in jobs
+    }
+
+    selected_job = st.selectbox(
+        "Select job",
+        options=job_options,
+        index=job_options.index(default_job),
+        format_func=lambda job_id: job_labels.get(job_id, job_id),
+        key="review-job-select",
+    )
+
+    selected_job_row = next(job for job in jobs if job["job_id"] == selected_job)
+    dd_rows = _get_job_dd_rows(selected_job)
+    pending = [row for row in dd_rows if row["status"] == "PENDING_REVIEW"]
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("DD rows", len(dd_rows))
+    m2.metric("Pending review", len(pending))
+    m3.metric("Excel ready", "Yes" if selected_job_row.get("excel_path") else "No")
+
+    st.caption(
+        f"Run #{selected_job_row.get('run_number', '-') or '-'} | Company: {selected_job_row['company']} | "
+        f"Platform: {selected_job_row['platform']} | Intent: {selected_job_row['intent']}"
+    )
+
+    _download_reviewed_excel(review_api_base_url, selected_job)
+    _download_reviewed_csv(review_api_base_url, selected_job)
+
+    if not pending:
+        st.success("No items pending review for this job.")
+    else:
+        st.write(f"{len(pending)} item(s) pending review.")
+
+    for row in pending:
         with st.container(border=True):
             col1, col2 = st.columns([3, 1])
             with col1:
-                st.markdown(
-                    f"**{item.entity_name}.{item.column_name}**  "
-                    f"(chain `{item.chain_id}`, job `{item.job_id}`)"
-                )
-                st.code(item.expression or "(no expression — see Decision Table)", language="text")
-                if item.validation_errors:
-                    st.error("Validation errors:\n" + "\n".join(f"- {e}" for e in item.validation_errors))
+                st.markdown(f"**{row['entity_name']}.{row['column_name']}**  (chain `{row['chain_id']}`)")
+                st.code(row["expression"] or "(no expression — see Decision Table)", language="text")
+                validation_errors = json.loads(row["validation_errors"] or "[]")
+                if validation_errors:
+                    st.error("Validation errors:\n" + "\n".join(f"- {e}" for e in validation_errors))
             with col2:
-                st.metric("Confidence", f"{item.confidence:.2f}")
-                st.caption(f"Effective: {item.effective_start_date}")
+                st.metric("Confidence", f"{float(row['confidence']):.2f}")
+                st.caption(f"Effective: {row['effective_start_date']}")
 
-            edited = st.text_area("Edit expression (optional)", value=item.expression, key=f"edit-{item.id}")
-            reviewer = st.text_input("Reviewer", value="reviewer", key=f"reviewer-{item.id}")
-            comment = st.text_input("Comment", key=f"comment-{item.id}")
+            edited = st.text_area("Edit expression (optional)", value=row["expression"] or "", key=f"edit-{row['id']}")
+            reviewer = st.text_input("Reviewer", value="reviewer", key=f"reviewer-{row['id']}")
+            comment = st.text_input("Comment", key=f"comment-{row['id']}")
 
             b1, b2, b3, b4 = st.columns(4)
-            if b1.button("Approve", key=f"approve-{item.id}"):
-                review_store.approve(item.id, reviewer, comment)
+            if b1.button("Approve", key=f"approve-{row['id']}"):
+                review_store.approve(row["id"], reviewer, comment)
                 st.rerun()
-            if b2.button("Reject", key=f"reject-{item.id}"):
-                review_store.reject(item.id, reviewer, comment)
+            if b2.button("Reject", key=f"reject-{row['id']}"):
+                review_store.reject(row["id"], reviewer, comment)
                 st.rerun()
-            if b3.button("Save Edit", key=f"save-{item.id}"):
-                review_store.edit(item.id, reviewer, edited, comment)
+            if b3.button("Save Edit", key=f"save-{row['id']}"):
+                review_store.edit(row["id"], reviewer, edited, comment)
                 st.rerun()
-            if b4.button("Override", key=f"override-{item.id}"):
-                review_store.override(item.id, reviewer, comment)
+            if b4.button("Override", key=f"override-{row['id']}"):
+                review_store.override(row["id"], reviewer, comment)
                 st.rerun()
+
+    with st.expander("All DD rows for this job", expanded=False):
+        for row in dd_rows:
+            st.markdown(
+                f"- **{row['entity_name']}.{row['column_name']}** | "
+                f"{row['derivation_option']} | {row['status']} | {row['effective_start_date']}"
+            )
 
 
 tab_input, tab_review = st.tabs(["Input & Intake", "Human Review"])

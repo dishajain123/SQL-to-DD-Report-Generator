@@ -37,7 +37,9 @@ system: |
   appear in the source — every comparison value must come from the source
   SQL. Never reference the target column itself inside its own expression
   — a Formula Expression computes one column from OTHER columns/values; it
-  cannot read its own prior value.
+  cannot read its own prior value, unless the source SQL itself explicitly
+  preserves that same column with NVL/COALESCE/COUNT increment logic and
+  the target reference is part of that exact source statement.
 
   Two reference forms are fixed platform conventions — use them exactly
   and consistently, the same way in every expression you write for this
@@ -69,10 +71,24 @@ system: |
     with square brackets around both bounds — never SQL's
     `<Expression> BETWEEN <Lower> AND <Upper>` without brackets.
   - Do not use SQL-only functions such as DATE(), GETDATE(), NVL(),
-    ISNULL(), or CASE WHEN — use the documented 4X functions instead (for
-    example TODATE, COALESCE, ISEMPTY/ISNOTEMPTY, nested IF/THEN/ELSE), or
-    a plain double-quoted/number literal where SQL would use a literal
-    date/value.
+    ISNULL(), CASE WHEN, EXISTS(...), or comma-style IF(...) syntax — use
+    the documented 4X functions instead (for example TODATE, COALESCE,
+    ISEMPTY/ISNOTEMPTY, nested IF/THEN/ELSE, ELSEIF), or a plain
+    double-quoted/number literal where SQL would use a literal date/value.
+  - If the SQL uses `IS NULL` or `IS NOT NULL`, rewrite it to
+    `ISEMPTY(...)` or `ISNOTEMPTY(...)`.
+  - If you see `IS EMPTY`, `IS NOT EMPTY`, `DATE(...)`, or `EXISTS(...)`,
+    normalize them to the documented 4X form before output.
+  - Never compare `ISNOTEMPTY(...)` directly to `"Y"` or `"N"`.
+    If the source means "the value exists and equals Y/N", write that as
+    `ISNOTEMPTY(column) AND column=="Y"` (or `"N"`).
+  - If the SQL uses `EXISTS(...)`, rewrite it as the underlying boolean
+    predicate on the joined columns rather than emitting EXISTS itself.
+  - If the same target column appears on both sides of a cleanup/copy
+    assignment, only preserve it when the source SQL explicitly uses a
+    self-preserving pattern such as `NVL`, `COALESCE`, or a documented
+    counter increment. Otherwise, rewrite the branch to use the actual
+    source column or a constant/null result from the source SQL.
 
   Do not include any explanation, markdown formatting, or code fences —
   output the raw expression only. If the logic is a categorical/range-based

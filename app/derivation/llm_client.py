@@ -374,7 +374,7 @@ class LLMClient:
                 "column -- rely on the full platform reference below.)"
             ),
         )
-        return self._complete(prompts["dd_generation_system"], user, max_tokens=min(self.max_new_tokens, 512))
+        return self._complete(prompts["dd_generation_system"], user, max_tokens=self.max_new_tokens)
 
     def retry_with_error(self, previous_expression: str, error: str, context: str) -> str:
         prompts = _load_prompts()
@@ -384,4 +384,4 @@ class LLMClient:
             error=error,
             context=context,
         )
-        return self._complete(prompts["retry_with_error_system"], user, max_tokens=min(self.max_new_tokens, 512))
+        return self._complete(prompts["retry_with_error_system"], user, max_tokens=self.max_new_tokens)

@@ -31,6 +31,7 @@ SQL alone.
 from __future__ import annotations
 
 import json
+import re
 from datetime import date
 from typing import Optional
 
@@ -335,6 +336,328 @@ def _normalize_sql_functions(expression: str) -> str:
     return expression
 
 
+def _find_matching_paren(text: str, open_index: int) -> int:
+    """Find the matching closing parenthesis, ignoring quoted segments."""
+    depth = 0
+    in_double = False
+    for idx in range(open_index, len(text)):
+        ch = text[idx]
+        if ch == '"':
+            in_double = not in_double
+            continue
+        if in_double:
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return idx
+    return -1
+
+
+def _rewrite_legacy_else_if(expression: str) -> str:
+    return re.sub(r"(?i)\bELSE\s+IF\b", "ELSEIF", expression)
+
+
+def _rewrite_not_in_membership(expression: str) -> str:
+    return re.sub(r"(?i)\bNOT\s+IN\b", "NOTIN", expression)
+
+
+def _rewrite_is_empty_syntax(expression: str) -> str:
+    expression = re.sub(r"(?i)\bIS\s+NOT\s+EMPTY\b", "ISNOTEMPTY", expression)
+    expression = re.sub(r"(?i)\bIS\s+EMPTY\b", "ISEMPTY", expression)
+    return expression
+
+
+def _rewrite_isnotempty_boolean_comparisons(expression: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        inner = match.group(1).strip()
+        literal = match.group(3)
+        return f'ISNOTEMPTY({inner}) AND {inner}=="{literal}"'
+
+    return re.sub(
+        r'(?i)\bISNOTEMPTY\s*\(\s*([^)]+?)\s*\)\s*==\s*(["\'])(Y|N)\2',
+        lambda match: replace(match),
+        expression,
+    )
+
+
+def _rewrite_date_function(expression: str) -> str:
+    """Rewrite SQL-style DATE(...) wrappers into the documented 4X date
+    constructor when the content is a single argument."""
+    def replace(match: re.Match[str]) -> str:
+        inner = match.group(1).strip()
+        return f"TODATE({inner})"
+
+    return re.sub(r"(?i)\bDATE\s*\(\s*([^()]+?)\s*\)", replace, expression)
+
+
+def _rewrite_unquoted_dotted_refs(expression: str) -> str:
+    """Quote bare dotted identifiers so the 4X grammar can parse them as
+    column references.
+
+    The source SQL often uses `table.column` or `alias.column` syntax, but
+    the 4X grammar only accepts quoted reference segments. This pass keeps
+    the semantic shape intact while making the output grammar-safe.
+    """
+    result: list[str] = []
+    i = 0
+    n = len(expression)
+    in_double = False
+    while i < n:
+        ch = expression[i]
+        if ch == '"':
+            in_double = not in_double
+            result.append(ch)
+            i += 1
+            continue
+
+        if in_double:
+            result.append(ch)
+            i += 1
+            continue
+
+        if ch.isalpha() or ch == "_":
+            start = i
+            j = i + 1
+            while j < n and (expression[j].isalnum() or expression[j] == "_"):
+                j += 1
+
+            parts = [expression[start:j]]
+            k = j
+            while True:
+                l = k
+                while l < n and expression[l].isspace():
+                    l += 1
+                if l >= n or expression[l] != ".":
+                    break
+                m = l + 1
+                while m < n and expression[m].isspace():
+                    m += 1
+                if m >= n or not (expression[m].isalpha() or expression[m] == "_"):
+                    break
+                p = m + 1
+                while p < n and (expression[p].isalnum() or expression[p] == "_"):
+                    p += 1
+                parts.append(expression[m:p])
+                k = p
+
+            if len(parts) > 1:
+                result.append(".".join(f'"{part}"' for part in parts))
+                i = k
+                continue
+
+        result.append(ch)
+        i += 1
+
+    return "".join(result)
+
+
+def _rewrite_null_predicates(expression: str) -> str:
+    expression = re.sub(
+        r'(?i)\b([A-Za-z_][A-Za-z0-9_".]*?)\s+IS\s+NOT\s+NULL\b',
+        r"ISNOTEMPTY(\1)",
+        expression,
+    )
+    expression = re.sub(
+        r'(?i)\b([A-Za-z_][A-Za-z0-9_".]*?)\s+IS\s+NULL\b',
+        r"ISEMPTY(\1)",
+        expression,
+    )
+    return expression
+
+
+def _rewrite_exists_predicates(expression: str) -> str:
+    """Drop unsupported EXISTS wrappers but keep the predicate body."""
+    result: list[str] = []
+    i = 0
+    in_double = False
+    while i < len(expression):
+        ch = expression[i]
+        if ch == '"':
+            in_double = not in_double
+            result.append(ch)
+            i += 1
+            continue
+
+        if not in_double and expression[i : i + 7].upper() == "EXISTS(":
+            open_index = i + 6
+            close_index = _find_matching_paren(expression, open_index)
+            if close_index != -1:
+                inner = expression[i + 7 : close_index].strip()
+                tail = expression[close_index + 1 :].lstrip()
+                needs_if_close = tail.upper().startswith("THEN")
+                suffix = ")" if needs_if_close else ""
+                where_match = re.search(r"(?is)\bWHERE\b", inner)
+                if where_match:
+                    predicate = inner[where_match.end() :].strip()
+                    result.append(predicate + suffix)
+                else:
+                    comma_match = re.search(r"(?s),", inner)
+                    if comma_match:
+                        predicate = inner[comma_match.end() :].strip()
+                        result.append(predicate + suffix)
+                    else:
+                        result.append(inner + suffix)
+                i = close_index + 1
+                continue
+
+        result.append(ch)
+        i += 1
+    return "".join(result)
+
+
+def _strip_min_wrapper(expression: str) -> str:
+    """Drop a single balanced `MIN(...)` wrapper when the inner payload is
+    already a complete expression.
+
+    The platform grammar/validator do not rely on `MIN` for the generated
+    DD rows in this project, and the model sometimes emits `MIN(...)` as a
+    SQL-shaped aggregate wrapper around a single conditional expression.
+    Removing only the wrapper keeps the inner logic while avoiding an
+    unnecessary parser failure.
+    """
+    result: list[str] = []
+    i = 0
+    in_double = False
+    while i < len(expression):
+        ch = expression[i]
+        if ch == '"':
+            in_double = not in_double
+            result.append(ch)
+            i += 1
+            continue
+
+        if not in_double and expression[i : i + 4].upper() == "MIN(":
+            open_index = i + 3
+            close_index = _find_matching_paren(expression, open_index)
+            if close_index != -1:
+                result.append(expression[i + 4 : close_index].strip())
+                i = close_index + 1
+                continue
+
+        result.append(ch)
+        i += 1
+    return "".join(result)
+
+
+def _repair_missing_then_parentheses(expression: str) -> str:
+    """Close an unterminated IF/ELSEIF condition immediately before THEN.
+
+    Some LLM outputs drop the `)` before `THEN`, producing malformed but
+    otherwise recoverable control-flow syntax. Repairing it here keeps the
+    retry loop focused on real logic issues instead of a mechanical typo.
+    """
+
+    def find_then(text: str, start: int) -> int:
+        depth = 1
+        in_string = False
+        i = start
+        while i < len(text):
+            ch = text[i]
+            if ch == '"':
+                in_string = not in_string
+                i += 1
+                continue
+            if in_string:
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            elif depth >= 1 and text[i : i + 4].upper() == "THEN":
+                before = text[i - 1] if i > 0 else ""
+                after = text[i + 4] if i + 4 < len(text) else ""
+                if not (before.isalnum() or before == "_") and not (after.isalnum() or after == "_"):
+                    return i
+            i += 1
+        return -1
+
+    result: list[str] = []
+    i = 0
+    in_string = False
+    while i < len(expression):
+        ch = expression[i]
+        if ch == '"':
+            in_string = not in_string
+            result.append(ch)
+            i += 1
+            continue
+
+        if not in_string and (
+            expression[i : i + 3].upper() == "IF(" or expression[i : i + 7].upper() == "ELSEIF("
+        ):
+            start = i + (3 if expression[i : i + 3].upper() == "IF(" else 7)
+            then_index = find_then(expression, start)
+            if then_index != -1:
+                depth = 1
+                local_in_string = False
+                j = start
+                while j < then_index:
+                    cur = expression[j]
+                    if cur == '"':
+                        local_in_string = not local_in_string
+                    elif not local_in_string:
+                        if cur == "(":
+                            depth += 1
+                        elif cur == ")":
+                            depth -= 1
+                    j += 1
+                prefix = expression[i:then_index]
+                if depth > 1:
+                    result.append(prefix)
+                    result.append(")" * (depth - 1))
+                    i = then_index
+                    continue
+                if depth < 1:
+                    trim_count = 1 - depth
+                    trimmed_prefix = prefix
+                    while trim_count > 0 and trimmed_prefix.endswith(")"):
+                        trimmed_prefix = trimmed_prefix[:-1]
+                        trim_count -= 1
+                    if trim_count == 0:
+                        result.append(trimmed_prefix)
+                        i = then_index
+                        continue
+                if depth == 1:
+                    result.append(prefix)
+                    i = then_index
+                    continue
+
+        result.append(ch)
+        i += 1
+    return "".join(result)
+
+
+def _remove_excess_closing_parens(expression: str) -> str:
+    """Drop unmatched closing parens while leaving quoted text alone."""
+    result: list[str] = []
+    depth = 0
+    in_double = False
+    for ch in expression:
+        if ch == '"':
+            in_double = not in_double
+            result.append(ch)
+            continue
+        if in_double:
+            result.append(ch)
+            continue
+        if ch == "(":
+            depth += 1
+            result.append(ch)
+            continue
+        if ch == ")":
+            if depth == 0:
+                continue
+            depth -= 1
+            result.append(ch)
+            continue
+        result.append(ch)
+    return "".join(result)
+
+
 def _normalize_legacy_if_syntax(expression: str) -> str:
     """Convert common comma-style IF(condition, true, false) output into 4X syntax.
 
@@ -347,6 +670,7 @@ def _normalize_legacy_if_syntax(expression: str) -> str:
         args = []
         current = []
         depth = 0
+        bracket_depth = 0
         in_string = False
         i = 0
         while i < len(text):
@@ -362,7 +686,15 @@ def _normalize_legacy_if_syntax(expression: str) -> str:
                     return None
                 depth -= 1
                 current.append(ch)
-            elif not in_string and ch == "," and depth == 0:
+            elif not in_string and ch == "[":
+                bracket_depth += 1
+                current.append(ch)
+            elif not in_string and ch == "]":
+                if bracket_depth == 0:
+                    return None
+                bracket_depth -= 1
+                current.append(ch)
+            elif not in_string and ch == "," and depth == 0 and bracket_depth == 0:
                 args.append("".join(current).strip())
                 current = []
             else:
@@ -416,6 +748,7 @@ def _normalize_legacy_if_syntax(expression: str) -> str:
     previous = expression
     for _ in range(3):
         rewritten = rewrite_once(previous)
+        rewritten = _rewrite_legacy_else_if(rewritten)
         if rewritten == previous:
             return rewritten
         previous = rewritten
@@ -490,7 +823,11 @@ def _normalize_sql_style_syntax(expression: str) -> str:
         result.append(ch)
         i += 1
 
-    return "".join(result)
+    normalized = "".join(result)
+    normalized = _rewrite_legacy_else_if(normalized)
+    normalized = _rewrite_null_predicates(normalized)
+    normalized = _rewrite_exists_predicates(normalized)
+    return normalized
 
 
 def _normalize_expression(expression: str) -> str:
@@ -506,8 +843,79 @@ def _normalize_expression(expression: str) -> str:
     expression = _normalize_sql_style_syntax(expression)
     expression = _normalize_sql_functions(expression)
     expression = _normalize_legacy_if_syntax(expression)
+    expression = _rewrite_not_in_membership(expression)
+    expression = _rewrite_is_empty_syntax(expression)
+    expression = _rewrite_isnotempty_boolean_comparisons(expression)
+    expression = _rewrite_date_function(expression)
+    expression = _rewrite_unquoted_dotted_refs(expression)
+    expression = _rewrite_exists_predicates(expression)
+    expression = _remove_excess_closing_parens(expression)
     expression = _fix_unbalanced_trailing_parens(expression)
+    expression = _repair_missing_then_parentheses(expression)
+    expression = _rewrite_legacy_else_if(expression)
+    expression = _rewrite_null_predicates(expression)
+    expression = _strip_min_wrapper(expression)
     return expression
+
+
+def _source_allows_target_reference(source_sql: str, entity_name: str, column: str) -> bool:
+    """Allow a self-reference only when the source SQL explicitly
+    preserves the target value or increments it.
+
+    This mirrors the semantic validation rule so the generator can
+    mechanically repair the most common false-positive shape: an
+    otherwise-correct expression whose final ELSE clause falls back to the
+    target column even though the source SQL never does that.
+    """
+    if not source_sql or not column:
+        return False
+
+    source_upper = source_sql.upper()
+    column_upper = re.escape(column.upper())
+    entity_upper = re.escape(entity_name.upper()) if entity_name else ""
+
+    quoted_target = rf'"{column_upper}"'
+    if entity_upper:
+        qualified_target = rf'"{entity_upper}"\s*\.\s*{quoted_target}'
+    else:
+        qualified_target = quoted_target
+
+    preservation_patterns = [
+        rf"\bNVL\s*\(\s*(?:[A-Z_][A-Z0-9_]*\s*\.\s*)?{qualified_target}\s*,",
+        rf"\bCOALESCE\s*\(\s*(?:[A-Z_][A-Z0-9_]*\s*\.\s*)?{qualified_target}\s*,",
+    ]
+    if any(re.search(pattern, source_upper) for pattern in preservation_patterns):
+        return True
+
+    if column_upper == "COUNT" and re.search(
+        rf"\bNVL\s*\(\s*{quoted_target}\s*,\s*0\s*\)\s*\+\s*1",
+        source_upper,
+    ):
+        return True
+
+    return False
+
+
+def _repair_trailing_self_reference(expression: str, entity_name: str, column: str, source_sql: str) -> str:
+    """Replace a final `ELSE(target_column)` fallback with `ELSE(NULL)` if
+    the source SQL does not explicitly preserve the same target column.
+    """
+    if _source_allows_target_reference(source_sql, entity_name, column):
+        return expression
+
+    column_upper = re.escape(column.upper())
+    entity_upper = re.escape(entity_name.upper()) if entity_name else ""
+    if entity_upper:
+        qualified = rf'"{entity_upper}"\s*\.\s*"{column_upper}"'
+    else:
+        qualified = rf'"{column_upper}"'
+
+    candidate = re.sub(
+        rf'(?i)(ELSE\s*\()\s*{qualified}\s*(\)\s*)$',
+        r"\1NULL\2",
+        expression,
+    )
+    return candidate if candidate != expression else expression
 
 
 def generate_dd_rows(
@@ -584,6 +992,9 @@ def _generate_for_column(
         derivation_option, expression, decision_table_json, parse_errors = _interpret_llm_output(raw_output)
         if expression:
             expression = _normalize_expression(expression)
+            repaired = _repair_trailing_self_reference(expression, entity_name, column, obj.raw_sql)
+            if repaired != expression and validate_expression(repaired).valid:
+                expression = repaired
 
         attempt_errors = list(parse_errors)
 

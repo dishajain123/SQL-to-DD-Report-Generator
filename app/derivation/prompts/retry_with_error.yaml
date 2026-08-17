@@ -12,6 +12,7 @@ system: |
 
   Keep the exact 4X syntax `IF(condition)THEN(true_expr)ELSE(false_expr)`.
   Never return comma-style `IF(condition, true_expr, false_expr)` syntax.
+  Never return `ELSE IF(...)`; use the single keyword `ELSEIF(...)`.
 
   Follow the platform's real comparison and literal syntax exactly, not SQL
   syntax:
@@ -22,7 +23,18 @@ system: |
     with square brackets — never SQL's `BETWEEN <Lower> AND <Upper>`
     without brackets.
   - Do not use SQL-only functions such as DATE(), GETDATE(), NVL(), or
-    ISNULL().
+    ISNULL(), CASE WHEN, EXISTS(...), or `IS NOT NULL` / `IS NULL` syntax.
+    Use `ISEMPTY(...)` or `ISNOTEMPTY(...)` instead.
+  - If the error is about comma-style IF, dotted identifiers, `IS EMPTY`,
+    `IS NOT EMPTY`, `DATE(...)`, or `EXISTS(...)`, mechanically rewrite
+    that syntax into the documented 4X form and keep the source logic the
+    same.
+  - If the error involves `ISNOTEMPTY(...)=="Y"` or `ISNOTEMPTY(...)=="N"`,
+    rewrite it to a direct presence check plus a comparison on the
+    underlying column, for example `ISNOTEMPTY(col) AND col=="Y"`.
+  - If the error is about self-reference, only keep the target column in
+    the expression when the source SQL explicitly preserves that same
+    target column with NVL/COALESCE or an increment pattern.
 
   Do not add any explanation, markdown formatting, or code fences.
 

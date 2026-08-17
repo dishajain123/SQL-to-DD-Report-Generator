@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     platform TEXT NOT NULL,
     intent TEXT NOT NULL,
     status TEXT NOT NULL,
+    run_number INTEGER,
     report_path TEXT,
     excel_path TEXT,
     error_message TEXT,
@@ -72,12 +73,23 @@ def _ensure_job_columns(conn: sqlite3.Connection) -> None:
         for row in conn.execute("PRAGMA table_info(jobs)").fetchall()
     }
     for column_name, column_type in (
+        ("run_number", "INTEGER"),
         ("report_path", "TEXT"),
         ("excel_path", "TEXT"),
         ("error_message", "TEXT"),
     ):
         if column_name not in existing_columns:
             conn.execute(f"ALTER TABLE jobs ADD COLUMN {column_name} {column_type}")
+
+    needs_backfill = "run_number" not in existing_columns
+    if not needs_backfill:
+        null_count = conn.execute("SELECT COUNT(*) AS count FROM jobs WHERE run_number IS NULL").fetchone()["count"]
+        needs_backfill = bool(null_count)
+
+    if needs_backfill:
+        rows = conn.execute("SELECT job_id FROM jobs ORDER BY created_at, job_id").fetchall()
+        for idx, row in enumerate(rows, start=1):
+            conn.execute("UPDATE jobs SET run_number = ? WHERE job_id = ?", (idx, row["job_id"]))
 
 
 @contextmanager
@@ -101,10 +113,17 @@ def init_db(db_path: str | None = None) -> None:
 
 def record_job(job_id: str, company: str, platform: str, intent: str, status: str, db_path: str | None = None) -> None:
     with get_connection(db_path) as conn:
+        existing = conn.execute("SELECT run_number FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+        if existing and existing["run_number"] is not None:
+            run_number = existing["run_number"]
+        else:
+            run_number = conn.execute("SELECT COALESCE(MAX(run_number), 0) + 1 AS next_run FROM jobs").fetchone()[
+                "next_run"
+            ]
         conn.execute(
-            "INSERT INTO jobs (job_id, company, platform, intent, status) VALUES (?, ?, ?, ?, ?) "
+            "INSERT INTO jobs (job_id, company, platform, intent, status, run_number) VALUES (?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(job_id) DO UPDATE SET status=excluded.status, updated_at=CURRENT_TIMESTAMP",
-            (job_id, company, platform, intent, status),
+            (job_id, company, platform, intent, status, run_number),
         )
 
 
@@ -160,6 +179,31 @@ def get_pending_review_rows(db_path: str | None = None) -> list[sqlite3.Row]:
     with get_connection(db_path) as conn:
         cur = conn.execute("SELECT * FROM dd_rows WHERE status = 'PENDING_REVIEW' ORDER BY id")
         return cur.fetchall()
+
+
+def get_dd_rows_for_job(job_id: str, db_path: str | None = None) -> list[sqlite3.Row]:
+    with get_connection(db_path) as conn:
+        cur = conn.execute(
+            "SELECT * FROM dd_rows WHERE job_id = ? ORDER BY row_index, id",
+            (job_id,),
+        )
+        return cur.fetchall()
+
+
+def get_job(job_id: str, db_path: str | None = None) -> sqlite3.Row | None:
+    with get_connection(db_path) as conn:
+        return conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+
+
+def get_job_output_dir(job_id: str, db_path: str | None = None) -> Path:
+    job = get_job(job_id, db_path=db_path)
+    if not job:
+        return Path(settings.output_dir) / job_id
+
+    run_number = job["run_number"]
+    if run_number is None:
+        return Path(settings.output_dir) / job_id
+    return Path(settings.output_dir) / f"{int(run_number):03d}_{job_id}"
 
 
 def record_review_decision(

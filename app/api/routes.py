@@ -11,6 +11,7 @@ from app.api.schemas import JobSubmitRequest, JobSubmitResponse
 from app.guardrails.input_guardrails import check_input_file, check_job_plan
 from app.models.core import JobPlan
 from app.orchestration.pipeline import build_pipeline
+from app.report.excel_export import export_reviewed_dd_rows_for_job, export_reviewed_dd_rows_for_job_csv
 from app.utils import db
 
 router = APIRouter()
@@ -134,4 +135,55 @@ def download_business_understanding_report(job_id: str) -> FileResponse:
         path=path,
         media_type="text/markdown",
         filename=f"business_understanding_{job_id}.md",
+    )
+
+
+@router.get("/jobs/{job_id}/excel")
+def download_reviewed_dd_excel(job_id: str) -> FileResponse:
+    """Export the latest reviewed DD rows for a job and stream the workbook.
+
+    The workbook is regenerated from the current SQLite `dd_rows` table so
+    any human review edits are reflected immediately.
+    """
+    job = db.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if not job["status"]:
+        raise HTTPException(status_code=404, detail="Job record is incomplete")
+
+    output_path = db.get_job_output_dir(job_id) / "dd_export.xlsx"
+    exported_path = export_reviewed_dd_rows_for_job(job_id, output_path)
+    db.update_job_status(job_id, job["status"], excel_path=str(exported_path))
+
+    if not exported_path.exists():
+        raise HTTPException(status_code=404, detail="Excel export could not be generated")
+
+    return FileResponse(
+        path=exported_path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=f"dd_export_{job_id}.xlsx",
+    )
+
+
+@router.get("/jobs/{job_id}/csv")
+def download_reviewed_dd_csv(job_id: str) -> FileResponse:
+    job = db.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if not job["status"]:
+        raise HTTPException(status_code=404, detail="Job record is incomplete")
+
+    output_path = db.get_job_output_dir(job_id) / "dd_export.csv"
+    exported_path = export_reviewed_dd_rows_for_job_csv(job_id, output_path)
+    db.update_job_status(job_id, job["status"], excel_path=job.get("excel_path"))
+
+    if not exported_path.exists():
+        raise HTTPException(status_code=404, detail="CSV export could not be generated")
+
+    return FileResponse(
+        path=exported_path,
+        media_type="text/csv",
+        filename=f"dd_export_{job_id}.csv",
     )

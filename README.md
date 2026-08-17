@@ -5,7 +5,7 @@ technical + business report, and (optionally) a DD Excel export matching a
 banking platform's own Derivations schema. Built around a LangGraph
 pipeline: parse SQL -> build cross-procedure lineage -> understand what the
 logic does -> translate it into the platform's Formula Expression grammar
--> validate -> human review for anything uncertain -> report + Excel.
+-> validate -> human review/edit -> report + Excel.
 
 ## What's real vs. what needs an API key
 
@@ -78,6 +78,26 @@ cd /Users/dishajain/Downloads/DD_Automation
 source .venv/bin/activate
 .venv/bin/streamlit run app/review/streamlit_app.py
 ```
+
+The review tab lets you inspect the generated DD rows, edit flagged
+findings, and re-download the latest reviewed Excel export.
+
+## Output Flow
+
+The app now follows this sequence:
+
+1. Generate the DD report for the job.
+2. Generate the DD Excel export.
+3. Let a user review and edit the DD findings in the Human Review tab.
+4. Re-download the reviewed Excel so the final workbook reflects the
+   latest human-reviewed values.
+
+The report itself is presentation-focused and does not include internal
+processing/status fields.
+
+Output folders are numbered in creation order, for example
+`output/001_job-abc123/`, `output/002_job-def456/`, so the newest run is
+easy to spot.
 
 ## How To Run
 

@@ -140,16 +140,17 @@ def node_skip_dd_generation(state: PipelineState) -> PipelineState:
 
 def node_report_and_export(state: PipelineState) -> PipelineState:
     job_plan = state["job_plan"]
+    output_dir = db.get_job_output_dir(job_plan.job_id)
     report_path = generate_report(
         job_plan, state["canonical_models"], state.get("dd_rows", []),
-        output_path=f"output/{job_plan.job_id}/report.md",
+        output_path=output_dir / "report.md",
         objects=state["objects"],
         structural_infos=state.get("structural_infos"),
     )
     state["report_path"] = str(report_path)
 
     if job_plan.include_dd_excel and state.get("dd_rows"):
-        excel_output_path = f"output/{job_plan.job_id}/dd_export.xlsx"
+        excel_output_path = output_dir / "dd_export.xlsx"
         existing_path = state.get("existing_dd_excel_path")
         excel_path = export_dd_rows(state["dd_rows"], excel_output_path, existing_dd_path=existing_path)
         state["excel_path"] = str(excel_path)
