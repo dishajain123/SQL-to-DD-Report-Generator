@@ -56,10 +56,12 @@ from app.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
 
-# Total generation attempts per column: one initial attempt plus up to two
-# bounded repair/regeneration attempts, each fed the accumulated grammar
-# and/or semantic errors from the previous attempt.
-_MAX_GENERATION_ATTEMPTS = 3
+# Total generation attempts per column: one initial attempt plus one
+# bounded repair/regeneration attempt. This keeps the pipeline responsive
+# on large procedures while still giving the model a chance to fix a
+# mechanically reported validation issue.
+_MAX_GENERATION_ATTEMPTS = 2
+_MAX_SOURCE_SQL_CONTEXT_CHARS = 5000
 
 _SYNTHETIC_DATE_REVIEW_NOTE = (
     "Effective start date is a synthetic estimate because no "
@@ -129,6 +131,39 @@ def _relevant_sql_excerpt(info: StructuralInfo, column: str) -> str:
     """
     excerpts = [chunk.raw_sql.strip() for chunk in _relevant_chunks(info, column) if chunk.raw_sql.strip()]
     return "\n\n".join(excerpts)
+
+
+def _source_sql_context_excerpt(source_sql: str, relevant_sql: str) -> str:
+    """Keep the model prompt focused by trimming the broad source SQL
+    context to a bounded excerpt.
+
+    The column-specific assignment chunks already carry the important
+    logic. The full procedure text is still useful for surrounding context,
+    but sending every line of a large stored procedure to the provider for
+    every column makes generation noticeably slower.
+    """
+    source_sql = source_sql.strip()
+    relevant_sql = relevant_sql.strip()
+
+    if not source_sql:
+        return relevant_sql
+
+    if len(source_sql) <= _MAX_SOURCE_SQL_CONTEXT_CHARS:
+        return source_sql
+
+    head_chars = max(1200, _MAX_SOURCE_SQL_CONTEXT_CHARS // 3)
+    tail_chars = max(1200, _MAX_SOURCE_SQL_CONTEXT_CHARS // 3)
+    head = source_sql[:head_chars].strip()
+    tail = source_sql[-tail_chars:].strip()
+
+    sections = []
+    if relevant_sql:
+        sections.append(relevant_sql)
+    if head:
+        sections.append("[Source SQL excerpt - beginning]\n" + head)
+    if tail and tail != head:
+        sections.append("[Source SQL excerpt - end]\n" + tail)
+    return "\n\n".join(sections)
 
 
 def _retrieve_rag_context(
@@ -1032,7 +1067,7 @@ def _generate_for_column(
     raw_output = llm_client.generate_formula_expression(
         technical_summary=canonical_model.technical_summary,
         business_summary=canonical_model.business_summary,
-        source_sql=obj.raw_sql,
+        source_sql=_source_sql_context_excerpt(obj.raw_sql, relevant_sql),
         function_reference=function_reference,
         column_name=column,
         entity_name=entity_name,

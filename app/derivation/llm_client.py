@@ -180,6 +180,7 @@ class LLMClient:
     temperature: float = 0.0
     max_new_tokens: int = 1024
     max_input_chars: int = 12000
+    request_timeout_seconds: float = 60.0
     transport: Optional[Callable[..., Any]] = None
 
     def __post_init__(self) -> None:
@@ -267,7 +268,7 @@ class LLMClient:
         )
 
         try:
-            with self.transport(req, timeout=120) as resp:
+            with self.transport(req, timeout=self.request_timeout_seconds) as resp:
                 raw = resp.read().decode("utf-8")
         except error.HTTPError as exc:
             raw = exc.read().decode("utf-8") if exc.fp else ""
@@ -337,12 +338,12 @@ class LLMClient:
             prompts["technical_reasoning_user"],
             sql_snippets="\n\n---\n\n".join(sql_snippets),
         )
-        return self._complete(prompts["technical_reasoning_system"], user)
+        return self._complete(prompts["technical_reasoning_system"], user, max_tokens=768)
 
     def business_reasoning(self, technical_summary: str) -> str:
         prompts = _load_prompts()
         user = _render_prompt(prompts["business_reasoning_user"], technical_summary=technical_summary)
-        return self._complete(prompts["business_reasoning_system"], user)
+        return self._complete(prompts["business_reasoning_system"], user, max_tokens=512)
 
     def generate_formula_expression(
         self,
@@ -374,7 +375,7 @@ class LLMClient:
                 "column -- rely on the full platform reference below.)"
             ),
         )
-        return self._complete(prompts["dd_generation_system"], user, max_tokens=self.max_new_tokens)
+        return self._complete(prompts["dd_generation_system"], user, max_tokens=256)
 
     def retry_with_error(self, previous_expression: str, error: str, context: str) -> str:
         prompts = _load_prompts()
@@ -384,4 +385,4 @@ class LLMClient:
             error=error,
             context=context,
         )
-        return self._complete(prompts["retry_with_error_system"], user, max_tokens=self.max_new_tokens)
+        return self._complete(prompts["retry_with_error_system"], user, max_tokens=256)
