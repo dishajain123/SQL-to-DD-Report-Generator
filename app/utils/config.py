@@ -27,6 +27,9 @@ class Settings:
     chroma_persist_dir: str = os.getenv("CHROMA_PERSIST_DIR", ".chroma")
     sqlite_db_path: str = os.getenv("SQLITE_DB_PATH", "dd_automation.db")
     output_dir: str = os.getenv("OUTPUT_DIR", "output")
+    dd_generation_max_workers: int = int(os.getenv("DD_GENERATION_MAX_WORKERS", "4"))
+    dd_generation_max_attempts: int = int(os.getenv("DD_GENERATION_MAX_ATTEMPTS", "1"))
+    llm_request_timeout_seconds: float = float(os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", "60"))
     structural_confidence_threshold: float = float(
         os.getenv("STRUCTURAL_CONFIDENCE_THRESHOLD", "0.5")
     )

@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import date
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 from app.derivation.llm_client import LLMClient
@@ -52,15 +53,16 @@ from app.models.core import (
     StructuralInfo,
 )
 from app.rag.chroma_store import ChromaStore, DOMAIN_COLLECTION, PLATFORM_COLLECTION
+from app.utils.config import settings
 from app.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
 
-# Total generation attempts per column: one initial attempt plus one
-# bounded repair/regeneration attempt. This keeps the pipeline responsive
-# on large procedures while still giving the model a chance to fix a
-# mechanically reported validation issue.
-_MAX_GENERATION_ATTEMPTS = 2
+# Total generation attempts per column. Default to a single fast pass so
+# large jobs do not stall on repeated model repair retries; additional
+# retries can be enabled from .env when higher recall is worth the extra
+# latency.
+_MAX_GENERATION_ATTEMPTS = max(1, settings.dd_generation_max_attempts)
 _MAX_SOURCE_SQL_CONTEXT_CHARS = 5000
 
 _SYNTHETIC_DATE_REVIEW_NOTE = (
@@ -164,6 +166,33 @@ def _source_sql_context_excerpt(source_sql: str, relevant_sql: str) -> str:
     if tail and tail != head:
         sections.append("[Source SQL excerpt - end]\n" + tail)
     return "\n\n".join(sections)
+
+
+def _generate_column_rows(
+    job: tuple[
+        CanonicalModel,
+        SQLObject,
+        StructuralInfo,
+        str,
+        str,
+        LLMClient,
+        str,
+        dict[int, date] | None,
+        Optional[ChromaStore],
+    ]
+) -> list[DDRow]:
+    canonical_model, obj, info, entity_name, column, llm_client, function_reference, timekey_map, rag_store = job
+    return _generate_for_column(
+        canonical_model=canonical_model,
+        obj=obj,
+        info=info,
+        entity_name=entity_name,
+        column=column,
+        llm_client=llm_client,
+        function_reference=function_reference,
+        timekey_map=timekey_map,
+        rag_store=rag_store,
+    )
 
 
 def _retrieve_rag_context(
@@ -1024,26 +1053,39 @@ def generate_dd_rows(
     entity_name_map = entity_name_map or {}
     dd_rows: list[DDRow] = []
 
+    jobs: list[tuple[CanonicalModel, SQLObject, StructuralInfo, str, str, LLMClient, str, dict[int, date] | None, Optional[ChromaStore]]] = []
     for oid in chain.order:
         obj = objects[oid]
         info = structural_infos[oid]
-
         for target_table, columns in info.columns_written_by_table.items():
             entity_name = entity_name_map.get(target_table, target_table)
             for column in columns:
-                dd_rows.extend(
-                    _generate_for_column(
-                        canonical_model=canonical_model,
-                        obj=obj,
-                        info=info,
-                        entity_name=entity_name,
-                        column=column,
-                        llm_client=llm_client,
-                        function_reference=function_reference,
-                        timekey_map=timekey_map,
-                        rag_store=rag_store,
+                jobs.append(
+                    (
+                        canonical_model,
+                        obj,
+                        info,
+                        entity_name,
+                        column,
+                        llm_client,
+                        function_reference,
+                        timekey_map,
+                        rag_store,
                     )
                 )
+
+    if not jobs:
+        return dd_rows
+
+    max_workers = max(1, min(settings.dd_generation_max_workers, len(jobs)))
+    if max_workers == 1:
+        for job in jobs:
+            dd_rows.extend(_generate_column_rows(*job))
+        return dd_rows
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for rows in executor.map(_generate_column_rows, jobs):
+            dd_rows.extend(rows)
     return dd_rows
 
 
@@ -1106,24 +1148,7 @@ def _generate_for_column(
             break
 
         validation_errors = attempt_errors
-        if attempt == _MAX_GENERATION_ATTEMPTS - 1:
-            break
-
-        retry_context = f"Column: {column}, Entity: {entity_name}"
-        if relevant_sql:
-            retry_context += (
-                "\n\nStatements found in the source that assign this "
-                f"column (make sure your corrected expression still "
-                f"reflects all of them):\n{relevant_sql}"
-            )
-        if rag_context:
-            retry_context += f"\n\nRelevant platform/domain reference:\n{rag_context}"
-
-        raw_output = llm_client.retry_with_error(
-            previous_expression=expression or raw_output,
-            error="; ".join(attempt_errors),
-            context=retry_context,
-        )
+        break
 
     confidence = info.confidence if not validation_errors else min(info.confidence, 0.3)
     status = DDStatus.PENDING_REVIEW if validation_errors else DDStatus.ACTIVE

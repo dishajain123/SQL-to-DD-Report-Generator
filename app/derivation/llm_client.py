@@ -180,13 +180,14 @@ class LLMClient:
     temperature: float = 0.0
     max_new_tokens: int = 1024
     max_input_chars: int = 12000
-    request_timeout_seconds: float = 60.0
+    request_timeout_seconds: float = settings.llm_request_timeout_seconds
     transport: Optional[Callable[..., Any]] = None
 
     def __post_init__(self) -> None:
         self.model = self.model or settings.llm_model_name.strip()
         self.base_url = self.base_url or settings.llm_base_url.strip()
         self.api_key = self.api_key or settings.llm_api_key.strip()
+        self.request_timeout_seconds = float(self.request_timeout_seconds or settings.llm_request_timeout_seconds)
         inferred_provider = _normalize_provider(self.provider, self.model, self.base_url)
         model_provider = _provider_from_model(self.model)
         key_provider = _provider_from_api_key(self.api_key)
