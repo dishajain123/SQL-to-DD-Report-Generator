@@ -351,6 +351,20 @@ def test_normalize_bundled_business_date_variable_reference():
     assert 'var_BUSINESS_DATE' not in normalized
 
 
+def test_normalize_fused_alias_column_reference_against_source_text():
+    expr = "IF(DIMPRODUCT_ProductAlt_Key == PUI_CAL_DEFAULT_REASON)THEN(1)ELSE(0)"
+    source_text = (
+        "SELECT DP.ProductAlt_Key, B.DEFAULT_REASON, A.AccountEntityId "
+        "FROM PRO.PUI_CAL B INNER JOIN PRO.AccountCal_Stg A ON A.AccountEntityID=B.AccountEntityId "
+        "LEFT JOIN DimProduct DP ON A.ProductAlt_Key=DP.ProductAlt_Key"
+    )
+    normalized = _normalize_expression(expr, source_text)
+    assert "ProductAlt_Key" in normalized
+    assert "DEFAULT_REASON" in normalized
+    assert "DIMPRODUCT_ProductAlt_Key" not in normalized
+    assert "PUI_CAL_DEFAULT_REASON" not in normalized
+
+
 def test_real_branch_heavy_columns_receive_structured_assignment_context(
     dpd_calculation_sql, maxdpd_sql, npa_date_sql, mock_llm_client, function_reference
 ):

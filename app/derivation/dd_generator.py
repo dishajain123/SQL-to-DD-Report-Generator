@@ -776,6 +776,65 @@ def _rewrite_bundled_business_date_var(expression: str) -> str:
     )
 
 
+def _rewrite_bundled_alias_column_refs(expression: str, source_text: str = "") -> str:
+    """Rewrite fused alias-like tokens such as `PUI_CAL_DEFAULT_REASON`
+    back to the source column name `DEFAULT_REASON` when the suffix is
+    actually present in the source SQL.
+
+    LLMs sometimes concatenate a table name or alias with a column name
+    instead of emitting a dotted reference. That produces invented
+    identifiers even when the underlying column is real. When the source
+    SQL contains the suffix by itself, dropping the fused prefix is a
+    safe mechanical normalization.
+    """
+    if not source_text:
+        return expression
+
+    source_tokens = {token.upper() for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", source_text)}
+    result: list[str] = []
+    i = 0
+    n = len(expression)
+    in_double = False
+
+    while i < n:
+        ch = expression[i]
+        if ch == '"':
+            in_double = not in_double
+            result.append(ch)
+            i += 1
+            continue
+        if in_double:
+            result.append(ch)
+            i += 1
+            continue
+
+        if ch.isalpha() or ch == "_":
+            start = i
+            j = i + 1
+            while j < n and (expression[j].isalnum() or expression[j] == "_"):
+                j += 1
+            token = expression[start:j]
+            if "_" in token and token.upper() not in source_tokens:
+                underscores = [idx for idx, char in enumerate(token) if char == "_"]
+                replacement = token
+                for idx in underscores:
+                    suffix = token[idx + 1 :]
+                    if suffix and suffix.upper() in source_tokens:
+                        replacement = suffix
+                if replacement != token:
+                    result.append(replacement)
+                    i = j
+                    continue
+            result.append(token)
+            i = j
+            continue
+
+        result.append(ch)
+        i += 1
+
+    return "".join(result)
+
+
 def _strip_angle_bracket_placeholders(expression: str) -> str:
     """Remove literal `<...>` placeholder wrappers from identifiers.
 
@@ -1225,7 +1284,7 @@ def _normalize_sql_style_syntax(expression: str) -> str:
     return normalized
 
 
-def _normalize_expression(expression: str) -> str:
+def _normalize_expression(expression: str, source_text: str = "") -> str:
     """Apply every mechanical, input-independent normalization pass, in an
     order chosen so each pass sees syntax the next one expects. Whitespace
     is flattened first (so every later pass works on a single line, and so
@@ -1246,6 +1305,7 @@ def _normalize_expression(expression: str) -> str:
     expression = _rewrite_sql_date_literals(expression)
     expression = _rewrite_date_function(expression)
     expression = _rewrite_in_subquery_membership(expression)
+    expression = _rewrite_bundled_alias_column_refs(expression, source_text)
     expression = _rewrite_unquoted_dotted_refs(expression)
     expression = _rewrite_bundled_business_date_var(expression)
     expression = _rewrite_exists_predicates(expression)
@@ -1475,7 +1535,7 @@ def _generate_for_column(
     validation_errors: list[str] = []
     source_sql_excerpt = _source_sql_context_excerpt(obj.raw_sql, relevant_sql)
     if assignment_context:
-        source_sql_excerpt = _source_sql_context_excerpt(obj.raw_sql, assignment_context)
+        source_sql_excerpt = assignment_context
     raw_output = llm_client.generate_formula_expression(
         technical_summary=canonical_model.technical_summary,
         business_summary=canonical_model.business_summary,
@@ -1490,7 +1550,7 @@ def _generate_for_column(
     for attempt in range(_MAX_GENERATION_ATTEMPTS):
         derivation_option, expression, decision_table_json, parse_errors = _interpret_llm_output(raw_output)
         if expression:
-            expression = _normalize_expression(expression)
+            expression = _normalize_expression(expression, obj.raw_sql)
             repaired = _repair_trailing_self_reference(expression, entity_name, column, obj.raw_sql)
             if repaired != expression and validate_expression(repaired).valid:
                 expression = repaired
