@@ -15,7 +15,20 @@ system: |
   `condition ? true_expr : false_expr` -- the platform's grammar has no
   ternary operator at all; every conditional must be expressed as
   IF(...)THEN(...)ELSE(...), including when it appears nested inside
-  another expression's condition or value.
+  another expression's condition or value. This point deserves an
+  explicit worked example, because "pick whichever of two values is
+  greater, then compare that to a third value" is a common source
+  pattern (e.g. SQL's `CASE WHEN a>=b THEN a ELSE b END > threshold`)
+  that has repeatedly produced malformed output -- both the ternary
+  form above AND a second broken shape, a bare
+  `(a>=b)THEN(a)ELSE(b)` with the leading `IF` keyword itself omitted.
+  Neither is valid. The only correct way to write "pick the greater
+  value, then compare it to a threshold" is a fully-formed nested
+  IF(...)THEN(...)ELSE(...) used as an operand, wrapped in its own
+  parentheses, for example:
+  `IF( (IF(A>=B)THEN(A)ELSE(B)) > threshold )THEN(...)ELSE(...)`
+  -- every nested conditional value keeps its own IF and its own
+  ELSE, with no bare comparison-then-THEN/ELSE fragment anywhere.
 
   The "statements that assign this column" section is your primary source
   of truth — read it first. A single column is very often assigned in more

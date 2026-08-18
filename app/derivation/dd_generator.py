@@ -997,6 +997,79 @@ def _rewrite_not_in_membership(expression: str) -> str:
     return re.sub(r"(?i)\bNOT\s+IN\b", "NOTIN", expression)
 
 
+_BARE_NOT_FUNCTION_RE = re.compile(r"\bNOT\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", re.IGNORECASE)
+
+
+def _wrap_bare_not_in_parens(expression: str) -> str:
+    """4X's grammar requires NOT as a function-call form -- `NOT(condition)`
+    -- with no bare `NOT condition` form at all
+    (`not_expr: "NOT" "(" expr ")"`). SQL's negation, by contrast, is a
+    bare prefix operator (`NOT X`), and sqlglot's own re-serialization of
+    `X IS NOT NULL` produces exactly that bare form
+    (`NOT X IS NULL`), which the existing IS-NULL rewrite then turns into
+    the still-invalid `NOT ISEMPTY(X)`. Confirmed against a real case:
+    this was silently causing a deterministically-translatable CASE
+    expression (in PRO_DPD_Calculation_StoredProcedure_2.sql's
+    DPD_IntService) to fall back to the LLM for a reason that had
+    nothing to do with the CASE translation itself.
+
+    This wraps the following function call in its own parens whenever
+    NOT is immediately followed by one, turning `NOT ISEMPTY(X)` into
+    `NOT(ISEMPTY(X))`. Deliberately narrow: only fires when NOT is
+    directly followed by a single recognizable `FUNC_NAME(...)` call --
+    the shape every real case observed so far actually produces. A bare
+    `NOT` followed by something else (a raw comparison, a column
+    reference) is left untouched -- determining the correct extent to
+    wrap in that case would require real expression parsing, and grammar
+    validation already correctly rejects and routes that shape to
+    PENDING_REVIEW rather than this guessing at it.
+    """
+    result: list[str] = []
+    i = 0
+    n = len(expression)
+    in_double = False
+    while i < n:
+        ch = expression[i]
+        if ch == '"':
+            in_double = not in_double
+            result.append(ch)
+            i += 1
+            continue
+        if in_double:
+            result.append(ch)
+            i += 1
+            continue
+        match = _BARE_NOT_FUNCTION_RE.match(expression, i)
+        if match and (i == 0 or not (expression[i - 1].isalnum() or expression[i - 1] == "_")):
+            func_name_start = match.start(1)
+            open_paren = expression.index("(", match.end(1))
+            depth = 1
+            k = open_paren + 1
+            local_in_double = False
+            close_paren = None
+            while k < n:
+                c = expression[k]
+                if c == '"':
+                    local_in_double = not local_in_double
+                elif not local_in_double:
+                    if c == "(":
+                        depth += 1
+                    elif c == ")":
+                        depth -= 1
+                        if depth == 0:
+                            close_paren = k
+                            break
+                k += 1
+            if close_paren is not None:
+                func_call_text = expression[func_name_start : close_paren + 1]
+                result.append(f"NOT({func_call_text})")
+                i = close_paren + 1
+                continue
+        result.append(ch)
+        i += 1
+    return "".join(result)
+
+
 def _rewrite_is_empty_syntax(expression: str) -> str:
     expression = re.sub(r"(?i)\bIS\s+NOT\s+EMPTY\b", "ISNOTEMPTY", expression)
     expression = re.sub(r"(?i)\bIS\s+EMPTY\b", "ISEMPTY", expression)
@@ -1626,6 +1699,95 @@ def _repair_missing_then_parentheses(expression: str) -> str:
         i += 1
 
     return "".join(result)
+
+
+_MISSING_IF_KEYWORD_BEFORE_RE = re.compile(r"(IF|ELSEIF)\s*$", re.IGNORECASE)
+
+
+def _repair_missing_if_before_then(expression: str) -> str:
+    """Deterministically insert a missing `IF` keyword when a
+    parenthesized condition is directly followed by `THEN(...)` without
+    an `IF`/`ELSEIF` keyword of its own -- i.e. `(cond)THEN(a)ELSE(b)`
+    where an `IF` was clearly intended but omitted.
+
+    Confirmed against a real generation defect: a DEGDATE expression
+    contained exactly `("A"."X">="A"."Y")THEN("A"."X")ELSE("A"."Y")`
+    sitting as the *value* inside an outer THEN(...) clause -- the model
+    appears to have been attempting the same "pick the greater of two
+    values" construct that also produced the ternary (`? :`) defect
+    elsewhere, but this time omitted the leading `IF` entirely instead of
+    using `?`/`:`.
+
+    Deliberately narrow and bail-safe, same philosophy as
+    _normalize_ternary_operator: only fires when a `)` immediately
+    precedes `THEN(` and that `)`'s matching `(` is NOT itself preceded
+    by `IF`/`ELSEIF` (i.e. this is unambiguously not already a properly
+    formed IF/ELSEIF...THEN). Iterates until no more insertions apply, so
+    more than one occurrence in the same expression is handled, and
+    always re-scans from the start after each insertion since inserting
+    text shifts every later position.
+
+    Important, honest limitation: this fixes the missing-`IF` shape in
+    isolation, but does NOT guarantee the surrounding expression becomes
+    fully grammar-valid on its own -- the same underlying "pick the
+    greater of two values, then compare to a third" construct has been
+    observed producing a SEPARATE, compounding malformation (an extra
+    unmatched closing parenthesis) in the same real defect this function
+    was built from. That combination was deliberately NOT force-repaired
+    here: attempting to also guess at removing "the right" extra paren
+    in an already-malformed, deeply-nested expression carries real risk
+    of producing a different, silently wrong rewrite rather than a
+    correct one. Grammar validation still runs after this (and every
+    other normalization pass) and correctly routes anything still
+    invalid to PENDING_REVIEW -- this function only ever narrows how
+    often that happens, it is not a substitute for that safety net.
+    """
+    result = expression
+    changed = True
+    while changed:
+        changed = False
+        text = result
+        n = len(text)
+        i = 0
+        in_double = False
+        while i < n:
+            ch = text[i]
+            if ch == '"':
+                in_double = not in_double
+                i += 1
+                continue
+            if in_double:
+                i += 1
+                continue
+            if text[i : i + 5].upper() == "THEN(" and (
+                i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")
+            ):
+                j = i - 1
+                while j >= 0 and text[j].isspace():
+                    j -= 1
+                if j >= 0 and text[j] == ")":
+                    depth = 1
+                    k = j - 1
+                    local_in_double = False
+                    while k >= 0 and depth > 0:
+                        c = text[k]
+                        if c == '"':
+                            local_in_double = not local_in_double
+                        elif not local_in_double:
+                            if c == ")":
+                                depth += 1
+                            elif c == "(":
+                                depth -= 1
+                        k -= 1
+                    if depth == 0:
+                        open_paren_index = k + 1
+                        before = text[:open_paren_index]
+                        if not _MISSING_IF_KEYWORD_BEFORE_RE.search(before):
+                            result = text[:open_paren_index] + "IF" + text[open_paren_index:]
+                            changed = True
+                            break
+            i += 1
+    return result
 
 
 def _repair_extra_close_before_then(expression: str) -> str:
@@ -2276,6 +2438,7 @@ def _normalize_expression(expression: str, source_text: str = "") -> str:
     net after all other rewrites have run."""
     expression = _flatten_whitespace(expression)
     expression = _normalize_ternary_operator(expression)
+    expression = _repair_missing_if_before_then(expression)
     expression = _normalize_sql_style_syntax(expression)
     expression = _normalize_sql_functions(expression)
     expression = _normalize_legacy_if_syntax(expression)
@@ -2283,6 +2446,7 @@ def _normalize_expression(expression: str, source_text: str = "") -> str:
     expression = _rewrite_not_in_membership(expression)
     expression = _rewrite_is_empty_syntax(expression)
     expression = _rewrite_postfix_isnotempty(expression)
+    expression = _wrap_bare_not_in_parens(expression)
     expression = _rewrite_misused_empty_functions(expression)
     expression = _rewrite_sql_not_equal_operator(expression)
     expression = _rewrite_string_concatenation(expression)
@@ -2345,35 +2509,178 @@ def _source_allows_target_reference(source_sql: str, entity_name: str, column: s
     return False
 
 
-def _is_simple_stage_value(expression: str) -> bool:
-    """Return True when a statement assigns a simple literal, NULL, or
-    direct column reference that can be composed deterministically.
+_SAFE_ARITHMETIC_FUNCTION_NAMES = {"COALESCE", "NVL", "ISNULL", "TODATE", "SYSDATE"}
 
-    Complex CASE/IF/aggregate expressions should still flow through the
-    LLM path so we do not oversimplify legitimate business logic.
+
+def _split_top_level(text: str, separators: str) -> list[str] | None:
+    """Split `text` on any of `separators` at paren/quote depth 0.
+
+    Returns None (not a valid top-level split) if parens/quotes are
+    unbalanced. A leading/interior separator that produces an empty
+    operand (e.g. a unary `-` immediately after another operator, as in
+    `A + -B`) is silently dropped rather than treated as an empty
+    operand -- this function is only ever used to decide whether every
+    *meaningful* operand is safe, never to reconstruct the expression
+    (the original text is always what gets composed, unchanged).
     """
-    text = expression.strip()
+    operands: list[str] = []
+    current: list[str] = []
+    depth = 0
+    in_single = False
+    in_double = False
+    for ch in text:
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            current.append(ch)
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+            current.append(ch)
+        elif in_single or in_double:
+            current.append(ch)
+        elif ch == "(":
+            depth += 1
+            current.append(ch)
+        elif ch == ")":
+            depth -= 1
+            if depth < 0:
+                return None
+            current.append(ch)
+        elif depth == 0 and ch in separators:
+            operand = "".join(current).strip()
+            if operand:
+                operands.append(operand)
+            current = []
+        else:
+            current.append(ch)
+    if depth != 0 or in_single or in_double:
+        return None
+    tail = "".join(current).strip()
+    if tail:
+        operands.append(tail)
+    return operands
+
+
+def _is_safely_composable_value(text: str, depth: int = 0) -> bool:
+    """Recursively decide whether a SQL value expression is simple enough
+    to compose deterministically -- i.e. contains nothing whose meaning
+    depends on business-logic judgment the deterministic composer can't
+    make (a CASE branch choice beyond what _translate_case_to_4x already
+    handles, a subquery, an aggregate, an unlisted function).
+
+    This never rewrites `text` -- the original string is always what
+    gets composed. It only ever decides yes/no, and only ever WIDENS
+    which values the deterministic path accepts; anything it says no to
+    still falls through to the LLM exactly as before, so this can only
+    ever increase how often write order is enforced deterministically,
+    never regress an already-working case to something less safe.
+
+    Handles, in addition to the base literal/column-reference/number
+    cases in _is_simple_stage_value:
+      - top-level arithmetic chains (a - b + c), each operand checked
+        recursively -- e.g. the real
+        `(v_ProcessDate - A.LastCrDate) + 1` shape found in
+        PRO_DPD_Calculation_StoredProcedure_2.sql;
+      - a small, explicit allowlist of safe wrapper functions
+        (COALESCE/NVL/ISNULL/TODATE), each argument checked recursively;
+      - one level of enclosing parentheses around any of the above.
+
+    Bounded to a small recursion depth (arbitrary business logic nested
+    indefinitely deep is exactly the case that must stay on the LLM
+    path, not something this should try to chase).
+    """
+    if depth > 4:
+        return False
+    text = text.strip()
     if not text:
         return False
+
+    if _is_simple_literal_or_reference(text):
+        return True
+
+    if text.startswith("(") and text.endswith(")"):
+        inner = text[1:-1]
+        # Only unwrap if these are genuinely one matching outer pair,
+        # not e.g. "(a) + (b)" where stripping the first/last char would
+        # be wrong.
+        depth_check = 0
+        in_single = in_double = False
+        balanced_until_end = True
+        for idx, ch in enumerate(inner):
+            if ch == "'" and not in_double:
+                in_single = not in_single
+            elif ch == '"' and not in_single:
+                in_double = not in_double
+            elif in_single or in_double:
+                continue
+            elif ch == "(":
+                depth_check += 1
+            elif ch == ")":
+                depth_check -= 1
+                if depth_check < 0 and idx != len(inner) - 1:
+                    balanced_until_end = False
+                    break
+        if balanced_until_end and depth_check == 0:
+            if _is_safely_composable_value(inner, depth + 1):
+                return True
+
+    arithmetic_operands = _split_top_level(text, "+-*/")
+    if arithmetic_operands and len(arithmetic_operands) > 1:
+        if all(_is_safely_composable_value(op, depth + 1) for op in arithmetic_operands):
+            return True
+
+    func_match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)$", text, re.DOTALL)
+    if func_match:
+        func_name = func_match.group(1).upper()
+        args_text = func_match.group(2)
+        if func_name in _SAFE_ARITHMETIC_FUNCTION_NAMES:
+            args = _split_top_level(args_text, ",")
+            if args is not None and all(_is_safely_composable_value(a, depth + 1) for a in args):
+                return True
+
+    if text.upper() in _SAFE_ARITHMETIC_FUNCTION_NAMES:
+        return True
+
+    return False
+
+
+def _is_simple_literal_or_reference(text: str) -> bool:
+    """The base, non-recursive cases: a bare literal, quoted/unquoted
+    column reference, or number -- exactly what _is_simple_stage_value
+    checked before this extension existed."""
     upper = text.upper()
     if upper in {"NULL", "0", "1"}:
         return True
     if re.fullmatch(r'"[^"]+"(?:\s*\.\s*"[^"]+")*', text):
         return True
-    # A single-quoted SQL string literal (e.g. 'Y', 'N') -- the value is
-    # converted to the 4X double-quoted form automatically by the
-    # existing _normalize_expression(value, "") call in the composer
-    # loop below, via _normalize_sql_style_syntax. Without this, every
-    # column whose simple stages assign a literal status/flag string
-    # (a very common shape -- COMPLETED='Y'/'N', a status code, etc.)
-    # would bail out of the deterministic composer entirely and fall
-    # through to the LLM for no real reason.
     if re.fullmatch(r"'[^']*'", text):
         return True
     if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)*', text):
         return True
     if re.fullmatch(r"\(?\s*[-+]?\d+(?:\.\d+)?\s*\)?", text):
         return True
+    return False
+
+
+def _is_simple_stage_value(expression: str) -> bool:
+    """Return True when a statement assigns a value that can be composed
+    deterministically -- a simple literal, NULL, direct column reference,
+    a safe arithmetic/function-wrapper combination of those (see
+    _is_safely_composable_value), or a value that is itself a complete,
+    independently grammar-valid IF(...)THEN(...)ELSE(...) expression
+    (the shape _translate_case_to_4x produces for a simple SQL CASE).
+
+    Genuinely complex expressions (subqueries, aggregates, unlisted
+    function calls, anything nested beyond what the checks above cover)
+    are intentionally left to flow through the LLM path so we do not
+    oversimplify legitimate business logic.
+    """
+    text = expression.strip()
+    if not text:
+        return False
+
+    if _is_safely_composable_value(text):
+        return True
+
     # A value that is itself a complete, independently grammar-valid
     # IF(...)THEN(...)ELSE(...) expression -- the shape
     # _translate_case_to_4x below produces when a SQL CASE expression's
@@ -2417,7 +2724,7 @@ def _translate_case_to_4x(case_node) -> str | None:
         value_node = when.args.get("true")
         if condition_node is None or value_node is None:
             return None
-        condition_sql = condition_node.sql(dialect="oracle")
+        condition_sql = _render_sql_condition_to_4x(condition_node) or condition_node.sql(dialect="oracle")
         value_sql = value_node.sql(dialect="oracle")
         normalized_value = _normalize_expression(value_sql, "")
         if not _is_simple_stage_value(normalized_value):
@@ -2461,6 +2768,119 @@ def _strip_leading_comments(text: str) -> str:
     return text[pos:]
 
 
+def _render_boolean_predicate_leaf(node) -> str | None:
+    """Render a non-boolean-structural node (a comparison, IS NULL check,
+    BETWEEN, or a bare column/literal) into 4X syntax.
+
+    Deliberately reuses the EXISTING, already-tested text pipeline for
+    this (serialize via sqlglot's own .sql(), then _normalize_expression)
+    rather than hand-rolling a second leaf renderer -- a leaf predicate
+    (unlike AND/OR/NOT) has no grouping ambiguity of its own to get
+    wrong, so the risk this whole structural renderer exists to close
+    does not apply here; reusing the proven pipeline is both simpler and
+    safer than re-implementing it. Returns None (caller falls back to
+    today's existing behavior) if the result isn't independently
+    grammar-valid as a standalone condition.
+    """
+    try:
+        text = node.sql(dialect="oracle")
+    except Exception:
+        return None
+    normalized = _normalize_expression(text, "")
+    probe = f"IF({normalized})THEN(1)ELSE(0)"
+    if validate_expression(probe).valid:
+        return normalized
+    return None
+
+
+def _render_boolean_operand(node, parent_is_or: bool) -> str | None:
+    """Render one operand of an AND/OR, adding parentheses whenever the
+    operand's own top-level connective differs from its parent's (an AND
+    directly under an OR, or vice versa) -- the exact, and only, shape
+    where omitting parentheses would silently change what the expression
+    means by falling back to the grammar's default AND-before-OR
+    precedence. This decision is made purely from the parsed tree's own
+    node types, never from the rendered text, so it can never be fooled
+    by a leaf value that happens to contain the words "AND"/"OR"."""
+    unwrapped = node.this if isinstance(node, exp.Paren) else node
+    rendered = _render_sql_condition_to_4x(unwrapped)
+    if rendered is None:
+        return None
+    if isinstance(unwrapped, exp.Or) and not parent_is_or:
+        return f"({rendered})"
+    if isinstance(unwrapped, exp.And) and parent_is_or:
+        return f"({rendered})"
+    return rendered
+
+
+def _render_sql_condition_to_4x(node) -> str | None:
+    """Deterministically render a sqlglot boolean-condition AST node into
+    4X syntax, with every AND/OR/NOT boundary crossing explicitly
+    parenthesized based purely on the parsed TREE STRUCTURE -- never
+    inferred from flattened text, and never left to grammar-default
+    precedence the way relying on the raw serialized text would.
+
+    This closes a real, distinct risk from the deterministic composer's
+    previous guard extraction (`where.this.sql(dialect="oracle")`
+    followed by text-level normalization): sqlglot's own serializer
+    already renders A AND (B OR C) faithfully (verified directly against
+    every shape in the write-order/boolean-structure test suite), so the
+    parsed SOURCE structure was never actually at risk in the
+    deterministic path -- but a later text-normalization pass expanding
+    a single comparison into a compound OR (as happens for some
+    NVL/COALESCE-equality shapes) could still, in principle, introduce a
+    new AND/OR boundary without its own parentheses. Building AND/OR/NOT
+    directly from the tree, rather than through any text round-trip,
+    removes that risk by construction rather than by pattern-matching
+    for it after the fact.
+
+    Falls back (returns None) for any construct not explicitly handled
+    below -- the caller then falls back to today's existing sqlglot
+    .sql() + text-normalization pipeline exactly as before, which may
+    itself fall back further to the LLM. This can only ever ADD a
+    structural guarantee for more cases; it never removes today's
+    existing coverage.
+    """
+    if isinstance(node, exp.Paren):
+        return _render_sql_condition_to_4x(node.this)
+
+    if isinstance(node, exp.And):
+        left = _render_boolean_operand(node.this, parent_is_or=False)
+        right = _render_boolean_operand(node.expression, parent_is_or=False)
+        if left is None or right is None:
+            return None
+        return f"{left} AND {right}"
+
+    if isinstance(node, exp.Or):
+        left = _render_boolean_operand(node.this, parent_is_or=True)
+        right = _render_boolean_operand(node.expression, parent_is_or=True)
+        if left is None or right is None:
+            return None
+        return f"{left} OR {right}"
+
+    if isinstance(node, exp.Not):
+        inner = node.this
+        inner_unwrapped = inner.this if isinstance(inner, exp.Paren) else inner
+        # Collapse the common `NOT(X IS NULL)` shape directly to
+        # ISNOTEMPTY(X) -- cleaner than the equivalent
+        # NOT(ISEMPTY(X)) and avoids depending on
+        # _wrap_bare_not_in_parens's text-level fixup for this path.
+        if isinstance(inner_unwrapped, exp.Is) and isinstance(inner_unwrapped.expression, exp.Null):
+            operand = _render_boolean_predicate_leaf(inner_unwrapped.this)
+            return f"ISNOTEMPTY({operand})" if operand else None
+        rendered = _render_sql_condition_to_4x(inner_unwrapped)
+        return f"NOT({rendered})" if rendered else None
+
+    if isinstance(node, exp.Is) and isinstance(node.expression, exp.Null):
+        operand = _render_boolean_predicate_leaf(node.this)
+        return f"ISEMPTY({operand})" if operand else None
+
+    # Any other node (a comparison, BETWEEN, a bare column/literal) has
+    # no AND/OR/NOT structure of its own to get wrong -- render it via
+    # the existing, already-proven leaf pipeline.
+    return _render_boolean_predicate_leaf(node)
+
+
 def _parse_simple_assignment_stage(raw_sql: str, target_column: str) -> tuple[str, str, str] | None:
     """Extract a deterministic guard/value pair for a simple UPDATE or
     MERGE write to `target_column`.
@@ -2487,23 +2907,37 @@ def _parse_simple_assignment_stage(raw_sql: str, target_column: str) -> tuple[st
 
     target_upper = target_column.upper()
 
+    def unwrap_parens(node):
+        """Strip enclosing exp.Paren wrappers -- e.g. `(CASE WHEN ... END)`,
+        a very common real-world style -- so a parenthesized CASE is still
+        recognized as exp.Case rather than silently bailing to the LLM
+        path just because of one extra layer of source parentheses.
+        Confirmed against a real case: PRO_DPD_Calculation_StoredProcedure_2.sql's
+        `SET A.DPD_IntService = (CASE WHEN A.IntNotServicedDt IS NOT NULL
+        THEN (v_ProcessDate - A.IntNotServicedDt) ELSE 0 END)` was bailing
+        for exactly this reason before this fix."""
+        while isinstance(node, exp.Paren):
+            node = node.this
+        return node
+
     if isinstance(tree, exp.Update):
         guard = ""
         where = tree.args.get("where")
         if where is not None:
-            guard = where.this.sql(dialect="oracle")
+            guard = _render_sql_condition_to_4x(where.this) or where.this.sql(dialect="oracle")
 
         for assignment in tree.args.get("expressions", []) or []:
             if not isinstance(assignment, exp.EQ) or not isinstance(assignment.this, exp.Column):
                 continue
             if assignment.this.name.upper() != target_upper:
                 continue
-            if isinstance(assignment.expression, exp.Case):
-                case_translation = _translate_case_to_4x(assignment.expression)
+            value_node = unwrap_parens(assignment.expression)
+            if isinstance(value_node, exp.Case):
+                case_translation = _translate_case_to_4x(value_node)
                 if case_translation is None:
                     return None
                 return guard, case_translation, assignment.this.name
-            value = assignment.expression.sql(dialect="oracle")
+            value = value_node.sql(dialect="oracle")
             if not _is_simple_stage_value(value):
                 return None
             return guard, value, assignment.this.name
@@ -2515,10 +2949,10 @@ def _parse_simple_assignment_stage(raw_sql: str, target_column: str) -> tuple[st
         if isinstance(using, exp.Subquery) and isinstance(using.this, exp.Select):
             where = using.this.args.get("where")
             if where is not None:
-                guard_parts.append(where.this.sql(dialect="oracle"))
+                guard_parts.append(_render_sql_condition_to_4x(where.this) or where.this.sql(dialect="oracle"))
         on_clause = tree.args.get("on")
         if on_clause is not None:
-            guard_parts.append(on_clause.sql(dialect="oracle"))
+            guard_parts.append(_render_sql_condition_to_4x(on_clause) or on_clause.sql(dialect="oracle"))
 
         whens = tree.args.get("whens")
         when_list = whens.expressions if whens is not None else []
@@ -2532,17 +2966,18 @@ def _parse_simple_assignment_stage(raw_sql: str, target_column: str) -> tuple[st
                     continue
                 if assignment.this.name.upper() != target_upper:
                     continue
-                if isinstance(assignment.expression, exp.Case):
-                    case_translation = _translate_case_to_4x(assignment.expression)
+                value_node = unwrap_parens(assignment.expression)
+                if isinstance(value_node, exp.Case):
+                    case_translation = _translate_case_to_4x(value_node)
                     if case_translation is None:
                         return None
                     value = case_translation
                 else:
-                    value = assignment.expression.sql(dialect="oracle")
+                    value = value_node.sql(dialect="oracle")
                     if not _is_simple_stage_value(value):
                         return None
                 if when_cond is not None:
-                    guard_parts.append(when_cond.sql(dialect="oracle"))
+                    guard_parts.append(_render_sql_condition_to_4x(when_cond) or when_cond.sql(dialect="oracle"))
                 guard = " AND ".join(f"({part})" for part in guard_parts if part)
                 return guard, value, assignment.this.name
         return None

@@ -507,18 +507,7 @@ def _process_overview_lines(
     objects: dict[str, SQLObject],
     structural_infos: dict[str, StructuralInfo] | None,
 ) -> list[str]:
-    process_name = _process_name(job_plan, canonical_models, objects)
-    source_objects = [objects[oid].name if oid in objects else oid for model in canonical_models for oid in model.object_ids]
-    unique_source_objects = list(dict.fromkeys(source_objects))
-
     lines: list[str] = ["## 1. Process Overview", ""]
-    lines.append(f"**Process:** {process_name}  ")
-    lines.append(f"**Company:** {job_plan.company}  ")
-    lines.append(f"**Platform:** {job_plan.platform}  ")
-    lines.append(f"**Intent:** {job_plan.intent.value}  ")
-    if unique_source_objects:
-        lines.append(f"**Source objects:** {', '.join(unique_source_objects)}")
-    lines.append("")
 
     technical_summaries = [model.technical_summary.strip() for model in canonical_models if model.technical_summary.strip()]
     business_summaries = [model.business_summary.strip() for model in canonical_models if model.business_summary.strip()]

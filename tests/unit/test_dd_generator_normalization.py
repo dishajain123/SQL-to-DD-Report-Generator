@@ -1,3 +1,5 @@
+import pytest
+
 from app.derivation.canonical_model import build_canonical_model
 from app.derivation.dd_generator import (
     _build_source_statement_refs,
@@ -964,3 +966,289 @@ def test_variable_dependency_chain_terminates_on_cycle():
     # Must return promptly (no infinite loop) and not raise.
     lines = _trace_variable_dependency_chain(["v_a"], definitions, before_index=100)
     assert isinstance(lines, list)
+
+
+def test_translate_case_to_4x_produces_valid_grammar():
+    """A simple, literal-outcome SQL CASE WHEN must translate
+    deterministically to the exact 4X IF/ELSEIF/ELSE form and validate
+    cleanly -- the same category of mechanical syntax fix as the ternary
+    normalizer, just for a different SQL-only construct the platform
+    grammar also has no direct equivalent for."""
+    from app.derivation.dd_generator import _compose_simple_assignment_expression, _AssignmentSite
+    from app.grammar.validator import validate_expression
+
+    raw = (
+        "UPDATE T SET RISK_BAND = CASE WHEN DPD > 90 THEN 'NPA' "
+        "WHEN DPD > 30 THEN 'SMA' ELSE 'STANDARD' END WHERE ACCOUNT_TYPE = 'LOAN'"
+    )
+    site = _AssignmentSite(kind="UPDATE", statement_indices=[1], raw_sql=raw, columns_written=["RISK_BAND"])
+    composed = _compose_simple_assignment_expression([site], "T", "RISK_BAND")
+
+    assert composed is not None
+    assert 'IF(DPD > 90)THEN("NPA")' in composed
+    assert 'ELSEIF(DPD > 30)THEN("SMA")' in composed
+    assert 'ELSE("STANDARD")' in composed
+    assert validate_expression(composed).valid
+
+
+def test_translate_case_to_4x_bails_out_on_complex_real_nested_case(dpd_calculation_sql):
+    """The real DPD_IntService assignment has a doubly-nested CASE WHEN
+    with arithmetic branch values
+    (`(v_ProcessDate - A.IntNotServicedDt) + 2`), not literal outcomes --
+    this must NOT be force-translated (the branch values aren't simple),
+    it must fall back to the LLM path exactly as before, same as any
+    other case genuinely too complex for the deterministic composer."""
+    from app.derivation.dd_generator import _assignment_sites, _compose_simple_assignment_expression
+
+    objects = split_objects(dpd_calculation_sql, "dpd.sql", Dialect.ORACLE)
+    info = analyze_object(objects[0])
+    sites = _assignment_sites(info, "DPD_IntService")
+    composed = _compose_simple_assignment_expression(sites, "AccountCal_Stg", "DPD_IntService")
+    assert composed is None
+
+
+def test_translate_case_to_4x_now_handles_simple_arithmetic_branch_values():
+    """As of the write-order-coverage extension, `A + B`-shaped simple
+    arithmetic branch values are recognized as safely composable (see
+    _is_safely_composable_value) -- this intentionally widens the
+    boundary from an earlier version of this test, which asserted that
+    exact shape was rejected. The result must be grammar-valid."""
+    from app.derivation.dd_generator import _compose_simple_assignment_expression, _AssignmentSite
+    from app.grammar.validator import validate_expression
+
+    raw = "UPDATE T SET X = CASE WHEN A > 1 THEN A + B ELSE 0 END WHERE Y = 1"
+    site = _AssignmentSite(kind="UPDATE", statement_indices=[1], raw_sql=raw, columns_written=["X"])
+    composed = _compose_simple_assignment_expression([site], "T", "X")
+    assert composed is not None
+    assert validate_expression(composed).valid
+
+
+def test_translate_case_to_4x_still_returns_none_for_genuinely_complex_branch_values():
+    """A branch value the deterministic composer genuinely cannot safely
+    represent (a subquery) must still bail to the LLM path -- the
+    boundary widened for simple arithmetic, it did not disappear."""
+    from app.derivation.dd_generator import _compose_simple_assignment_expression, _AssignmentSite
+
+    raw = "UPDATE T SET X = CASE WHEN A > 1 THEN (SELECT MAX(Z) FROM W) ELSE 0 END WHERE Y = 1"
+    site = _AssignmentSite(kind="UPDATE", statement_indices=[1], raw_sql=raw, columns_written=["X"])
+    assert _compose_simple_assignment_expression([site], "T", "X") is None
+
+
+def test_repair_missing_if_before_then_fixes_isolated_case():
+    """A bare (cond)THEN(a)ELSE(b) construct -- missing its leading IF --
+    sitting as the value inside an outer THEN(...) clause must be
+    repaired to IF(cond)THEN(a)ELSE(b). Confirmed against a real
+    generation defect (a DEGDATE expression) that produced exactly this
+    shape while attempting the same "pick the greater of two values"
+    construct that separately also produced a ternary defect elsewhere."""
+    from app.derivation.dd_generator import _normalize_expression
+    from app.grammar.validator import validate_expression
+
+    buggy = "IF(X==1)THEN((A>=B)THEN(A)ELSE(B))ELSE(0)"
+    fixed = _normalize_expression(buggy)
+    assert fixed == "IF(X==1)THEN(IF(A>=B)THEN(A)ELSE(B))ELSE(0)"
+    assert validate_expression(fixed).valid
+
+
+def test_repair_missing_if_before_then_leaves_well_formed_expressions_untouched():
+    from app.derivation.dd_generator import _repair_missing_if_before_then
+
+    clean = "IF(X==1)THEN(A)ELSEIF(X==2)THEN(B)ELSE(C)"
+    assert _repair_missing_if_before_then(clean) == clean
+
+
+def test_repair_missing_if_before_then_handles_multiple_occurrences():
+    from app.derivation.dd_generator import _repair_missing_if_before_then
+    from app.grammar.validator import validate_expression
+
+    buggy = "IF(X==1)THEN((A>=B)THEN(A)ELSE(B))ELSE((C>=D)THEN(C)ELSE(D))"
+    fixed = _repair_missing_if_before_then(buggy)
+    assert validate_expression(fixed).valid
+
+
+def test_repair_missing_if_before_then_is_honest_about_its_limitation():
+    """This function alone does NOT fully repair the exact real compound
+    defect it was built from (missing IF combined with a separate extra
+    unmatched paren elsewhere in the same expression) -- documenting that
+    limitation as an executable test, not just a comment, so it can never
+    silently start being relied on for more than it actually does."""
+    from app.derivation.dd_generator import _repair_missing_if_before_then
+    from app.report.formula_pretty_printer import _pretty_parser
+
+    real_compound_defect = (
+        'IF(("AdvAcRestructureCal"."FINALASSETCLASSALT_KEY">1 OR "AdvAcRestructureCal"."FlgDeg"=="Y") '
+        'AND IF(ISNOTEMPTY("AdvAcRestructureCal"."SP_ExpiryDate") AND '
+        'ISNOTEMPTY("AdvAcRestructureCal"."SP_ExpiryExtendedDate")))'
+        'THEN(("AdvAcRestructureCal"."SP_ExpiryDate">="AdvAcRestructureCal"."SP_ExpiryExtendedDate")'
+        'THEN("AdvAcRestructureCal"."SP_ExpiryDate")ELSE("AdvAcRestructureCal"."SP_ExpiryExtendedDate"))'
+        'ELSE("AdvAcRestructureCal"."SP_ExpiryExtendedDate") > "AdvAcRestructureCal"."var"."BUSINESS_DATE")'
+        'THEN(IF(ISNOTEMPTY("AdvAcRestructureCal"."PreRestructureNPA_Date"))'
+        'THEN("AdvAcRestructureCal"."PreRestructureNPA_Date")ELSE("AdvAcRestructureCal"."RestructureDt"))'
+        'ELSE("AdvAcRestructureCal"."DEGDATE")'
+    )
+    fixed = _repair_missing_if_before_then(real_compound_defect)
+    with pytest.raises(Exception):
+        _pretty_parser.parse(fixed)
+
+
+# ---------------------------------------------------------------------------
+# Write-order coverage extension: regression tests for multiple sequential
+# writes to the same column, per the explicit requirement that later writes
+# must correctly override earlier writes and the LLM must never decide this.
+# ---------------------------------------------------------------------------
+
+
+def test_multiple_unconditional_writes_preserve_sequential_overwrite_semantics():
+    """UPDATE X = A; UPDATE X = B; UPDATE X = C -- with no WHERE guards at
+    all -- must NOT become mutually-exclusive IF/ELSEIF branches (there is
+    no condition to branch on); it must preserve "the last unconditional
+    write wins" by making the final composed value literally just the
+    last stage's value, since each unconditional write unconditionally
+    replaces the accumulated expression so far."""
+    from app.derivation.dd_generator import _AssignmentSite, _compose_simple_assignment_expression
+
+    sites = [
+        _AssignmentSite(kind="UPDATE", statement_indices=[1], raw_sql="UPDATE T SET X = 'A'", columns_written=["X"]),
+        _AssignmentSite(kind="UPDATE", statement_indices=[2], raw_sql="UPDATE T SET X = 'B'", columns_written=["X"]),
+        _AssignmentSite(kind="UPDATE", statement_indices=[3], raw_sql="UPDATE T SET X = 'C'", columns_written=["X"]),
+    ]
+    composed = _compose_simple_assignment_expression(sites, "T", "X")
+    assert composed == '"C"'
+
+
+def test_three_conditional_writes_check_latest_condition_first():
+    """Three conditional writes to the same column: the LATEST write's
+    condition must be the outermost check (evaluated first), falling
+    through to progressively earlier writes, then the original column
+    value -- proving order is preserved across more than two writes, not
+    just the two-write case already covered elsewhere."""
+    from app.derivation.dd_generator import _AssignmentSite, _compose_simple_assignment_expression
+    from app.grammar.validator import validate_expression
+
+    sites = [
+        _AssignmentSite(kind="UPDATE", statement_indices=[1], raw_sql="UPDATE T SET X = 'A' WHERE COND1 = 'Y'", columns_written=["X"]),
+        _AssignmentSite(kind="UPDATE", statement_indices=[2], raw_sql="UPDATE T SET X = 'B' WHERE COND2 = 'Y'", columns_written=["X"]),
+        _AssignmentSite(kind="UPDATE", statement_indices=[3], raw_sql="UPDATE T SET X = 'C' WHERE COND3 = 'Y'", columns_written=["X"]),
+    ]
+    composed = _compose_simple_assignment_expression(sites, "T", "X")
+    assert composed is not None
+    assert validate_expression(composed).valid
+    # COND3 (latest write) must be checked before COND2, which must be
+    # checked before COND1 (earliest write) -- proving strict order
+    # across all three, not just adjacent pairs.
+    assert composed.index("COND3") < composed.index("COND2") < composed.index("COND1")
+
+
+def test_mixed_conditional_and_unconditional_writes_preserve_order():
+    """A conditional write followed by a later UNCONDITIONAL write: the
+    unconditional write must win outright (it always executes last and
+    always applies), completely replacing the earlier conditional logic
+    -- not merged into an ELSE branch, since the source SQL's own
+    unconditional UPDATE has no guard to preserve."""
+    from app.derivation.dd_generator import _AssignmentSite, _compose_simple_assignment_expression
+
+    sites = [
+        _AssignmentSite(kind="UPDATE", statement_indices=[1], raw_sql="UPDATE T SET X = 'A' WHERE COND1 = 'Y'", columns_written=["X"]),
+        _AssignmentSite(kind="UPDATE", statement_indices=[2], raw_sql="UPDATE T SET X = 'B'", columns_written=["X"]),
+    ]
+    composed = _compose_simple_assignment_expression(sites, "T", "X")
+    # The later, unconditional write completely replaces everything
+    # accumulated before it -- the final result is just its own value.
+    assert composed == '"B"'
+
+
+def test_reversed_source_order_produces_different_precedence():
+    """Sanity check that order genuinely matters and isn't a no-op: the
+    SAME two conditional writes in the OPPOSITE source order must
+    produce a DIFFERENT composed expression (the later one always
+    becomes the outer/first-checked condition)."""
+    from app.derivation.dd_generator import _AssignmentSite, _compose_simple_assignment_expression
+
+    forward = [
+        _AssignmentSite(kind="UPDATE", statement_indices=[1], raw_sql="UPDATE T SET X = 'A' WHERE COND1 = 'Y'", columns_written=["X"]),
+        _AssignmentSite(kind="UPDATE", statement_indices=[2], raw_sql="UPDATE T SET X = 'B' WHERE COND2 = 'Y'", columns_written=["X"]),
+    ]
+    reversed_order = [
+        _AssignmentSite(kind="UPDATE", statement_indices=[1], raw_sql="UPDATE T SET X = 'B' WHERE COND2 = 'Y'", columns_written=["X"]),
+        _AssignmentSite(kind="UPDATE", statement_indices=[2], raw_sql="UPDATE T SET X = 'A' WHERE COND1 = 'Y'", columns_written=["X"]),
+    ]
+    forward_composed = _compose_simple_assignment_expression(forward, "T", "X")
+    reversed_composed = _compose_simple_assignment_expression(reversed_order, "T", "X")
+    assert forward_composed != reversed_composed
+    # In `forward`, COND2 (the later write) is checked first.
+    assert forward_composed.index("COND2") < forward_composed.index("COND1")
+    # In `reversed_order`, COND1 is now the later write and is checked first.
+    assert reversed_composed.index("COND1") < reversed_composed.index("COND2")
+
+
+# ---------------------------------------------------------------------------
+# _is_safely_composable_value: the new arithmetic/function-wrapper coverage
+# ---------------------------------------------------------------------------
+
+
+def test_is_safely_composable_value_accepts_simple_arithmetic():
+    from app.derivation.dd_generator import _is_safely_composable_value
+
+    assert _is_safely_composable_value("(v_ProcessDate - A.LastCrDate) + 1")
+    assert _is_safely_composable_value("A + B - C")
+    assert _is_safely_composable_value("NVL(A.LastCrDate, 0) + 1")
+
+
+def test_is_safely_composable_value_rejects_subqueries_and_unknown_functions():
+    from app.derivation.dd_generator import _is_safely_composable_value
+
+    assert not _is_safely_composable_value("(SELECT MAX(X) FROM Y)")
+    assert not _is_safely_composable_value("SOME_UNKNOWN_FUNC(A, B)")
+    assert not _is_safely_composable_value("A + (SELECT 1 FROM DUAL)")
+
+
+def test_case_with_parenthesized_wrapper_is_now_recognized():
+    """Regression test for a real bug found while extending coverage: a
+    CASE expression wrapped in an extra layer of source parentheses
+    (`(CASE WHEN ... END)`, a very common real-world style -- confirmed
+    in PRO_DPD_Calculation_StoredProcedure_2.sql's DPD_IntService) was
+    being silently missed entirely, because sqlglot parses the extra
+    parens as their own exp.Paren node wrapping the exp.Case, and the
+    isinstance check wasn't unwrapping it first."""
+    from app.derivation.dd_generator import _parse_simple_assignment_stage
+
+    raw = "UPDATE T SET X = (CASE WHEN A IS NOT NULL THEN (B - A) ELSE 0 END) WHERE 1=1"
+    result = _parse_simple_assignment_stage(raw, "X")
+    assert result is not None
+    guard, value, _ = result
+    assert "IF(" in value and "THEN(" in value and "ELSE(" in value
+
+
+def test_wrap_bare_not_in_parens_fixes_real_is_not_null_translation():
+    """Regression test for a real bug found while extending coverage:
+    sqlglot re-serializes `X IS NOT NULL` as `NOT X IS NULL`, which the
+    existing IS-NULL rewrite turns into the still-grammar-invalid
+    `NOT ISEMPTY(X)` (4X requires NOT as a function call, NOT(...), with
+    no bare-operator form at all). This was silently causing a
+    deterministically-translatable real CASE expression (DPD_IntService
+    in PRO_DPD_Calculation_StoredProcedure_2.sql) to fall back to the LLM
+    for a reason that had nothing to do with the CASE translation logic
+    itself -- and would affect ANY generated formula containing a bare
+    NOT, not just this one deterministic-composer code path."""
+    from app.derivation.dd_generator import _normalize_expression
+    from app.grammar.validator import validate_expression
+
+    normalized = _normalize_expression("NOT A.IntNotServicedDt IS NULL", "")
+    assert normalized == 'NOT(ISEMPTY("A"."IntNotServicedDt"))'
+    full = f'IF({normalized})THEN(1)ELSE(0)'
+    assert validate_expression(full).valid
+
+
+def test_real_dpd_overdrawn_now_composes_fully_deterministically(dpd_calculation_sql):
+    """End-to-end proof on real SQL: DPD_Overdrawn -- which fell back to
+    the LLM before this extension -- now composes fully deterministically
+    end-to-end, and the result is grammar-valid."""
+    from app.derivation.dd_generator import _assignment_sites, _compose_simple_assignment_expression
+    from app.grammar.validator import validate_expression
+
+    objects = split_objects(dpd_calculation_sql, "dpd.sql", Dialect.ORACLE)
+    info = analyze_object(objects[0])
+    sites = _assignment_sites(info, "DPD_Overdrawn")
+    composed = _compose_simple_assignment_expression(sites, "AccountCal_Stg", "DPD_Overdrawn")
+    assert composed is not None
+    assert validate_expression(composed).valid
