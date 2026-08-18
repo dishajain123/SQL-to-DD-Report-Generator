@@ -34,6 +34,23 @@ system: |
   ELSE(NULL), and do not drop a later override just because an earlier
   MERGE already set the same column once.
 
+  One write site is a genuine exception to "ordered sequence": a site
+  labeled role=EXCEPTION_HANDLER (and marked "mutually exclusive alternate
+  path" in the ordered write sequence overview) only executes if an
+  unhandled error occurred elsewhere in the procedure -- it is never a
+  later step of the normal flow, it is an alternative to it. Its guard
+  condition in your expression must be genuinely distinct from every
+  normal-flow site's guard for the same column. In particular, never
+  reuse the exact same condition text to gate both an EXCEPTION_HANDLER
+  site's value and a normal-flow site's value in the same IF/ELSEIF
+  chain -- that produces a condition that is checked twice with no way to
+  ever select the exception-handler value, which is wrong regardless of
+  how the source's own error/status tracking works. If nothing in the
+  source SQL exposes an explicit condition for "an exception occurred"
+  (no error-flag column to test), use the exception-handler site's value
+  as the final ELSE, after every normal-flow condition, rather than
+  inventing or repeating a condition for it.
+
   For source procedures that write the same column in multiple stages
   (for example a MERGE/USING calculation followed by one or more UPDATE
   fix-ups), keep the stages separate unless the source SQL itself clearly

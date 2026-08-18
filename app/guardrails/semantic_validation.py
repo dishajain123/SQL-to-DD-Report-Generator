@@ -18,13 +18,19 @@ specific to any one procedure or column):
 - dropped row-scoping WHERE guard: if the column is assigned via a plain
   UPDATE whose WHERE clause scopes it to specific rows (not the target
   column's own value), the expression must show some trace of that too.
+- redundant nested condition: a condition must never be tested again,
+  unchanged, inside a branch where its truth value has already been
+  established by an enclosing IF/ELSEIF/ELSE in the same chain -- see
+  check_redundant_nested_condition for why this exists.
 """
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 from app.guardrails.input_guardrails import GuardrailResult
 from app.models.core import SmartChunk
+from lark import Lark, Token, Tree
 
 _KEYWORD_STOPWORDS = {
     "IF", "THEN", "ELSE", "ELSEIF", "AND", "OR", "NOT", "BETWEEN", "IN",
@@ -583,6 +589,143 @@ def check_dropped_override_conditions(
     return errors
 
 
+_semantic_tree_parser: Lark | None = None
+
+
+def _get_semantic_tree_parser() -> Lark:
+    """Lazily constructed, module-level Lark parser instance dedicated to
+    check_redundant_nested_condition. This is a separate instance from
+    app.grammar.validator's shared parser (and from
+    app/report/formula_pretty_printer.py's and
+    app/derivation/period_pruning.py's own instances), for the same
+    reason those keep their own: it needs source-position tracking
+    (propagate_positions) to slice the original expression text for exact
+    condition-to-condition comparison, which the shared validator parser
+    does not enable. The grammar compile itself is deferred to first use
+    (not done at import time), so importing this module never pays that
+    cost unless this specific check actually runs."""
+    global _semantic_tree_parser
+    if _semantic_tree_parser is None:
+        grammar_path = Path(__file__).resolve().parents[1] / "grammar" / "fourx_grammar.lark"
+        _semantic_tree_parser = Lark(
+            grammar_path.read_text(), parser="earley", start="start", propagate_positions=True
+        )
+    return _semantic_tree_parser
+
+
+def _unwrap_to_if_expr_or_column_ref(node):
+    """Descend through wrapper nodes that always keep their own Tree even
+    with exactly one child (see the identical helper and explanation in
+    app/report/formula_pretty_printer.py -- the grammar's `membership`
+    rule is the concrete example). Duplicated here rather than imported
+    since a guardrail module deliberately does not depend on the report
+    module."""
+    while (
+        isinstance(node, Tree)
+        and node.data not in ("if_expr", "column_ref")
+        and len(node.children) == 1
+    ):
+        node = node.children[0]
+    return node
+
+
+def _condition_span_text(node, expression: str) -> str:
+    if isinstance(node, Token):
+        return str(node).strip()
+    meta = node.meta
+    if meta.empty:
+        return expression.strip()
+    return " ".join(expression[meta.start_pos : meta.end_pos].split())
+
+
+def _if_chain_parts(if_node):
+    children = list(if_node.children)
+    condition, then_branch = children[0], children[1]
+    rest = children[2:]
+    elseif_clauses = [c for c in rest if isinstance(c, Tree) and c.data == "elseif_clause"]
+    else_clause = next((c for c in rest if isinstance(c, Tree) and c.data == "else_clause"), None)
+    conditions = [condition] + [clause.children[0] for clause in elseif_clauses]
+    then_branches = [then_branch] + [clause.children[1] for clause in elseif_clauses]
+    return conditions, then_branches, else_clause
+
+
+def _walk_for_redundant_conditions(node, expression: str, ancestor_conditions: list[str]) -> list[str]:
+    node = _unwrap_to_if_expr_or_column_ref(node)
+    if not (isinstance(node, Tree) and node.data == "if_expr"):
+        return []
+
+    conditions, then_branches, else_clause = _if_chain_parts(node)
+    condition_texts = [_condition_span_text(c, expression) for c in conditions]
+
+    errors: list[str] = []
+    for text in condition_texts:
+        if text in ancestor_conditions:
+            errors.append(
+                "Semantic validation: the condition "
+                f'"{text}" is tested again inside a branch where it is already '
+                "known true or false from an enclosing IF/ELSEIF -- this can "
+                "never change the result and almost always means two "
+                "different source conditions (e.g. a normal-flow guard and "
+                "an exception-handler guard) were collapsed into the same "
+                "text by mistake."
+            )
+
+    # Descend into each THEN branch with its own condition added to the
+    # ancestor set -- reaching that branch proves this condition true, so
+    # any nested test of the identical text is dead/redundant there too.
+    for condition_text, branch in zip(condition_texts, then_branches):
+        errors.extend(
+            _walk_for_redundant_conditions(branch, expression, ancestor_conditions + [condition_text])
+        )
+
+    # Descend into the ELSE branch (if any) with every sibling condition
+    # in this chain added -- reaching ELSE proves all of them false, so a
+    # nested repeat of any one of them is exactly the BR-014/BR-015-shaped
+    # bug this check exists to catch (a normal-flow guard re-tested,
+    # unchanged, inside what should be the exception-handler branch).
+    if else_clause is not None:
+        else_branch = else_clause.children[0]
+        errors.extend(
+            _walk_for_redundant_conditions(else_branch, expression, ancestor_conditions + condition_texts)
+        )
+
+    return errors
+
+
+def check_redundant_nested_condition(expression: str) -> list[str]:
+    """A condition must never be tested again, unchanged, inside a branch
+    where its truth value has already been established by an enclosing
+    IF/ELSEIF/ELSE in the very same decision chain -- that repeat can
+    never affect the result, so if the generated expression contains one,
+    it is not a stylistic quirk: it means two source statements governed
+    by genuinely different conditions (most commonly a normal-flow
+    statement and an exception-handler statement, or two branches of an
+    ELSEIF chain) were merged as though they shared one condition.
+
+    This is purely structural -- it walks the real parsed expression tree
+    and compares condition text, with no keyword lists or column-name
+    heuristics -- so it applies identically to every column and every
+    procedure, and it does not depend on the source SQL at all (unlike
+    check_dropped_override_conditions, which can be fooled when a token
+    from the dropped branch happens to appear elsewhere in the expression,
+    as in the BR-014 ERRORDATE case this check was added to catch: the
+    exception branch's own SYSDATE token was present, but gated by the
+    wrong, repeated condition).
+
+    Returns an empty list (never raises) if the expression doesn't parse
+    -- grammar validation is what rejects an unparseable expression; this
+    check only adds an additional, independent signal on top of an
+    expression that already parses."""
+    try:
+        tree = _get_semantic_tree_parser().parse(expression)
+    except Exception:
+        return []
+    try:
+        return _walk_for_redundant_conditions(tree, expression, [])
+    except Exception:
+        return []
+
+
 def check_semantic_consistency(
     expression: str,
     column: str,
@@ -602,5 +745,6 @@ def check_semantic_consistency(
     errors.extend(_check_constant_conditions(expression))
     errors.extend(_check_identical_simple_branches(expression))
     errors.extend(check_dropped_override_conditions(expression, relevant_chunks, column))
+    errors.extend(check_redundant_nested_condition(expression))
 
     return GuardrailResult(passed=not errors, errors=errors)

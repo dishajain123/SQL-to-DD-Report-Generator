@@ -1,5 +1,12 @@
 from app.derivation.canonical_model import build_canonical_model
-from app.derivation.dd_generator import _format_assignment_context, _normalize_expression, generate_dd_rows
+from app.derivation.dd_generator import (
+    _build_source_statement_refs,
+    _extract_aggregate_info,
+    _extract_variable_trace,
+    _format_assignment_context,
+    _normalize_expression,
+    generate_dd_rows,
+)
 from app.grammar.validator import validate_expression
 from app.lineage.dependency_graph import build_graph, find_chains
 from app.models.core import DDStatus, Dialect, SmartChunk
@@ -417,6 +424,84 @@ def test_assignment_context_keeps_exception_handler_bridge_statements():
     assert context.index("COMPLETED='Y'") < context.index("v_error := SQLERRM") < context.index("COMPLETED='N'")
 
 
+def test_assignment_context_labels_exception_handler_as_mutually_exclusive():
+    """Regression test for a real, confirmed defect: the normal-flow
+    completion UPDATE and the EXCEPTION-handler UPDATE for the same
+    column were both labeled with the same generic role
+    (SEQUENTIAL_ASSIGNMENT), and the ordered-write-sequence overview even
+    described the exception site with "later stages stay later" -- giving
+    the model no signal that the two are mutually exclusive alternate
+    paths rather than sequential steps, which led to a generated
+    expression that tested the identical guard condition twice (see
+    app/guardrails/semantic_validation.py::check_redundant_nested_condition,
+    added to catch this class of defect from the output side; this test
+    covers the same defect from the input/context side)."""
+    chunks = [
+        SmartChunk(
+            chunk_id="chunk-1",
+            object_id="obj-1",
+            chunk_index=0,
+            chunk_kind="UPDATE",
+            statement_indices=[30],
+            raw_sql=(
+                "UPDATE PRO.ACLRUNNINGPROCESSSTATUS SET COMPLETED='Y', "
+                "ERRORDATE=NULL WHERE RUNNINGPROCESSNAME='NPA_Date_Calculation';"
+            ),
+            columns_written=["ERRORDATE"],
+        ),
+        SmartChunk(
+            chunk_id="chunk-2",
+            object_id="obj-1",
+            chunk_index=1,
+            chunk_kind="CONTROL_FLOW",
+            statement_indices=[31],
+            raw_sql="EXCEPTION",
+            columns_written=[],
+        ),
+        SmartChunk(
+            chunk_id="chunk-3",
+            object_id="obj-1",
+            chunk_index=2,
+            chunk_kind="CONTROL_FLOW",
+            statement_indices=[32],
+            raw_sql="WHEN OTHERS THEN",
+            columns_written=[],
+        ),
+        SmartChunk(
+            chunk_id="chunk-4",
+            object_id="obj-1",
+            chunk_index=3,
+            chunk_kind="UPDATE",
+            statement_indices=[33],
+            raw_sql=(
+                "UPDATE PRO.ACLRUNNINGPROCESSSTATUS SET COMPLETED='N', "
+                "ERRORDATE=SYSDATE WHERE RUNNINGPROCESSNAME='NPA_Date_Calculation';"
+            ),
+            columns_written=["ERRORDATE"],
+        ),
+    ]
+    info = type("Info", (), {"smart_chunks": chunks})()
+
+    context = _format_assignment_context(info, "ERRORDATE")
+
+    # The two sites must receive genuinely different role labels -- the
+    # normal-flow completion UPDATE stays whatever the deterministic
+    # UPDATE heuristics classify it as, but the exception-handler site
+    # must be labeled EXCEPTION_HANDLER, not the same generic label.
+    assert "role=EXCEPTION_HANDLER" in context
+    normal_flow_role = context.split("[Assignment 1")[1].split("role=")[1].split("|")[0].strip()
+    assert normal_flow_role != "EXCEPTION_HANDLER"
+
+    # The ordered-write-sequence overview must describe the exception
+    # site as a mutually exclusive alternate path, not as a later
+    # sequential stage.
+    assert "mutually exclusive alternate path" in context
+
+    # And the explicit decomposition hint telling the model not to reuse
+    # the same guard condition for both sites must be present.
+    assert "never" in context and "same repeated condition" in context
+
+
 def test_normalize_bundled_business_date_variable_reference():
     expr = 'IF(ISNOTEMPTY("FCT_NPA_PRODUCT"."var_BUSINESS_DATE"))THEN("FCT_NPA_PRODUCT"."var_BUSINESS_DATE")ELSE(NULL)'
     normalized = _normalize_expression(expr)
@@ -508,3 +593,103 @@ def test_real_branch_heavy_columns_receive_structured_assignment_context(
     assert refperiod_call["column_name"] == "REFPERIODMAX"
     ordered_text = refperiod_call["source_sql"]
     assert ordered_text.index("SET REFPeriodMax=RefPeriodNoCredit") < ordered_text.index("SET REFPeriodMax=RefPeriodOverdue") < ordered_text.index("SET REFPeriodMax=RefPeriodOverDrawn") < ordered_text.index("SET REFPeriodMax=RefPeriodStkStatement") < ordered_text.index("SET REFPeriodMax=RefPeriodReview")
+
+
+def test_extract_aggregate_info_detects_grouped_aggregate():
+    """A cross-row rollup (aggregate function combined with GROUP BY) must
+    be detected -- this is the shape a per-row Formula Expression cannot
+    literally reproduce (e.g. the real MAX(DPD)...GROUP BY AccountEntityID
+    pattern in PRO_DPD_Calculation_StoredProcedure_2.sql)."""
+    raw_sql = (
+        "SELECT AccountEntityID, MAX(DPD) DPD_MaxFin FROM (...) GROUP BY AccountEntityID"
+    )
+    info = _extract_aggregate_info(raw_sql)
+    assert len(info) == 1
+    assert "MAX" in info[0]
+    assert "AccountEntityID" in info[0]
+
+
+def test_extract_aggregate_info_detects_multiple_aggregate_functions():
+    raw_sql = "SELECT CustomerEntityId, MIN(NPA_DATE) NPA_DATE, LISTAGG(DEFAULT_REASON, ', ') FROM x GROUP BY CustomerEntityId"
+    info = _extract_aggregate_info(raw_sql)
+    assert len(info) == 1
+    assert "MIN" in info[0]
+    assert "LISTAGG" in info[0]
+
+
+def test_extract_aggregate_info_ignores_scalar_aggregate_without_group_by():
+    """A same-row scalar function call like MAX(a, b) -- picking the
+    larger of two values already on the same row -- is not a cross-row
+    rollup and must not be flagged just because the function name
+    matches."""
+    raw_sql = "UPDATE T SET X = MAX(A, B) WHERE Y = 1"
+    assert _extract_aggregate_info(raw_sql) == []
+
+
+def test_extract_variable_trace_finds_variables_used_downstream():
+    raw_sql = "EXCEPTION\nWHEN OTHERS THEN\nv_error := SQLERRM;\nUPDATE T SET ERRORDESCRIPTION = v_error WHERE X = 1;"
+    trace = _extract_variable_trace(raw_sql)
+    assert len(trace) == 1
+    assert "v_error := SQLERRM" in trace[0]
+    assert "used later" in trace[0]
+
+
+def test_extract_variable_trace_ignores_variables_never_referenced_again():
+    """A local assignment that is never used by anything downstream in
+    this same write site's text should not be surfaced -- only variables
+    that actually feed the final assignment are relevant to a reviewer."""
+    raw_sql = "v_unused := 1;\nUPDATE T SET X = 5 WHERE Y = 1;"
+    assert _extract_variable_trace(raw_sql) == []
+
+
+def test_assignment_context_shows_aggregate_summary_and_hint_for_real_dpd_max(dpd_calculation_sql):
+    objects = split_objects(dpd_calculation_sql, "dpd.sql", Dialect.ORACLE)
+    infos = {obj.object_id: analyze_object(obj) for obj in objects}
+    info = next(iter(infos.values()))
+
+    context = _format_assignment_context(info, "DPD_MaxFin")
+
+    assert "aggregates MAX" in context
+    assert "AccountEntityID" in context
+    assert "cross-row aggregate" in context
+    assert "cannot itself perform a GROUP BY" in context
+
+
+def test_build_source_statement_refs_traces_real_errordate_to_both_sites(dpd_calculation_sql):
+    objects = split_objects(dpd_calculation_sql, "dpd.sql", Dialect.ORACLE)
+    infos = {obj.object_id: analyze_object(obj) for obj in objects}
+    obj = objects[0]
+    info = infos[obj.object_id]
+
+    refs = _build_source_statement_refs(obj, info, "ERRORDATE")
+
+    assert len(refs) == 2
+    assert any("role=EXCEPTION_HANDLER" in ref for ref in refs)
+    assert any("role=EXCEPTION_HANDLER" not in ref for ref in refs)
+    assert all(ref.startswith("dpd.sql stmt #") for ref in refs)
+
+
+def test_dd_rows_carry_source_statement_refs_end_to_end(
+    dpd_calculation_sql, maxdpd_sql, npa_date_sql, mock_llm_client, function_reference
+):
+    """The traceability breadcrumbs must survive all the way through
+    DD row generation -- not just be computable in isolation -- since a
+    row with an empty source_statement_refs list is useless to a
+    reviewer even if the underlying helper functions work correctly on
+    their own."""
+    chain, objects, infos = _build_chain(dpd_calculation_sql, maxdpd_sql, npa_date_sql)
+    model = build_canonical_model(chain, "job-int-refs", objects, infos, mock_llm_client)
+
+    rows = generate_dd_rows(
+        chain=chain,
+        canonical_model=model,
+        objects=objects,
+        structural_infos=infos,
+        llm_client=mock_llm_client,
+        function_reference=function_reference,
+        entity_name_map={"AccountCal_Stg": "FCT_NPA_PRODUCT"},
+    )
+
+    assert len(rows) > 0
+    assert all(row.source_statement_refs for row in rows), "every row should have at least one traced source statement"
+    assert all(ref.count("stmt #") for row in rows for ref in row.source_statement_refs)

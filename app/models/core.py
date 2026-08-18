@@ -205,6 +205,14 @@ class DDRow(BaseModel):
     # Traceability (not in the platform export, used internally / in the report)
     source_chain_id: str
     source_object_ids: list[str] = Field(default_factory=list)
+    # One human-readable entry per source write site that fed this row's
+    # expression -- e.g. "npa.sql stmt #30 (role=NULL_RESET)" -- so a
+    # reviewer (or the report) can trace a generated condition back to the
+    # exact statement(s) in the source SQL it came from, not just the
+    # object as a whole. Populated in
+    # app/derivation/dd_generator.py::_generate_for_column from the same
+    # _AssignmentSite data already used to build the LLM's prompt context.
+    source_statement_refs: list[str] = Field(default_factory=list)
     confidence: float = 1.0
     validation_errors: list[str] = Field(default_factory=list)
     advisory_notes: list[str] = Field(default_factory=list)

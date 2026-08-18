@@ -168,10 +168,12 @@ def _format_assignment_context(info: StructuralInfo, column: str) -> str:
         role = _infer_assignment_role(raw)
         hints = _assignment_decomposition_hints(raw)
         summary = _assignment_decomposition_summary(raw)
+        variable_trace = _extract_variable_trace(raw)
         sections.append(
             f"[Assignment {idx} | role={role} | kind={site.kind} | statements={stmt_ids} | columns={columns}]\n"
             f"{raw}"
             + (f"\n[Decomposition summary]\n" + "\n".join(f"- {line}" for line in summary) if summary else "")
+            + (f"\n[Variable trace]\n" + "\n".join(f"- {line}" for line in variable_trace) if variable_trace else "")
             + (f"\n[Decomposition hints]\n" + "\n".join(f"- {hint}" for hint in hints) if hints else "")
         )
     return "\n\n".join(sections)
@@ -182,7 +184,14 @@ def _ordered_assignment_overview(sites: list[_AssignmentSite]) -> list[str]:
     for site in sites:
         summary = _assignment_decomposition_summary(site.raw_sql)
         compact = "; ".join(summary) if summary else site.raw_sql.strip()
-        overview.append(f"later stages stay later | role={site.kind} | {compact}")
+        role = _infer_assignment_role(site.raw_sql)
+        sequencing = (
+            "mutually exclusive alternate path -- executes INSTEAD OF the normal-flow "
+            "site(s) below, never in sequence with them"
+            if role == "EXCEPTION_HANDLER"
+            else "later stages stay later"
+        )
+        overview.append(f"{sequencing} | role={role} | {compact}")
     return overview
 
 
@@ -266,14 +275,102 @@ def _statement_writes_column(stmt: StatementInfo, column_upper: str) -> bool:
     return False
 
 
+_AGGREGATE_FUNCTION_RE = re.compile(
+    r"\b(MIN|MAX|SUM|COUNT|AVG|LISTAGG)\s*\(", re.IGNORECASE
+)
+_GROUP_BY_RE = re.compile(r"\bGROUP\s+BY\s+(?P<cols>[^\n\)]+)", re.IGNORECASE)
+
+
+def _extract_aggregate_info(raw_sql: str) -> list[str]:
+    """If the source statement computes its value via an aggregate
+    function (MIN/MAX/SUM/COUNT/AVG/LISTAGG) combined with a GROUP BY --
+    the shape used for cross-row rollups like "the earliest NPA date
+    across all of a customer's accounts" or "the highest DPD across
+    several DPD-type columns for one account" -- return a description of
+    exactly which aggregate(s) and which grouping column(s), so the
+    prompt can tell the model this is a genuine cross-row aggregation, not
+    a per-row calculation to re-derive from scratch.
+
+    Detection requires BOTH an aggregate function call AND a GROUP BY
+    clause in the same statement -- an aggregate function alone (e.g. a
+    single MAX(a,b) picking the larger of two same-row values) is an
+    ordinary scalar function call, not a cross-row rollup, and must not be
+    flagged here.
+    """
+    functions = sorted({m.group(1).upper() for m in _AGGREGATE_FUNCTION_RE.finditer(raw_sql)})
+    group_by_match = _GROUP_BY_RE.search(raw_sql)
+    if not functions or not group_by_match:
+        return []
+
+    group_cols = group_by_match.group("cols").strip().rstrip(";").strip()
+    return [f"aggregates {', '.join(functions)}(...) grouped by {group_cols}"]
+
+
+_VARIABLE_ASSIGNMENT_RE = re.compile(
+    r"(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:=\s*(.+?);\s*$"
+)
+
+
+def _extract_variable_trace(raw_sql: str) -> list[str]:
+    """Find local PL/SQL variable assignments (`v_x := expr;`) inside this
+    write site's own text and report only the ones that are actually
+    referenced later in the same block -- i.e. the ones that feed the
+    final assignment, not every incidental variable that happens to
+    appear.
+
+    This deliberately only traces within the single write site's own
+    already-collected text (which _assignment_sites_from_statements
+    already folds preceding/bridging statements into -- see
+    bridge_context there), not across the whole procedure. A full
+    whole-procedure variable dependency graph is real, separate scope;
+    this covers the common, high-value case where a variable is defined
+    immediately before the statement that consumes it (e.g.
+    `v_error := SQLERRM; ... SET ERRORDESCRIPTION = v_error`), which is
+    exactly the shape the proposal's "DPD -> Reference Period -> ... ->
+    FinalNpaDt" example describes at the single-statement-block level.
+    """
+    assignments = _VARIABLE_ASSIGNMENT_RE.findall(raw_sql)
+    if not assignments:
+        return []
+
+    trace: list[str] = []
+    for name, value in assignments:
+        # Does anything *after* this assignment's own line reference the
+        # variable? (A crude but safe check: the variable name appears
+        # again elsewhere in the text, as a whole word, beyond this one
+        # assignment line itself.)
+        other_text = raw_sql.replace(f"{name} := {value};", "", 1)
+        if re.search(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])", other_text, re.IGNORECASE):
+            trace.append(f'{name} := {value.strip()}  (this value is used later in this assignment)')
+    return trace
+
+
 def _infer_assignment_role(raw_sql: str) -> str:
     """Classify the write pattern generically so the prompt can describe
-    the chunk as a value-selection, initialization, or fix-up stage.
+    the chunk as a value-selection, initialization, fix-up, or exception-
+    handling stage.
 
     This is intentionally heuristic: it should improve source decomposition
     for many procedures without hardcoding any specific column names.
     """
     upper = raw_sql.upper()
+
+    # Checked first, before any MERGE/UPDATE pattern below: control-flow
+    # headers (EXCEPTION, WHEN OTHERS THEN, ...) are folded onto the front
+    # of the assignment's raw_sql by _relevant_chunks /
+    # _assignment_sites_from_statements, so an exception-handler
+    # assignment's raw_sql starts with "EXCEPTION" / "WHEN OTHERS THEN",
+    # not with the UPDATE/MERGE keyword itself -- without checking this
+    # first, such a site silently falls through to the same generic
+    # "SEQUENTIAL_ASSIGNMENT" role as an ordinary normal-flow statement,
+    # giving the model no signal that the two are mutually exclusive
+    # alternate paths rather than sequential steps of one flow. This is
+    # exactly the shape that produced a real, confirmed generation defect
+    # (a normal-flow guard and an exception-handler guard collapsed into
+    # one repeated condition -- see
+    # app/guardrails/semantic_validation.py::check_redundant_nested_condition).
+    if re.search(r"(?:^|\n)\s*EXCEPTION\b", raw_sql, re.IGNORECASE):
+        return "EXCEPTION_HANDLER"
 
     if "MERGE INTO" in upper and "USING (" in upper:
         if "CASE WHEN" in upper or re.search(r"\bCASE\b", upper):
@@ -304,6 +401,21 @@ def _assignment_decomposition_hints(raw_sql: str) -> list[str]:
     upper = raw_sql.upper()
     hints: list[str] = []
 
+    role = _infer_assignment_role(raw_sql)
+    if role == "EXCEPTION_HANDLER":
+        hints.append(
+            "This assignment only happens if an unhandled exception occurred elsewhere "
+            "in the procedure -- it is a mutually exclusive alternate path, not a later "
+            "step of the normal flow. Its trigger condition in the expression must be "
+            "genuinely distinct from (never textually identical to) any normal-flow "
+            "site's condition for the same column -- e.g. do not gate both this value "
+            "and the normal-flow value with the same repeated condition; if the source "
+            "has no explicit column recording whether an exception occurred, express the "
+            "normal-flow condition and its logical negation as two separate branches, or "
+            "use ELSE for whichever site's condition is not otherwise determinable."
+        )
+        return hints
+
     if "MERGE INTO" in upper and "USING (" in upper:
         hints.append("Treat the USING subquery as the value source and the MERGE ON/WHERE predicates as the outer guard.")
         if "CASE" in upper:
@@ -320,6 +432,16 @@ def _assignment_decomposition_hints(raw_sql: str) -> list[str]:
     if "CASE WHEN" in upper or re.search(r"\bCASE\b", upper):
         hints.append("Preserve the source CASE branches in order; do not flatten later branches into the first one.")
 
+    if _extract_aggregate_info(raw_sql):
+        hints.append(
+            "This value is computed as a cross-row aggregate (MIN/MAX/SUM/COUNT/AVG/"
+            "LISTAGG) grouped by another column in the source SQL -- a Formula "
+            "Expression is evaluated one row at a time and cannot itself perform a "
+            "GROUP BY. Represent this by referencing the column the aggregated result "
+            "is written into (for example the MERGE target this aggregate feeds), not "
+            "by attempting to re-derive the aggregation logic at the row level."
+        )
+
     return hints
 
 
@@ -334,8 +456,12 @@ def _assignment_decomposition_summary(raw_sql: str) -> list[str]:
     summary: list[str] = []
 
     if upper.startswith("MERGE") and "USING (" in upper:
+        # The alias after the value expression may or may not use the AS
+        # keyword (Oracle allows `MAX(DPD) DPD_MaxFin` without AS, not
+        # just `MAX(DPD) AS DPD_MaxFin`) -- both forms are common in real
+        # procedures, so AS is optional here rather than required.
         value_match = re.search(
-            r"USING\s*\(\s*SELECT\s+.*?,\s*(?P<value>.+?)\s+AS\s+\w+\s+FROM\s+",
+            r"USING\s*\(\s*SELECT\s+.*?,\s*(?P<value>.+?)\s+(?:AS\s+)?\w+\s+FROM\s+",
             text,
             re.IGNORECASE,
         )
@@ -359,6 +485,8 @@ def _assignment_decomposition_summary(raw_sql: str) -> list[str]:
         where_match = re.search(r"\bWHERE\b\s+(?P<guard>.+?)(?:;|$)", text, re.IGNORECASE)
         if where_match:
             summary.append(f"guard: {where_match.group('guard').strip()}")
+
+    summary.extend(_extract_aggregate_info(raw_sql))
 
     return summary
 
@@ -1995,6 +2123,29 @@ def generate_dd_rows_for_chains(
     return _run_jobs(all_jobs)
 
 
+def _build_source_statement_refs(obj: SQLObject, info: StructuralInfo, column: str) -> list[str]:
+    """One human-readable breadcrumb per write site that could feed this
+    column's expression -- e.g. "npa.sql stmt #30 (role=NULL_RESET)" -- so
+    a reviewer (or the generated report) can trace a row back to the
+    exact source statement(s) it came from, not just the object name.
+    Built from the same _AssignmentSite data already computed for the
+    LLM's prompt context (see _format_assignment_context), so this can
+    never describe a different set of write sites than what the model was
+    actually shown.
+    """
+    refs: list[str] = []
+    for site in _assignment_sites(info, column):
+        if not site.raw_sql.strip():
+            continue
+        role = _infer_assignment_role(site.raw_sql)
+        if site.statement_indices:
+            stmt_label = "stmt #" + ",".join(str(i) for i in site.statement_indices)
+        else:
+            stmt_label = "stmt #?"
+        refs.append(f"{obj.source_file} {stmt_label} (role={role})")
+    return refs
+
+
 def _generate_for_column(
     canonical_model: CanonicalModel,
     obj: SQLObject,
@@ -2009,6 +2160,7 @@ def _generate_for_column(
     relevant_chunks = _relevant_chunks(info, column)
     relevant_sql = "\n\n".join(chunk.raw_sql.strip() for chunk in relevant_chunks if chunk.raw_sql.strip())
     assignment_context = _format_assignment_context(info, column)
+    source_statement_refs = _build_source_statement_refs(obj, info, column)
     rag_context = _retrieve_rag_context(
         rag_store, relevant_sql, canonical_model.technical_summary, canonical_model.business_summary
     )
@@ -2157,6 +2309,7 @@ def _generate_for_column(
                 decision_table_json=decision_table_json,
                 source_chain_id=canonical_model.chain_id,
                 source_object_ids=[obj.object_id],
+                source_statement_refs=source_statement_refs,
                 confidence=row_confidence,
                 validation_errors=row_validation_errors,
                 advisory_notes=advisory_notes,

@@ -5,6 +5,29 @@ full source SQL. It organizes DD output into a fixed narrative structure
 so reviewers can understand the process, the platform syntax, the business
 logic, and the column-level derivations without losing the exact platform
 formula text or the traceability metadata needed for review.
+
+Structure:
+  1. A one-line plain-English summary + a "How to Read a Condition" legend
+     + an optional Glossary -- all aimed at a non-technical reader before
+     anything technical appears.
+  2. Process Overview -- process/company/platform/intent, the canonical
+     model's own technical/business narrative, and a deterministic Tables
+     Read / Tables Written breakdown built from StructuralInfo (not the
+     LLM), so this is always available even if the LLM summary is thin.
+  3. Rule Summary -- a compact, scannable table (no formulas) with anchor
+     links into the detail cards below, so a reviewer can jump straight to
+     the one rule they care about instead of scrolling a giant table.
+  4. Detailed Business Rules & DD Conditions -- one card per rule, grouped
+     by target table, each with a deterministically pretty-printed
+     decision-chain rendering of the formula (see
+     app/report/formula_pretty_printer.py -- reformats, never rewrites,
+     the accepted expression) alongside the exact platform formula text a
+     reviewer would paste into the platform.
+
+There is no separate "Business Rules / Logic Explanation" section
+duplicating the same explanation already shown per rule in the cards, and
+no "Process Control & Traceability" section -- pending-review reasons are
+inlined directly on the row/card they belong to instead.
 """
 from __future__ import annotations
 
@@ -14,6 +37,7 @@ from pathlib import Path
 import re
 
 from app.models.core import CanonicalModel, DDRow, JobPlan, SQLObject, StructuralInfo
+from app.report.formula_pretty_printer import pretty_print_expression
 from app.utils.identity import canonical_expression_key, canonical_logical_name
 from app.grammar.validator import KNOWN_FUNCTIONS
 
@@ -92,6 +116,18 @@ def _first_sentence(text: str) -> str:
     if match:
         return match.group(1).strip()
     return stripped
+
+
+def _slugify(*parts: str) -> str:
+    """A stable, renderer-independent anchor id -- rendered as an explicit
+    `<a id="...">` next to each card heading rather than relying on any
+    particular Markdown renderer's own header-to-anchor slug algorithm
+    (which varies enough between renderers, e.g. handling of em dashes,
+    that a Rule Summary link built against one renderer's rules can
+    silently fail to jump anywhere in another)."""
+    raw = "-".join(parts).lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", raw).strip("-")
+    return slug or "rule"
 
 
 def _render_glossary_lines(canonical_models: list[CanonicalModel]) -> list[str]:
@@ -192,7 +228,6 @@ def _extract_dependencies(expression: str) -> list[str]:
     seen: set[str] = set()
     i = 0
     n = len(expression)
-    in_double = False
 
     def add_ref(value: str) -> None:
         canonical = value.strip()
@@ -290,27 +325,6 @@ def _is_fallback_business_meaning(rule: "_RuleGroup") -> bool:
     return " ".join(rule.business_meaning.split()).strip() == " ".join(fallback.split()).strip()
 
 
-def _rule_summary_from_formula(expression: str) -> str:
-    expr = _flatten_for_table_cell(expression)
-    if len(expr) <= 180:
-        return expr
-    return expr[:177] + "..."
-
-
-def _summarize_process_overview(job_plan: JobPlan, canonical_models: list[CanonicalModel], objects: dict[str, SQLObject]) -> tuple[list[str], list[str]]:
-    process_name = _process_name(job_plan, canonical_models, objects)
-    source_procedures = [objects[oid].name if oid in objects else oid for model in canonical_models for oid in model.object_ids]
-    unique_source_procedures = list(dict.fromkeys(source_procedures))
-    inputs = [
-        f"Company: {job_plan.company}",
-        f"Platform: {job_plan.platform}",
-        f"Intent: {job_plan.intent.value}",
-    ]
-    if unique_source_procedures:
-        inputs.append("Source files: " + ", ".join(unique_source_procedures))
-    return [process_name, *inputs], unique_source_procedures
-
-
 @dataclass(frozen=True)
 class _RuleGroup:
     rule_id: str
@@ -324,6 +338,7 @@ class _RuleGroup:
     status: str
     validation_notes: str
     advisory_notes: str
+    source_statement_refs: list[str]
 
 
 def _build_rule_groups(dd_rows: list[DDRow]) -> list[_RuleGroup]:
@@ -351,6 +366,7 @@ def _build_rule_groups(dd_rows: list[DDRow]) -> list[_RuleGroup]:
                 status=first.status.value,
                 validation_notes="; ".join(first.validation_errors) if first.validation_errors else "",
                 advisory_notes="; ".join(first.advisory_notes) if first.advisory_notes else "",
+                source_statement_refs=list(getattr(first, "source_statement_refs", []) or []),
             )
         )
     return rule_groups
@@ -366,51 +382,13 @@ def _rules_by_entity(rule_groups: list[_RuleGroup]) -> list[tuple[str, list[_Rul
     return [(entity, grouped[entity]) for entity in order]
 
 
-def _business_flow_lines(rule_groups: list[_RuleGroup], canonical_models: list[CanonicalModel]) -> list[str]:
-    lines: list[str] = []
-    for model in canonical_models:
-        if model.technical_summary:
-            lines.append(f"- {model.technical_summary}")
-        if model.business_summary:
-            lines.append(f"- {model.business_summary}")
-    if not lines:
-        lines.append("- No business summary was generated for this job.")
-    for rule in rule_groups:
-        lines.append(
-            f"- {rule.rule_id} ({rule.entity_name}.{rule.column_name}): {rule.business_meaning}"
-        )
-    return lines
-
-
-def _special_case_lines(rule_groups: list[_RuleGroup]) -> list[str]:
-    lines: list[str] = []
-    for rule in rule_groups:
-        expr = rule.formula.upper()
-        if "ELSEIF(" in expr or "CASE" in expr:
-            lines.append(f"- {rule.rule_id}: Preserves branch logic for {rule.entity_name}.{rule.column_name}.")
-        if "ISNOTEMPTY(" in expr or "ISEMPTY(" in expr:
-            lines.append(f"- {rule.rule_id}: Includes explicit null-handling for {rule.entity_name}.{rule.column_name}.")
-        if "ELSE(NULL)" in expr or "ELSE(0)" in expr:
-            lines.append(f"- {rule.rule_id}: Uses an explicit fallback when the source condition does not match.")
-        if "BETWEEN" in expr or ">" in expr or "<" in expr:
-            lines.append(f"- {rule.rule_id}: Keeps source thresholds and comparisons intact.")
-    if not lines:
-        lines.append("- No special-case branching was detected.")
-    return lines
-
-
-def _aggregation_lines(rule_groups: list[_RuleGroup]) -> list[str]:
-    lines: list[str] = []
-    for rule in rule_groups:
-        expr = rule.formula.upper()
-        if any(token in expr for token in ("MAX(", "MIN(", "COALESCE(", "DATEDIFF(")):
-            lines.append(f"- {rule.rule_id}: {rule.entity_name}.{rule.column_name} uses aggregation / fallback logic.")
-    if not lines:
-        lines.append("- No aggregation / max-style logic was detected.")
-    return lines
-
-
 def _business_rule_explanation_lines(rule: _RuleGroup) -> list[str]:
+    """Deterministic, pattern-based supporting detail -- shown only when
+    `rule.business_meaning` is itself the deterministic fallback sentence
+    (i.e. no real per-rule explanation was available from the LLM), so a
+    card is never left with just a generic one-liner and nothing else. If
+    a genuine LLM-authored explanation exists, this returns nothing and
+    the card relies on that instead of also showing these pattern notes."""
     expr = rule.formula.upper()
     if not _is_fallback_business_meaning(rule):
         return []
@@ -469,70 +447,212 @@ def _business_rule_explanation_lines(rule: _RuleGroup) -> list[str]:
     return lines
 
 
-def _business_rules_section(rule_groups: list[_RuleGroup]) -> list[str]:
+def _tables_read_written_lines(
+    canonical_models: list[CanonicalModel],
+    objects: dict[str, SQLObject],
+    structural_infos: dict[str, StructuralInfo] | None,
+) -> list[str]:
+    """Deterministic Tables Read / Tables Written tables built directly
+    from StructuralInfo -- not the LLM -- so this is always available
+    (and always accurate to what was actually parsed) regardless of how
+    detailed the canonical model's own narrative summary happens to be."""
+    if not structural_infos:
+        return []
+
+    object_ids: list[str] = []
+    seen: set[str] = set()
+    for model in canonical_models:
+        for oid in model.object_ids:
+            if oid not in seen:
+                seen.add(oid)
+                object_ids.append(oid)
+
+    read_by_table: dict[str, set[str]] = defaultdict(set)
+    written_by_table: dict[str, set[str]] = defaultdict(set)
+    for oid in object_ids:
+        info = structural_infos.get(oid)
+        if info is None:
+            continue
+        object_name = objects[oid].name if oid in objects else oid
+        for table in info.tables_read:
+            read_by_table[table].add(object_name)
+        for table, columns in info.columns_written_by_table.items():
+            written_by_table[table].update(columns)
+
     lines: list[str] = []
-    lines.append("## 4. Business Rules / Logic Explanation")
+    if read_by_table:
+        lines.append("### Tables Read")
+        lines.append("")
+        lines.append("| Table | Read By |")
+        lines.append("|---|---|")
+        for table in sorted(read_by_table):
+            lines.append(f"| {table} | {', '.join(sorted(read_by_table[table]))} |")
+        lines.append("")
+
+    if written_by_table:
+        lines.append("### Tables Written")
+        lines.append("")
+        lines.append("| Table | Columns Set |")
+        lines.append("|---|---|")
+        for table in sorted(written_by_table):
+            lines.append(f"| {table} | {', '.join(sorted(written_by_table[table]))} |")
+        lines.append("")
+
+    return lines
+
+
+def _process_overview_lines(
+    job_plan: JobPlan,
+    canonical_models: list[CanonicalModel],
+    objects: dict[str, SQLObject],
+    structural_infos: dict[str, StructuralInfo] | None,
+) -> list[str]:
+    process_name = _process_name(job_plan, canonical_models, objects)
+    source_objects = [objects[oid].name if oid in objects else oid for model in canonical_models for oid in model.object_ids]
+    unique_source_objects = list(dict.fromkeys(source_objects))
+
+    lines: list[str] = ["## 1. Process Overview", ""]
+    lines.append(f"**Process:** {process_name}  ")
+    lines.append(f"**Company:** {job_plan.company}  ")
+    lines.append(f"**Platform:** {job_plan.platform}  ")
+    lines.append(f"**Intent:** {job_plan.intent.value}  ")
+    if unique_source_objects:
+        lines.append(f"**Source objects:** {', '.join(unique_source_objects)}")
     lines.append("")
-    if not rule_groups:
-        lines.append("- No generated rules were available for explanation.")
+
+    technical_summaries = [model.technical_summary.strip() for model in canonical_models if model.technical_summary.strip()]
+    business_summaries = [model.business_summary.strip() for model in canonical_models if model.business_summary.strip()]
+
+    if technical_summaries:
+        lines.append("### What the Source SQL Does")
+        lines.append("")
+        for summary in technical_summaries:
+            lines.append(summary)
+            lines.append("")
+
+    if business_summaries:
+        lines.append("### What It Means for the Business")
+        lines.append("")
+        for summary in business_summaries:
+            lines.append(summary)
+            lines.append("")
+
+    lines.extend(_tables_read_written_lines(canonical_models, objects, structural_infos))
+    return lines
+
+
+def _rule_summary_table_lines(business_groups: list[_RuleGroup], technical_groups: list[_RuleGroup]) -> list[str]:
+    lines: list[str] = ["## 2. Rule Summary", ""]
+    all_rules = business_groups + technical_groups
+    if not all_rules:
+        lines.append("- No DD rows were generated for this job.")
+        lines.append("")
         return lines
 
-    for entity_name, rules in _rules_by_entity(rule_groups):
-        lines.append(f"### {entity_name}")
-        lines.append("")
-        for rule in rules:
-            details = _business_rule_explanation_lines(rule)
-            summary = rule.business_meaning
-            if rule.status == "PENDING_REVIEW":
-                summary = f"PENDING_REVIEW: {summary}"
-            elif rule.advisory_notes:
-                summary = f"{summary} (advisory)"
-            lines.append(f"- {rule.rule_id} {rule.column_name}: {summary}")
-            for detail in details:
-                lines.append(f"  - {detail}")
-            lines.append(f"  - Effective dates: {rule.effective_dates}")
+    lines.append("| Rule ID | Table | Column | Business Meaning | Effective Date(s) |")
+    lines.append("|---|---|---|---|---|")
+    technical_ids = {rule.rule_id for rule in technical_groups}
+    for rule in all_rules:
+        anchor = _slugify(rule.rule_id, rule.column_name)
+        label = f"{rule.rule_id} (technical)" if rule.rule_id in technical_ids else rule.rule_id
+        meaning = rule.business_meaning
+        if rule.status == "PENDING_REVIEW":
+            meaning = f"PENDING_REVIEW: {meaning}"
+        lines.append(
+            f"| [{label}](#{anchor}) | {rule.entity_name} | {rule.column_name} | {_flatten_for_table_cell(meaning)} | {rule.effective_dates} |"
+        )
+    lines.append("")
+    if technical_groups:
+        lines.append(
+            "*Rows marked (technical) are operational monitoring fields, not business rules -- see the "
+            "technical-housekeeping subsection below.*"
+        )
         lines.append("")
     return lines
 
 
-def _period_rule_rows(rule_groups: list[_RuleGroup]) -> list[tuple[str, str, str, str, str]]:
-    rows: list[tuple[str, str, str, str, str]] = []
-    for rule in rule_groups:
-        if len(rule.rows) <= 1:
-            continue
-        rows.append(
-            (
-                rule.rule_id,
-                rule.entity_name,
-                rule.column_name,
-                rule.effective_dates,
-                rule.business_meaning,
-            )
-        )
-    return rows
+def _rule_card_lines(rule: _RuleGroup) -> list[str]:
+    anchor = _slugify(rule.rule_id, rule.column_name)
+    lines: list[str] = []
+    lines.append(f'<a id="{anchor}"></a>')
+    lines.append(f"#### {rule.rule_id} \u2014 {rule.column_name}")
+    lines.append("")
+    lines.append(f"**Table:** `{rule.entity_name}`  ")
 
+    lines.append(f"**Purpose:** {rule.business_meaning}")
+    for detail in _business_rule_explanation_lines(rule):
+        lines.append(f"- {detail}")
+    lines.append("")
 
-def _traceability_lines(job_plan: JobPlan, canonical_models: list[CanonicalModel], dd_rows: list[DDRow]) -> tuple[list[str], list[str]]:
-    pending = [row for row in dd_rows if row.status.value == "PENDING_REVIEW"]
-    advisory = [row for row in dd_rows if row.advisory_notes and row.status.value != "PENDING_REVIEW"]
-    source_refs: list[str] = []
-    for model in canonical_models:
-        if model.object_ids:
-            source_refs.append(f"- Chain {model.chain_id}: {', '.join(model.object_ids)}")
-        if model.evidence:
-            source_refs.append(f"- Evidence: {', '.join(model.evidence)}")
-
-    notes: list[str] = []
-    if pending:
-        notes.append("- Some rows are still marked PENDING_REVIEW because validation or semantic checks were not fully satisfied.")
+    lines.append(f"**Effective Date(s):** {rule.effective_dates}  ")
+    if rule.status == "PENDING_REVIEW":
+        notes = rule.validation_notes or "Validation did not fully pass; see the formula below before approving."
+        lines.append(f"**Status:** PENDING_REVIEW \u2014 {notes}")
+    elif rule.advisory_notes:
+        lines.append(f"**Status:** ACTIVE (advisory) \u2014 {rule.advisory_notes}")
     else:
-        notes.append("- No rows are marked PENDING_REVIEW in this report.")
-    if advisory:
-        notes.append(f"- {len(advisory)} rows carry advisory notes only and remain auto-validated.")
+        lines.append("**Status:** ACTIVE")
+    lines.append("")
 
-    notes.append("- The reviewed DD CSV export can be regenerated from the current saved rows.")
+    formula = rule.formula or "(pending review \u2014 no formula was accepted)"
+    pretty = pretty_print_expression(formula) if rule.formula else None
 
-    return source_refs or ["- No source reference metadata was available."], notes
+    if pretty:
+        lines.append("**Decision Logic**")
+        lines.append("")
+        lines.append("```text")
+        lines.append(pretty)
+        lines.append("```")
+        lines.append("")
+
+    lines.append("**Platform Formula**")
+    lines.append("")
+    lines.append("```text")
+    lines.append(formula)
+    lines.append("```")
+    lines.append("")
+
+    if rule.depends_on:
+        lines.append("**Depends On**")
+        for dep in rule.depends_on:
+            lines.append(f"- {dep}")
+        lines.append("")
+
+    if rule.source_statement_refs:
+        lines.append("**Source Statements**")
+        for ref in rule.source_statement_refs:
+            lines.append(f"- {ref}")
+        lines.append("")
+
+    lines.append("---")
+    lines.append("")
+    return lines
+
+
+def _detailed_rules_lines(business_groups: list[_RuleGroup], technical_groups: list[_RuleGroup]) -> list[str]:
+    lines: list[str] = ["## 3. Detailed Business Rules & DD Conditions", ""]
+    if not business_groups and not technical_groups:
+        lines.append("- No DD rows were generated for this job.")
+        return lines
+
+    for entity_name, rules in _rules_by_entity(business_groups):
+        lines.append(f"### {entity_name}")
+        lines.append("")
+        for rule in rules:
+            lines.extend(_rule_card_lines(rule))
+
+    if technical_groups:
+        for entity_name, rules in _rules_by_entity(technical_groups):
+            lines.append(f"### {entity_name} \u2014 technical housekeeping, not business logic")
+            lines.append("")
+            lines.append(
+                "> These rows are operational monitoring fields and are excluded from the business-rules count above."
+            )
+            lines.append("")
+            for rule in rules:
+                lines.extend(_rule_card_lines(rule))
+
+    return lines
 
 
 def generate_report(
@@ -559,7 +679,7 @@ def generate_report(
     glossary_lines = _render_glossary_lines(canonical_models)
 
     lines: list[str] = []
-    lines.append(f"# DD Automation Report — {process_name}")
+    lines.append(f"# DD Automation Report \u2014 {process_name}")
     lines.append("")
     if top_summary:
         lines.append(f"> **What this process does, in one line:** {top_summary}")
@@ -570,80 +690,12 @@ def generate_report(
     if glossary_lines:
         lines.extend(glossary_lines)
 
-    lines.append("## 1. Business Flow / Process Overview")
+    lines.extend(_process_overview_lines(job_plan, canonical_models, objects, structural_infos))
     lines.append("")
 
-    lines.append("## 2. Column-Level Derivations & DD Conditions")
-    if business_groups or technical_groups:
-        for entity_name, rules in _rules_by_entity(business_groups):
-            lines.append("")
-            lines.append(f"### {entity_name}")
-            lines.append("")
-            lines.append("| Column | Business Meaning | Depends On | Rule ID | Platform Formula | Effective Dates |")
-            lines.append("|---|---|---|---|---|---|")
-            for rule in rules:
-                depends_on = ", ".join(rule.depends_on) if rule.depends_on else "(not confidently extracted)"
-                formula = rule.formula or "(pending review)"
-                business_meaning = rule.business_meaning
-                if rule.status == "PENDING_REVIEW" and rule.validation_notes:
-                    business_meaning = f"PENDING_REVIEW: {business_meaning}"
-                elif rule.advisory_notes:
-                    business_meaning = f"{business_meaning} (advisory)"
-                lines.append(
-                    f"| {rule.column_name} | {business_meaning} | {depends_on} | {rule.rule_id} | `{_flatten_for_table_cell(formula)}` | {rule.effective_dates} |"
-                )
+    lines.extend(_rule_summary_table_lines(business_groups, technical_groups))
 
-        if technical_groups:
-            technical_by_entity = _rules_by_entity(technical_groups)
-            for entity_name, rules in technical_by_entity:
-                lines.append("")
-                lines.append(f"### {entity_name} — technical housekeeping, not business logic")
-                lines.append("")
-                lines.append(
-                    "> These rows are operational monitoring fields and are excluded from the business-rules count below."
-                )
-                lines.append("")
-                lines.append("| Column | Business Meaning | Depends On | Rule ID | Platform Formula | Effective Dates |")
-                lines.append("|---|---|---|---|---|---|")
-                for rule in rules:
-                    depends_on = ", ".join(rule.depends_on) if rule.depends_on else "(not confidently extracted)"
-                    formula = rule.formula or "(pending review)"
-                    business_meaning = rule.business_meaning
-                    if rule.status == "PENDING_REVIEW" and rule.validation_notes:
-                        business_meaning = f"PENDING_REVIEW: {business_meaning}"
-                    elif rule.advisory_notes:
-                        business_meaning = f"{business_meaning} (advisory)"
-                    lines.append(
-                        f"| {rule.column_name} | {business_meaning} | {depends_on} | {rule.rule_id} | `{_flatten_for_table_cell(formula)}` | {rule.effective_dates} |"
-                    )
-    else:
-        lines.append("- No DD rows were generated for this job.")
-    lines.append("")
-
-    lines.append("## 3. Business Rules / Logic Explanation")
-    lines.append("")
-    if business_groups:
-        lines.append("- The rules below explain why each business derivation matters, not just how the formula is written.")
-        if technical_groups:
-            lines.append("- Technical housekeeping rows are documented above and excluded from this section.")
-        lines.append("")
-        for entity_name, rules in _rules_by_entity(business_groups):
-            lines.append(f"### {entity_name}")
-            lines.append("")
-            for rule in rules:
-                details = _business_rule_explanation_lines(rule)
-                summary = rule.business_meaning
-                if rule.status == "PENDING_REVIEW":
-                    summary = f"PENDING_REVIEW: {summary}"
-                elif rule.advisory_notes:
-                    summary = f"{summary} (advisory)"
-                lines.append(f"- {rule.rule_id} {rule.column_name}: {summary}")
-                for detail in details:
-                    lines.append(f"  - {detail}")
-                lines.append(f"  - Effective dates: {rule.effective_dates}")
-            lines.append("")
-    else:
-        lines.append("- No business rules were available for explanation.")
+    lines.extend(_detailed_rules_lines(business_groups, technical_groups))
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
