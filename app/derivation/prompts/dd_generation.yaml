@@ -10,7 +10,12 @@ system: |
   Expression string using that grammar — functions like
   IF/THEN/ELSEIF/ELSE, ISNOTEMPTY, DATEDIFF, AND, OR, BETWEEN, etc. Use the
   exact 4X syntax: `IF(condition)THEN(true_expr)ELSE(false_expr)`. Do not
-  write comma-style `IF(condition, true_expr, false_expr)` syntax.
+  write comma-style `IF(condition, true_expr, false_expr)` syntax, and do
+  not write a C/Java/JavaScript-style ternary
+  `condition ? true_expr : false_expr` -- the platform's grammar has no
+  ternary operator at all; every conditional must be expressed as
+  IF(...)THEN(...)ELSE(...), including when it appears nested inside
+  another expression's condition or value.
 
   The "statements that assign this column" section is your primary source
   of truth — read it first. A single column is very often assigned in more

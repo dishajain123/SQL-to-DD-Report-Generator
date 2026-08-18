@@ -693,3 +693,274 @@ def test_dd_rows_carry_source_statement_refs_end_to_end(
     assert len(rows) > 0
     assert all(row.source_statement_refs for row in rows), "every row should have at least one traced source statement"
     assert all(ref.count("stmt #") for row in rows for ref in row.source_statement_refs)
+
+
+def test_normalize_ternary_operator_fixes_real_degdate_defect():
+    """Regression test for a real, confirmed defect: a generated DEGDATE
+    expression used a `condition ? true : false` ternary, which the 4X
+    grammar has no support for at all -- it was correctly rejected by
+    grammar validation with "No terminal matches '?'". The normalizer
+    must deterministically rewrite this to the grammar's real
+    IF(...)THEN(...)ELSE(...) form and the result must actually validate."""
+    from app.derivation.dd_generator import _normalize_expression
+    from app.grammar.validator import validate_expression
+
+    buggy = (
+        'IF(("AdvAcRestructureCal"."FINALASSETCLASSALT_KEY">1 OR "AdvAcRestructureCal"."FlgDeg"=="Y") '
+        'AND (IF(ISNOTEMPTY("AdvAcRestructureCal"."SP_ExpiryDate") AND '
+        'ISNOTEMPTY("AdvAcRestructureCal"."SP_ExpiryExtendedDate"))'
+        'THEN(("AdvAcRestructureCal"."SP_ExpiryDate">="AdvAcRestructureCal"."SP_ExpiryExtendedDate") '
+        '? "AdvAcRestructureCal"."SP_ExpiryDate" : "AdvAcRestructureCal"."SP_ExpiryExtendedDate")'
+        'ELSE(COALESCE("AdvAcRestructureCal"."SP_ExpiryDate","AdvAcRestructureCal"."SP_ExpiryExtendedDate")) '
+        '> "AdvAcRestructureCal"."var"."BUSINESS_DATE"))'
+        'THEN(IF(ISNOTEMPTY("AdvAcRestructureCal"."PreRestructureNPA_Date"))'
+        'THEN("AdvAcRestructureCal"."PreRestructureNPA_Date")ELSE("AdvAcRestructureCal"."RestructureDt"))'
+        'ELSE("AdvAcRestructureCal"."DEGDATE")'
+    )
+    assert not validate_expression(buggy).valid  # confirm it's really broken to start
+
+    fixed = _normalize_expression(buggy)
+    assert "?" not in fixed
+    result = validate_expression(fixed)
+    assert result.valid, result.error
+
+
+def test_normalize_ternary_operator_bails_out_when_condition_not_parenthesized():
+    """A ternary whose condition isn't a clean, fully-parenthesized group
+    immediately before the '?' must be left completely untouched rather
+    than guessed at -- the '?' stays as a literal character, so grammar
+    validation still rejects it exactly as before (no regression, no
+    silent wrong rewrite)."""
+    from app.derivation.dd_generator import _normalize_expression
+
+    ambiguous = 'IF(X)THEN(A ? B : C)ELSE(D)'
+    result = _normalize_expression(ambiguous)
+    assert "?" in result
+
+
+def test_normalize_ternary_operator_handles_simple_standalone_case():
+    from app.derivation.dd_generator import _normalize_ternary_operator
+
+    assert _normalize_ternary_operator('(X>1) ? A : B') == 'IF(X>1)THEN(A)ELSE(B)'
+
+
+def test_compose_simple_assignment_expression_enforces_last_write_wins():
+    """Item 'Track sequential operations': proves the deterministic
+    composer already correctly implements last-write-wins precedence --
+    a later stage's guard is checked FIRST in the composed expression
+    (wrapping everything accumulated so far as its ELSE), so if a later
+    write's condition is satisfied it always wins over an earlier one,
+    matching how sequential SQL UPDATE/MERGE statements actually behave.
+    This was not new work this session -- this test exists to make the
+    already-correct behavior explicit and regression-proof."""
+    from app.derivation.dd_generator import _AssignmentSite, _compose_simple_assignment_expression
+
+    sites = [
+        _AssignmentSite(kind="UPDATE", statement_indices=[1], raw_sql="UPDATE T SET X = 'A' WHERE COND1 = 'Y'", columns_written=["X"]),
+        _AssignmentSite(kind="UPDATE", statement_indices=[2], raw_sql="UPDATE T SET X = 'B' WHERE COND2 = 'Y'", columns_written=["X"]),
+    ]
+    result = _compose_simple_assignment_expression(sites, "T", "X")
+    assert result is not None
+    # The LATER stage's condition (COND2) must be the outermost IF -- it
+    # gets checked first, so it wins even if COND1 also happens to be true.
+    assert result.index("COND2") < result.index("COND1")
+
+
+def test_undeterminable_exception_sites_catches_real_completed_and_errordate_defect(dpd_calculation_sql):
+    """Regression test for the real, confirmed root cause behind the
+    ERRORDATE/COMPLETED exception-flow defect: both the normal-flow
+    UPDATE and the EXCEPTION-handler UPDATE for ACLRUNNINGPROCESSSTATUS
+    share the exact same row-scoping WHERE clause (both restricted to
+    one process's status row), so neither the LLM nor the deterministic
+    composer has any real data-driven way to distinguish "an exception
+    occurred" from "normal completion" -- this must be detected and the
+    exception-handler write excluded, not guessed at."""
+    from app.derivation.dd_generator import _assignment_sites, undeterminable_exception_sites
+
+    objects = split_objects(dpd_calculation_sql, "dpd.sql", Dialect.ORACLE)
+    info = analyze_object(objects[0])
+
+    for column in ["ERRORDATE", "ERRORDESCRIPTION", "COMPLETED", "COUNT"]:
+        sites = _assignment_sites(info, column)
+        undeterminable = undeterminable_exception_sites(sites)
+        assert len(undeterminable) == 1, f"{column}: expected exactly one undeterminable exception site"
+
+
+def test_where_guard_extraction_ignores_comment_text(dpd_calculation_sql):
+    """Regression test for a real bug found while verifying the fix
+    above: the source SQL has a `--` comment directly above the real
+    UPDATE statement whose own free text happens to contain the word
+    "where" (`--Update BANDAUDITSTATUS ... where BandName='...'`) -- an
+    earlier version of the guard extractor matched the comment's "where"
+    instead of the real WHERE clause several lines later, producing a
+    guard that could never match anything and silently defeating the
+    whole detection."""
+    from app.derivation.dd_generator import _assignment_sites, _extract_where_guard_text
+
+    objects = split_objects(dpd_calculation_sql, "dpd.sql", Dialect.ORACLE)
+    info = analyze_object(objects[0])
+    sites = _assignment_sites(info, "ERRORDATE")
+    guards = [_extract_where_guard_text(s.raw_sql) for s in sites]
+    assert len(guards) == 2
+    assert guards[0] == guards[1]
+    assert "BANDNAME" not in (guards[0] or "")
+
+
+def test_dd_generation_deterministically_excludes_exception_handler_write(
+    dpd_calculation_sql, maxdpd_sql, npa_date_sql, mock_llm_client, function_reference
+):
+    """End-to-end: the composed/generated expression for a column with an
+    undeterminable exception-handler write must (a) never contain the
+    fabricated duplicate-condition shape, (b) be forced to
+    PENDING_REVIEW, and (c) carry a clear, specific reason explaining the
+    representational gap -- not silently produce a plausible-looking but
+    wrong formula."""
+    chain, objects, infos = _build_chain(dpd_calculation_sql, maxdpd_sql, npa_date_sql)
+    model = build_canonical_model(chain, "job-exc-exclusion", objects, infos, mock_llm_client)
+
+    rows = generate_dd_rows(
+        chain=chain,
+        canonical_model=model,
+        objects=objects,
+        structural_infos=infos,
+        llm_client=mock_llm_client,
+        function_reference=function_reference,
+        entity_name_map={"AccountCal_Stg": "FCT_NPA_PRODUCT"},
+    )
+
+    errordate_row = next(r for r in rows if r.column_name.upper() == "ERRORDATE")
+    assert errordate_row.status.value == "PENDING_REVIEW"
+    assert any("exception handler" in e for e in errordate_row.validation_errors)
+    # Must not contain the old fabricated duplicate-condition bug shape.
+    expr_upper = errordate_row.display_derivation_expression.upper()
+    assert expr_upper.count("RUNNINGPROCESSNAME") <= 1
+
+
+def test_auto_parenthesize_null_check_or_fixes_real_br011_defect():
+    """Regression test for a real, confirmed defect: the source's single
+    atomic comparison `NVL(A.FlgProcessing,'N')='N'` was correctly
+    expanded to `ISEMPTY(FlgProcessing) OR FlgProcessing=="N"`, but lost
+    its grouping when combined with a preceding AND, silently changing
+    `A AND (B OR C)` into `(A AND B) OR C`. This must now be auto-
+    corrected deterministically, and the ambiguous-grouping guardrail
+    must go silent on the corrected result."""
+    from app.derivation.dd_generator import _normalize_expression
+    from app.grammar.validator import validate_expression
+    from app.guardrails.semantic_validation import check_ambiguous_boolean_grouping
+
+    buggy = (
+        'IF("CustomerCal_Stg"."REFCUSTOMERID"=="C"."REFCUSTOMERID" AND '
+        'ISEMPTY("CustomerCal_Stg"."FlgProcessing") OR '
+        '"CustomerCal_Stg"."FlgProcessing"=="N")THEN("C"."FinalNpaDt")ELSE(NULL)'
+    )
+    assert check_ambiguous_boolean_grouping(buggy)  # confirm it's really broken to start
+
+    fixed = _normalize_expression(buggy)
+    assert '(ISEMPTY("CustomerCal_Stg"."FlgProcessing") OR "CustomerCal_Stg"."FlgProcessing"=="N")' in fixed
+    assert validate_expression(fixed).valid
+    assert check_ambiguous_boolean_grouping(fixed) == []
+
+
+def test_auto_parenthesize_null_check_or_does_not_touch_mismatched_columns():
+    """Must not wrap an OR just because it sits next to an AND+ISEMPTY --
+    only when the OR's other side actually compares the SAME column the
+    ISEMPTY call checks."""
+    from app.derivation.dd_generator import _normalize_expression
+
+    mismatch = 'IF("A"."X"==1 AND ISEMPTY("A"."Y") OR "A"."Z"=="N")THEN(1)ELSE(0)'
+    assert _normalize_expression(mismatch) == _normalize_expression(mismatch)  # no crash
+    fixed = _normalize_expression(mismatch)
+    assert '(ISEMPTY("A"."Y") OR "A"."Z"=="N")' not in fixed
+
+
+def test_auto_parenthesize_null_check_or_leaves_clean_expressions_untouched():
+    from app.derivation.dd_generator import _normalize_expression
+
+    clean = 'IF(ISNOTEMPTY("A"."X") AND ISNOTEMPTY("A"."Y") AND "A"."Z"=="N")THEN("Y")ELSEIF(ISNOTEMPTY("A"."W"))THEN("Y")ELSE(NULL)'
+    assert _normalize_expression(clean) == clean
+
+
+def test_whole_procedure_variable_trace_finds_select_into_definition(dpd_calculation_sql):
+    """Regression test for a real, high-value gap: v_ProcessDate -- the
+    business date driving nearly every date calculation in
+    PRO_DPD_Calculation_StoredProcedure_2.sql -- is defined via
+    `SELECT "Date" INTO v_ProcessDate FROM SysDayMatrix WHERE ...`, not
+    `:=`. A tracer that only recognizes `:=` would never find it at all."""
+    from app.derivation.dd_generator import _assignment_sites, _whole_procedure_variable_trace
+
+    objects = split_objects(dpd_calculation_sql, "dpd.sql", Dialect.ORACLE)
+    info = analyze_object(objects[0])
+    sites = _assignment_sites(info, "DPD_IntService")
+    assert sites
+
+    traces = []
+    for site in sites:
+        before_index = min(site.statement_indices)
+        traces.extend(_whole_procedure_variable_trace(site.raw_sql, info.statements, before_index))
+
+    assert any("SELECT" in line and "SysDayMatrix" in line for line in traces)
+
+
+def test_whole_procedure_variable_trace_shows_both_mutually_exclusive_definitions(dpd_calculation_sql):
+    """Regression test for a bug caught while building this: naively
+    picking only the definition with the highest statement index hid the
+    real SELECT...INTO definition behind its own
+    `EXCEPTION WHEN NO_DATA_FOUND THEN v_ProcessDate := NULL;` fallback,
+    since the fallback's statement index is numerically later even
+    though the two are mutually exclusive alternate paths, not a
+    sequential overwrite. Both must be shown."""
+    from app.derivation.dd_generator import _assignment_sites, _whole_procedure_variable_trace
+
+    objects = split_objects(dpd_calculation_sql, "dpd.sql", Dialect.ORACLE)
+    info = analyze_object(objects[0])
+    sites = _assignment_sites(info, "DPD_IntService")
+    traces = []
+    for site in sites:
+        before_index = min(site.statement_indices)
+        traces.extend(_whole_procedure_variable_trace(site.raw_sql, info.statements, before_index))
+
+    assert any("SELECT" in line for line in traces)
+    assert any(":= NULL" in line for line in traces)
+
+
+def test_variable_dependency_chain_follows_multi_hop_references():
+    """Synthetic multi-hop chain (A depends on B depends on C), matching
+    the proposal's own example shape (DPD -> Reference Period -> ... ->
+    FinalNpaDt), proving recursion actually follows references rather
+    than stopping at the first hop."""
+    from app.derivation.dd_generator import _trace_variable_dependency_chain
+    from app.models.core import StatementInfo
+
+    statements = [
+        StatementInfo(statement_index=1, statement_type="OTHER", raw_text="v_c := 100;"),
+        StatementInfo(statement_index=2, statement_type="OTHER", raw_text="v_b := v_c + 1;"),
+        StatementInfo(statement_index=3, statement_type="OTHER", raw_text="v_a := v_b * 2;"),
+    ]
+    from app.derivation.dd_generator import _find_variable_definitions
+
+    definitions = _find_variable_definitions(statements)
+    lines = _trace_variable_dependency_chain(["v_a"], definitions, before_index=100)
+
+    assert any("v_a" in line for line in lines)
+    assert any("v_b" in line for line in lines)
+    assert any("v_c" in line for line in lines)
+    # v_a's own line must come before v_b's, which must come before v_c's --
+    # proving this follows the dependency direction correctly.
+    joined = "\n".join(lines)
+    assert joined.index("v_a") < joined.index("v_b") < joined.index("v_c")
+
+
+def test_variable_dependency_chain_terminates_on_cycle():
+    """Two variables that reference each other must not cause infinite
+    recursion -- the visited set must break the cycle."""
+    from app.derivation.dd_generator import _find_variable_definitions, _trace_variable_dependency_chain
+    from app.models.core import StatementInfo
+
+    statements = [
+        StatementInfo(statement_index=1, statement_type="OTHER", raw_text="v_a := v_b + 1;"),
+        StatementInfo(statement_index=2, statement_type="OTHER", raw_text="v_b := v_a + 1;"),
+    ]
+    definitions = _find_variable_definitions(statements)
+    # Must return promptly (no infinite loop) and not raise.
+    lines = _trace_variable_dependency_chain(["v_a"], definitions, before_index=100)
+    assert isinstance(lines, list)

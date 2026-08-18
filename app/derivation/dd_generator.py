@@ -35,6 +35,7 @@ import re
 from datetime import date
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import sqlglot
@@ -143,15 +144,20 @@ def _relevant_sql_excerpt(info: StructuralInfo, column: str) -> str:
     return "\n\n".join(excerpts)
 
 
-def _format_assignment_context(info: StructuralInfo, column: str) -> str:
+def _format_assignment_context(info: StructuralInfo, column: str, sites: list["_AssignmentSite"] | None = None) -> str:
     """Present the relevant write sites in source order with lightweight
     metadata so the LLM can see which assignment is an initial set, a
     later fix-up, or an override branch.
 
     The raw SQL is preserved verbatim under each numbered section; the
     labels simply make the execution order and statement role explicit.
+
+    `sites` can be supplied directly (already computed and possibly
+    filtered by the caller, e.g. with an undeterminable exception-handler
+    site already removed) instead of being recomputed here from `info`.
     """
-    sites = _assignment_sites(info, column)
+    if sites is None:
+        sites = _assignment_sites(info, column)
     if not sites:
         return ""
 
@@ -169,11 +175,18 @@ def _format_assignment_context(info: StructuralInfo, column: str) -> str:
         hints = _assignment_decomposition_hints(raw)
         summary = _assignment_decomposition_summary(raw)
         variable_trace = _extract_variable_trace(raw)
+        before_index = min(site.statement_indices) if site.statement_indices else 2**31
+        whole_procedure_trace = _whole_procedure_variable_trace(raw, getattr(info, "statements", []), before_index)
         sections.append(
             f"[Assignment {idx} | role={role} | kind={site.kind} | statements={stmt_ids} | columns={columns}]\n"
             f"{raw}"
             + (f"\n[Decomposition summary]\n" + "\n".join(f"- {line}" for line in summary) if summary else "")
             + (f"\n[Variable trace]\n" + "\n".join(f"- {line}" for line in variable_trace) if variable_trace else "")
+            + (
+                f"\n[Whole-procedure variable dependency chain]\n" + "\n".join(f"- {line}" for line in whole_procedure_trace)
+                if whole_procedure_trace
+                else ""
+            )
             + (f"\n[Decomposition hints]\n" + "\n".join(f"- {hint}" for hint in hints) if hints else "")
         )
     return "\n\n".join(sections)
@@ -343,6 +356,152 @@ def _extract_variable_trace(raw_sql: str) -> list[str]:
         if re.search(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])", other_text, re.IGNORECASE):
             trace.append(f'{name} := {value.strip()}  (this value is used later in this assignment)')
     return trace
+
+
+_VARIABLE_NAME_TOKEN_RE = re.compile(r"\b([vV]_[A-Za-z0-9_]+)\b")
+_VARIABLE_SELECT_INTO_RE = re.compile(
+    r"SELECT\s+(?P<select_list>.+?)\s+INTO\s+(?P<targets>[vV]_[A-Za-z0-9_]+(?:\s*,\s*[vV]_[A-Za-z0-9_]+)*)\s+FROM\s+(?P<from_clause>.+?)(?:;|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _find_variable_definitions(statements: list["StatementInfo"]) -> list[tuple[int, str, str]]:
+    """Every `v_x := expr;` assignment and every `SELECT ... INTO v_x FROM
+    ...` across ALL statements of the object, as
+    (statement_index, VARIABLE_NAME_UPPER, human-readable definition)
+    triples, in source order.
+
+    Both forms matter: `:=` is the common case already handled by
+    _extract_variable_trace, but a query-driven variable -- assigned via
+    `SELECT col INTO v_x FROM table WHERE ...`, the single most common way
+    a PL/SQL procedure pulls in an external value (a processing date from
+    a calendar table, a reference value from a parameters table, etc.) --
+    is a completely different syntax shape that a `:=`-only scan would
+    never find at all. Confirmed against a real, high-value case: the
+    business date driving nearly every date calculation in
+    PRO_DPD_Calculation_StoredProcedure_2.sql
+    (`SELECT "Date" INTO v_ProcessDate FROM SysDayMatrix WHERE ...`) is
+    defined exactly this way, not with `:=`.
+    """
+    definitions: list[tuple[int, str, str]] = []
+    for stmt in statements:
+        text = stmt.raw_text
+        for match in _VARIABLE_ASSIGNMENT_RE.finditer(text):
+            name, value = match.group(1), match.group(2).strip()
+            if not name.upper().startswith("V_"):
+                continue
+            definitions.append((stmt.statement_index, name.upper(), f"{name} := {value}"))
+        for match in _VARIABLE_SELECT_INTO_RE.finditer(text):
+            select_list = " ".join(match.group("select_list").split())
+            from_clause = " ".join(match.group("from_clause").split())
+            targets = [t.strip() for t in match.group("targets").split(",")]
+            for target in targets:
+                definitions.append(
+                    (
+                        stmt.statement_index,
+                        target.upper(),
+                        f"{target} <- SELECT {select_list} FROM {from_clause}",
+                    )
+                )
+    return definitions
+
+
+def _trace_variable_dependency_chain(
+    variable_names: list[str],
+    definitions: list[tuple[int, str, str]],
+    before_index: int,
+    depth: int = 0,
+    visited: set[str] | None = None,
+    max_depth: int = 5,
+) -> list[str]:
+    """Whole-procedure variable dependency trace: for each name in
+    `variable_names`, find its most recent definition (highest
+    statement_index strictly less than `before_index`, i.e. the
+    definition actually in effect at the point of use, not merely the
+    first one written anywhere in the procedure) among `definitions`,
+    then recurse into whatever OTHER v_-prefixed variables that
+    definition's own text references, up to `max_depth` hops, with a
+    `visited` set to guarantee termination even if two variables happen
+    to reference each other.
+
+    This directly implements the proposal's own example chain shape
+    (`DPD -> Reference Period -> NPA Reference Period -> NEW_FINALNPADT
+    -> FinalNpaDt`) for real PL/SQL local-variable chains, not just a
+    variable defined immediately adjacent to its use -- the whole point
+    of "preserve intermediate calculations" is that a variable defined
+    far earlier in the procedure must still be found.
+    """
+    if visited is None:
+        visited = set()
+    if depth >= max_depth:
+        return []
+
+    lines: list[str] = []
+    for var_name in variable_names:
+        key = var_name.upper()
+        if key in visited:
+            continue
+        visited.add(key)
+
+        candidates = [d for d in definitions if d[1] == key and d[0] < before_index]
+        if not candidates:
+            continue
+
+        # Show every distinct definition that occurs before this point,
+        # not only the textually-last one. A variable is frequently
+        # defined by a "normal path" statement (e.g. a SELECT...INTO)
+        # AND a separate exception-handler fallback for the same
+        # variable (e.g. `v_x := NULL` inside `EXCEPTION WHEN
+        # NO_DATA_FOUND THEN`) -- these are mutually exclusive
+        # alternate paths, not a sequential overwrite, so picking only
+        # the one with the highest statement index would silently hide
+        # whichever one happens to sit later in the text (confirmed
+        # against a real case: v_ProcessDate's real SELECT...INTO
+        # definition was being hidden behind its own
+        # `EXCEPTION WHEN NO_DATA_FOUND THEN v_ProcessDate := NULL;`
+        # fallback purely because the fallback's statement index is
+        # higher). Showing every distinct one is more verbose but never
+        # silently wrong.
+        seen_summaries: set[str] = set()
+        indent = "    " * depth
+        next_round_referenced: set[str] = set()
+        for stmt_index, _name, summary in sorted(candidates, key=lambda d: d[0]):
+            if summary in seen_summaries:
+                continue
+            seen_summaries.add(summary)
+            lines.append(f"{indent}{summary}  (statement #{stmt_index})")
+            next_round_referenced.update(
+                m.group(1)
+                for m in _VARIABLE_NAME_TOKEN_RE.finditer(summary)
+                if m.group(1).upper() != key
+            )
+
+        referenced = sorted(next_round_referenced)
+        if referenced:
+            # Use the latest candidate's statement index as the recursion
+            # boundary, so a variable referenced inside one of these
+            # definitions is still resolved relative to where it's used,
+            # not where the outer variable itself is used.
+            latest_index = max(c[0] for c in candidates)
+            lines.extend(
+                _trace_variable_dependency_chain(
+                    referenced, definitions, latest_index, depth + 1, visited, max_depth
+                )
+            )
+    return lines
+
+
+def _whole_procedure_variable_trace(raw_sql: str, statements: list["StatementInfo"], before_index: int) -> list[str]:
+    """Public entry point used by _format_assignment_context: find every
+    v_-prefixed variable referenced in `raw_sql` and trace each one's
+    full whole-procedure dependency chain."""
+    referenced = sorted({m.group(1) for m in _VARIABLE_NAME_TOKEN_RE.finditer(raw_sql)})
+    if not referenced:
+        return []
+    definitions = _find_variable_definitions(statements)
+    if not definitions:
+        return []
+    return _trace_variable_dependency_chain(referenced, definitions, before_index)
 
 
 def _infer_assignment_role(raw_sql: str) -> str:
@@ -1730,6 +1889,382 @@ def _normalize_sql_style_syntax(expression: str) -> str:
     return normalized
 
 
+_TERNARY_BOUNDARY_KEYWORD_RE = re.compile(r"(THEN|ELSEIF|ELSE|AND|OR)\b", re.IGNORECASE)
+
+
+def _normalize_ternary_operator(expression: str) -> str:
+    """Deterministically rewrite a `(condition) ? true_val : false_val`
+    ternary into the grammar's real `IF(condition)THEN(true_val)ELSE(false_val)`
+    form -- the 4X grammar has no ternary operator at all (confirmed
+    against a real generation defect: a DEGDATE expression produced
+    exactly this shape and was correctly rejected by grammar validation
+    with "No terminal matches '?'").
+
+    This is deliberately conservative and bails out (leaves that part of
+    the text completely unchanged) the moment the surrounding shape isn't
+    unambiguous, rather than guessing:
+      - the condition must be the fully-parenthesized group immediately
+        preceding the `?` (nothing before a `?` that isn't `(...)` is
+        rewritten);
+      - the `:` that separates the two branches must be found at the same
+        paren depth as the `?` (a `:` inside a nested call's own parens is
+        never mistaken for the ternary's own separator);
+      - the false-branch's end must be found as an unambiguous boundary (a
+        depth-0 `)`, `,`, or one of THEN/ELSEIF/ELSE/AND/OR as a whole
+        word) -- if the string ends before any boundary is found, the
+        false-branch extends to end of string.
+    If any of these can't be established, the `?` is left as a literal
+    character, so grammar validation still catches it exactly as it does
+    today. This can only ever turn an already-invalid expression into a
+    valid one; it never touches an expression that doesn't contain a `?`.
+    """
+    result: list[str] = []
+    i = 0
+    n = len(expression)
+    in_double = False
+
+    while i < n:
+        ch = expression[i]
+        if ch == '"':
+            in_double = not in_double
+            result.append(ch)
+            i += 1
+            continue
+        if in_double:
+            result.append(ch)
+            i += 1
+            continue
+
+        if ch == "?":
+            rewritten = _try_rewrite_ternary_at(expression, i, result)
+            if rewritten is not None:
+                new_result_text, next_i = rewritten
+                result = list(new_result_text)
+                i = next_i
+                continue
+
+        result.append(ch)
+        i += 1
+
+    return "".join(result)
+
+
+def _try_rewrite_ternary_at(expression: str, qmark_index: int, result_so_far: list[str]) -> tuple[str, int] | None:
+    # 1) The condition must be the fully-parenthesized group ending right
+    # before '?' (skipping whitespace).
+    j = len(result_so_far) - 1
+    while j >= 0 and result_so_far[j].isspace():
+        j -= 1
+    if j < 0 or result_so_far[j] != ")":
+        return None
+
+    depth = 1
+    k = j - 1
+    local_in_double = False
+    while k >= 0 and depth > 0:
+        c = result_so_far[k]
+        if c == '"':
+            local_in_double = not local_in_double
+        elif not local_in_double:
+            if c == ")":
+                depth += 1
+            elif c == "(":
+                depth -= 1
+        k -= 1
+    if depth != 0:
+        return None
+    cond_start = k + 1
+    condition_text = "".join(result_so_far[cond_start : j + 1])  # includes its own ( )
+    prefix_text = "".join(result_so_far[:cond_start])
+
+    # 2) Find the ':' that separates true/false branches, at depth 0
+    # relative to right after '?'.
+    p = qmark_index + 1
+    n = len(expression)
+    depth2 = 0
+    local_in_double2 = False
+    colon_pos = None
+    while p < n:
+        c = expression[p]
+        if c == '"':
+            local_in_double2 = not local_in_double2
+        elif not local_in_double2:
+            if c == "(":
+                depth2 += 1
+            elif c == ")":
+                if depth2 == 0:
+                    return None  # ran out of the ternary's own scope first
+                depth2 -= 1
+            elif c == ":" and depth2 == 0:
+                colon_pos = p
+                break
+        p += 1
+    if colon_pos is None:
+        return None
+    true_branch = expression[qmark_index + 1 : colon_pos].strip()
+    if not true_branch:
+        return None
+
+    # 3) Find where the false-branch ends: a depth-0 ')', ',', or a
+    # THEN/ELSEIF/ELSE/AND/OR keyword as a whole word.
+    q = colon_pos + 1
+    depth3 = 0
+    local_in_double3 = False
+    false_end = None
+    while q < n:
+        c = expression[q]
+        if c == '"':
+            local_in_double3 = not local_in_double3
+        elif not local_in_double3:
+            if c == "(":
+                depth3 += 1
+            elif c == ")":
+                if depth3 == 0:
+                    false_end = q
+                    break
+                depth3 -= 1
+            elif depth3 == 0 and c == ",":
+                false_end = q
+                break
+            elif depth3 == 0:
+                m = _TERNARY_BOUNDARY_KEYWORD_RE.match(expression, q)
+                if m and (q == 0 or not (expression[q - 1].isalnum() or expression[q - 1] == "_")):
+                    false_end = q
+                    break
+        q += 1
+    if false_end is None:
+        false_end = n
+    false_branch = expression[colon_pos + 1 : false_end].strip()
+    if not false_branch:
+        return None
+
+    rewritten = f"IF{condition_text}THEN({true_branch})ELSE({false_branch})"
+    return prefix_text + rewritten, false_end
+
+
+_boolean_grouping_parser: "object | None" = None
+
+
+def _get_boolean_grouping_parser():
+    """Lazily constructed, dedicated Lark parser instance for
+    _auto_parenthesize_null_check_or_pattern -- needs source-position
+    tracking (propagate_positions) to insert parentheses at the right
+    text offsets, the same reason every other position-dependent parser
+    instance in this codebase (formula_pretty_printer.py,
+    period_pruning.py, semantic_validation.py) keeps its own rather than
+    sharing app.grammar.validator's."""
+    global _boolean_grouping_parser
+    if _boolean_grouping_parser is None:
+        from lark import Lark
+
+        grammar_path = Path(__file__).resolve().parents[1] / "grammar" / "fourx_grammar.lark"
+        _boolean_grouping_parser = Lark(
+            grammar_path.read_text(), parser="earley", start="start", propagate_positions=True
+        )
+    return _boolean_grouping_parser
+
+
+def _unwrap_boolean_node(node):
+    from lark import Tree
+
+    while (
+        isinstance(node, Tree)
+        and node.data not in ("if_expr", "column_ref", "function_call")
+        and len(node.children) == 1
+    ):
+        node = node.children[0]
+    return node
+
+
+def _node_span_text(node, expression: str) -> str | None:
+    from lark import Token, Tree
+
+    if isinstance(node, Token):
+        return str(node)
+    if isinstance(node, Tree) and not node.meta.empty:
+        return " ".join(expression[node.meta.start_pos : node.meta.end_pos].split())
+    return None
+
+
+def _column_ref_key(node, expression: str) -> str | None:
+    """A normalized identity string for a column_ref node (or a function
+    call's single column_ref argument), so two references can be compared
+    for "is this the same column" regardless of exact spacing."""
+    from lark import Tree
+
+    node = _unwrap_boolean_node(node)
+    if isinstance(node, Tree) and node.data == "column_ref":
+        text = _node_span_text(node, expression)
+        return text.upper() if text else None
+    return None
+
+
+def _is_null_check_call(node, expression: str) -> tuple[str, str] | None:
+    """If `node` is a call to ISEMPTY(x) or ISNOTEMPTY(x) with exactly one
+    column_ref argument, return (function_name, column_key); else None."""
+    from lark import Tree
+
+    node = _unwrap_boolean_node(node)
+    if not (isinstance(node, Tree) and node.data == "function_call"):
+        return None
+    children = list(node.children)
+    if len(children) != 2:
+        return None
+    func_name_node, args_node = children
+    func_name = str(func_name_node).upper()
+    if func_name not in ("ISEMPTY", "ISNOTEMPTY"):
+        return None
+    if not (isinstance(args_node, Tree) and args_node.data == "arg_list"):
+        return None
+    if len(args_node.children) != 1:
+        return None
+    column_key = _column_ref_key(args_node.children[0], expression)
+    if column_key is None:
+        return None
+    return func_name, column_key
+
+
+def _is_matching_literal_comparison(node, expression: str, column_key: str) -> bool:
+    """True if `node` is a `compare` node testing the same column
+    (`column_key`) against a literal, in either operand order (e.g.
+    `X=="N"` or `"N"==X`)."""
+    from lark import Tree
+
+    node = _unwrap_boolean_node(node)
+    if not (isinstance(node, Tree) and node.data == "compare"):
+        return False
+    if len(node.children) != 3:
+        return False
+    left, _op, right = node.children
+    left_key = _column_ref_key(left, expression)
+    right_key = _column_ref_key(right, expression)
+    return left_key == column_key or right_key == column_key
+
+
+def _find_null_check_or_spans(node, expression: str, spans: list[tuple[int, int]]) -> None:
+    """Collect (start, end) text spans to wrap in parentheses so that an
+    `ISEMPTY(X)` (or `ISNOTEMPTY(X)`) sitting immediately next to an OR,
+    combined with a comparison of that same X against a literal on the
+    OTHER side of that OR, gets grouped together -- instead of binding to
+    a sibling AND operand first by ordinary precedence.
+
+    Concretely, for `A AND ISEMPTY(X) OR X=="v"`, the grammar parses this
+    (correctly, by standard AND-before-OR precedence) as:
+
+        or_op
+          and_op
+            A
+            ISEMPTY(X)          <- and_op's right child, adjacent to the OR
+          X=="v"                <- or_op's right child
+
+    This is exactly the shape produced when this codebase's own
+    normalization mechanically expands a single source comparison like
+    `NVL(x,'N')='N'` into `ISEMPTY(x) OR x=="N"` and that sits next to a
+    preceding `AND` -- the fix is to wrap only the two adjacent
+    "ISEMPTY(X)" and "X==literal" operands (which are already contiguous
+    in the source text, just not grouped), producing
+    `A AND (ISEMPTY(X) OR X=="v")`, without touching or reordering `A`.
+
+    The mirror shape (`X=="v" OR ISEMPTY(X) AND B`, and_op as or_op's
+    right child, null-check as and_op's LEFT child) is handled the same
+    way. Only these two shapes -- where the null-check operand is
+    textually adjacent to the OR boundary -- are attempted; a null-check
+    on the *non-adjacent* side of the AND would require reordering text,
+    not just adding parentheses around a contiguous span, and is
+    deliberately left to check_ambiguous_boolean_grouping to flag for
+    human review instead of being guessed at here.
+    """
+    from lark import Tree
+
+    if isinstance(node, Tree):
+        if node.data == "or_op" and len(node.children) == 2:
+            for and_side_idx in (0, 1):
+                and_side = node.children[and_side_idx]
+                other_side = node.children[1 - and_side_idx]
+                and_unwrapped = _unwrap_boolean_node(and_side)
+                if not (isinstance(and_unwrapped, Tree) and and_unwrapped.data == "and_op" and len(and_unwrapped.children) == 2):
+                    continue
+                # The null-check must be the AND operand adjacent to the OR
+                # boundary: if and_op is on the LEFT of or_op, that's its
+                # RIGHT child (index 1); if and_op is on the RIGHT of
+                # or_op, that's its LEFT child (index 0).
+                adjacent_idx = 1 if and_side_idx == 0 else 0
+                and_operand = and_unwrapped.children[adjacent_idx]
+                null_check = _is_null_check_call(and_operand, expression)
+                if null_check is None:
+                    continue
+                if not _is_matching_literal_comparison(other_side, expression, null_check[1]):
+                    continue
+                nc_node = _unwrap_boolean_node(and_operand)
+                other_node = _unwrap_boolean_node(other_side)
+                if isinstance(nc_node, Tree) and nc_node.meta.empty:
+                    continue
+                if isinstance(other_node, Tree) and other_node.meta.empty:
+                    continue
+                span_start = min(nc_node.meta.start_pos, other_node.meta.start_pos)
+                span_end = max(nc_node.meta.end_pos, other_node.meta.end_pos)
+                if not _is_span_already_parenthesized_range(span_start, span_end, expression):
+                    spans.append((span_start, span_end))
+        for child in node.children:
+            _find_null_check_or_spans(child, expression, spans)
+
+
+def _is_span_already_parenthesized_range(start: int, end: int, expression: str) -> bool:
+    before = start - 1
+    while before >= 0 and expression[before].isspace():
+        before -= 1
+    after = end
+    while after < len(expression) and expression[after].isspace():
+        after += 1
+    return before >= 0 and expression[before] == "(" and after < len(expression) and expression[after] == ")"
+
+
+def _auto_parenthesize_null_check_or_pattern(expression: str) -> str:
+    """Deterministically wrap `ISEMPTY(x) OR x=="v"` (or ISNOTEMPTY / !=)
+    in parentheses whenever it's an un-parenthesized operand of an AND --
+    confirmed against a real generation defect: the source's single
+    atomic comparison `NVL(A.FlgProcessing,'N')='N'` was correctly
+    expanded to `ISEMPTY(FlgProcessing) OR FlgProcessing=="N"`, but the
+    parentheses that expansion should have kept around the OR pair were
+    lost when it was combined with a preceding `AND`, silently changing
+    `A AND (B OR C)` into `(A AND B) OR C` by grammar precedence -- a
+    change that passes grammar validation (it's syntactically valid) and
+    can only be caught semantically (see
+    app/guardrails/semantic_validation.py::check_ambiguous_boolean_grouping,
+    which still runs after this as a safety net for every OTHER
+    unparenthesized AND/OR shape this function does not attempt to fix).
+    """
+    upper = expression.upper()
+    # Cheap pre-check before paying for a full Earley parse: the pattern
+    # this function looks for can only exist if the expression contains
+    # an ISEMPTY/ISNOTEMPTY call, an OR, and an AND all at once. Skipping
+    # straight past the (comparatively expensive) parse for the large
+    # majority of expressions that obviously can't match keeps this
+    # normalization pass from adding meaningful latency across a whole
+    # job's worth of expressions, most of which have no OR at all.
+    if not (("ISEMPTY(" in upper or "ISNOTEMPTY(" in upper) and " OR " in upper and " AND " in upper):
+        return expression
+
+    try:
+        tree = _get_boolean_grouping_parser().parse(expression)
+    except Exception:
+        return expression
+
+    spans: list[tuple[int, int]] = []
+    try:
+        _find_null_check_or_spans(tree, expression, spans)
+    except Exception:
+        return expression
+
+    if not spans:
+        return expression
+
+    result = expression
+    for start, end in sorted(spans, key=lambda s: s[0], reverse=True):
+        result = result[:start] + "(" + result[start:end] + ")" + result[end:]
+    return result
+
+
 def _normalize_expression(expression: str, source_text: str = "") -> str:
     """Apply every mechanical, input-independent normalization pass, in an
     order chosen so each pass sees syntax the next one expects. Whitespace
@@ -1740,6 +2275,7 @@ def _normalize_expression(expression: str, source_text: str = "") -> str:
     tracking, and finally a trailing-paren-balance check as a last safety
     net after all other rewrites have run."""
     expression = _flatten_whitespace(expression)
+    expression = _normalize_ternary_operator(expression)
     expression = _normalize_sql_style_syntax(expression)
     expression = _normalize_sql_functions(expression)
     expression = _normalize_legacy_if_syntax(expression)
@@ -1760,6 +2296,7 @@ def _normalize_expression(expression: str, source_text: str = "") -> str:
     expression = _rewrite_unquoted_dotted_refs(expression)
     expression = _rewrite_bundled_business_date_var(expression)
     expression = _rewrite_exists_predicates(expression)
+    expression = _auto_parenthesize_null_check_or_pattern(expression)
     expression = _repair_extra_close_before_then(expression)
     expression = _remove_excess_closing_parens(expression)
     expression = _fix_unbalanced_trailing_parens(expression)
@@ -1823,11 +2360,86 @@ def _is_simple_stage_value(expression: str) -> bool:
         return True
     if re.fullmatch(r'"[^"]+"(?:\s*\.\s*"[^"]+")*', text):
         return True
+    # A single-quoted SQL string literal (e.g. 'Y', 'N') -- the value is
+    # converted to the 4X double-quoted form automatically by the
+    # existing _normalize_expression(value, "") call in the composer
+    # loop below, via _normalize_sql_style_syntax. Without this, every
+    # column whose simple stages assign a literal status/flag string
+    # (a very common shape -- COMPLETED='Y'/'N', a status code, etc.)
+    # would bail out of the deterministic composer entirely and fall
+    # through to the LLM for no real reason.
+    if re.fullmatch(r"'[^']*'", text):
+        return True
     if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)*', text):
         return True
     if re.fullmatch(r"\(?\s*[-+]?\d+(?:\.\d+)?\s*\)?", text):
         return True
+    # A value that is itself a complete, independently grammar-valid
+    # IF(...)THEN(...)ELSE(...) expression -- the shape
+    # _translate_case_to_4x below produces when a SQL CASE expression's
+    # own WHEN/THEN/ELSE branches are all simple. This is checked last
+    # (grammar validation is comparatively expensive) and only even
+    # considered for text that already looks like a formula, not for
+    # arbitrary SQL fragments that happen to start with "IF(".
+    if text.upper().startswith("IF(") and validate_expression(text).valid:
+        return True
     return False
+
+
+def _translate_case_to_4x(case_node) -> str | None:
+    """Deterministically translate a SQL `CASE WHEN cond1 THEN val1 WHEN
+    cond2 THEN val2 ELSE val3 END` expression into the platform's real
+    `IF(cond1)THEN(val1)ELSEIF(cond2)THEN(val2)ELSE(val3)` syntax.
+
+    This is a mechanical, structure-preserving syntax translation -- the
+    same category of fix as _normalize_ternary_operator for the `? :`
+    ternary -- not a business-logic decision: SQL's CASE WHEN and the 4X
+    grammar's IF/ELSEIF/ELSE have a direct one-to-one correspondence
+    (branch order preserved, same number of branches, same fallback),
+    so translating it here means this shape of column never needs the
+    LLM to reproduce a conditional structure it already has right in
+    front of it, which is exactly where a plausible-looking-but-wrong
+    rewrite (like the ternary defect) could otherwise slip in.
+
+    Returns None (falls back to the LLM path, same as any other
+    "too complex for the deterministic composer" case) unless every
+    branch's condition and value is itself simple enough to compose
+    safely, and the fully-assembled result is independently grammar-
+    valid -- this never guesses at a shape it isn't certain about.
+    """
+    ifs = case_node.args.get("ifs") or []
+    if not ifs:
+        return None
+
+    branches: list[tuple[str, str]] = []
+    for when in ifs:
+        condition_node = when.args.get("this")
+        value_node = when.args.get("true")
+        if condition_node is None or value_node is None:
+            return None
+        condition_sql = condition_node.sql(dialect="oracle")
+        value_sql = value_node.sql(dialect="oracle")
+        normalized_value = _normalize_expression(value_sql, "")
+        if not _is_simple_stage_value(normalized_value):
+            return None
+        branches.append((condition_sql, normalized_value))
+
+    default_node = case_node.args.get("default")
+    if default_node is not None:
+        default_sql = _normalize_expression(default_node.sql(dialect="oracle"), "")
+        if not _is_simple_stage_value(default_sql):
+            return None
+    else:
+        default_sql = "NULL"
+
+    first_cond, first_val = branches[0]
+    parts = [f"IF({_normalize_expression(first_cond, '')})THEN({first_val})"]
+    for cond, val in branches[1:]:
+        parts.append(f"ELSEIF({_normalize_expression(cond, '')})THEN({val})")
+    parts.append(f"ELSE({default_sql})")
+
+    result = "".join(parts)
+    return result if validate_expression(result).valid else None
 
 
 def _strip_leading_comments(text: str) -> str:
@@ -1886,6 +2498,11 @@ def _parse_simple_assignment_stage(raw_sql: str, target_column: str) -> tuple[st
                 continue
             if assignment.this.name.upper() != target_upper:
                 continue
+            if isinstance(assignment.expression, exp.Case):
+                case_translation = _translate_case_to_4x(assignment.expression)
+                if case_translation is None:
+                    return None
+                return guard, case_translation, assignment.this.name
             value = assignment.expression.sql(dialect="oracle")
             if not _is_simple_stage_value(value):
                 return None
@@ -1915,9 +2532,15 @@ def _parse_simple_assignment_stage(raw_sql: str, target_column: str) -> tuple[st
                     continue
                 if assignment.this.name.upper() != target_upper:
                     continue
-                value = assignment.expression.sql(dialect="oracle")
-                if not _is_simple_stage_value(value):
-                    return None
+                if isinstance(assignment.expression, exp.Case):
+                    case_translation = _translate_case_to_4x(assignment.expression)
+                    if case_translation is None:
+                        return None
+                    value = case_translation
+                else:
+                    value = assignment.expression.sql(dialect="oracle")
+                    if not _is_simple_stage_value(value):
+                        return None
                 if when_cond is not None:
                     guard_parts.append(when_cond.sql(dialect="oracle"))
                 guard = " AND ".join(f"({part})" for part in guard_parts if part)
@@ -1925,6 +2548,102 @@ def _parse_simple_assignment_stage(raw_sql: str, target_column: str) -> tuple[st
         return None
 
     return None
+
+
+def _strip_sql_comments_for_guard_matching(text: str) -> str:
+    """Strip `--` line comments and `/* */` block comments (quote-aware),
+    so a WHERE-clause search below can never be hijacked by a comment
+    that happens to contain the word "where" in its own free text (a
+    real, confirmed failure mode: a comment like
+    `--Update X set Y=Z where BandName='...'` sits directly above the
+    real UPDATE statement in one of the sample procedures, and an earlier
+    version of this function matched the comment's "where" instead of the
+    actual WHERE clause several lines later, producing a guard that could
+    never match anything)."""
+    result: list[str] = []
+    i = 0
+    n = len(text)
+    in_single = False
+    while i < n:
+        ch = text[i]
+        if in_single:
+            result.append(ch)
+            if ch == "'" and not (i + 1 < n and text[i + 1] == "'"):
+                in_single = False
+            i += 1
+            continue
+        if ch == "'":
+            in_single = True
+            result.append(ch)
+            i += 1
+            continue
+        if ch == "-" and i + 1 < n and text[i + 1] == "-":
+            nl = text.find("\n", i)
+            i = n if nl == -1 else nl
+            continue
+        if ch == "/" and i + 1 < n and text[i + 1] == "*":
+            end = text.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            continue
+        result.append(ch)
+        i += 1
+    return "".join(result)
+
+
+_WHERE_CLAUSE_GUARD_RE = re.compile(r"(?is)\bWHERE\b(.+?)(?:;|$)")
+
+
+def _extract_where_guard_text(raw_sql: str) -> str | None:
+    """The row-scoping WHERE clause text of a statement, whitespace/case
+    normalized for exact comparison -- or None if the statement has none.
+    Deliberately simple (a single regex, not a full parse): this is only
+    ever used to compare two guards for exact textual equality, not to
+    understand the guard's own structure. Comments are stripped first so
+    a comment's own free text can never be mistaken for a real WHERE
+    clause."""
+    match = _WHERE_CLAUSE_GUARD_RE.search(_strip_sql_comments_for_guard_matching(raw_sql))
+    if not match:
+        return None
+    normalized = " ".join(match.group(1).split()).upper().rstrip(")")
+    return normalized or None
+
+
+def undeterminable_exception_sites(sites: list["_AssignmentSite"]) -> list["_AssignmentSite"]:
+    """Identify EXCEPTION_HANDLER write sites whose only apparent guard is
+    textually identical (once normalized) to a guard some non-exception
+    site for the same column also uses.
+
+    This is the structural signature of a column that cannot honestly be
+    derived as a per-row Formula Expression at all: "an unhandled
+    exception occurred" is a runtime execution event, not a fact present
+    in row data, so it has no real data-driven guard of its own. When the
+    exception-handler statement's only extracted condition is literally
+    the same row-scoping filter the normal-flow statement also uses (for
+    example both restricted to `WHERE RUNNINGPROCESSNAME = 'X'`, since
+    they write the same process's status row), that WHERE clause isn't
+    actually distinguishing the exception case -- it just happens to be
+    present on both statements for an unrelated reason (scoping to one
+    process's row in a table several different procedures share).
+
+    Confirmed against a real generation defect this way: both the LLM
+    path and the deterministic composer independently produced the exact
+    same wrong expression for a column shaped like this (ERRORDATE in
+    ACLRUNNINGPROCESSSTATUS) -- because both derive their "exception
+    occurred" guard from the same coincidentally-identical WHERE text,
+    there is no guard for either path to discover here; the fix has to
+    be structural exclusion, not a smarter guard.
+    """
+    exception_sites = [s for s in sites if _infer_assignment_role(s.raw_sql) == "EXCEPTION_HANDLER"]
+    if not exception_sites:
+        return []
+    other_guards = {
+        g
+        for g in (_extract_where_guard_text(s.raw_sql) for s in sites if _infer_assignment_role(s.raw_sql) != "EXCEPTION_HANDLER")
+        if g
+    }
+    if not other_guards:
+        return []
+    return [s for s in exception_sites if _extract_where_guard_text(s.raw_sql) in other_guards]
 
 
 def _compose_simple_assignment_expression(
@@ -2158,11 +2877,40 @@ def _generate_for_column(
     rag_store: Optional[ChromaStore] = None,
 ) -> list[DDRow]:
     relevant_chunks = _relevant_chunks(info, column)
+    all_sites = _assignment_sites(info, column)
+    excluded_sites = undeterminable_exception_sites(all_sites)
+    excluded_stmt_indices: set[int] = set()
+    for site in excluded_sites:
+        excluded_stmt_indices.update(site.statement_indices)
+
+    sites = [s for s in all_sites if s not in excluded_sites]
+    if excluded_stmt_indices:
+        relevant_chunks = [
+            chunk
+            for chunk in relevant_chunks
+            if not (
+                chunk.statement_indices
+                and set(chunk.statement_indices).issubset(excluded_stmt_indices)
+            )
+        ]
+
     relevant_sql = "\n\n".join(chunk.raw_sql.strip() for chunk in relevant_chunks if chunk.raw_sql.strip())
-    assignment_context = _format_assignment_context(info, column)
+    assignment_context = _format_assignment_context(info, column, sites=sites)
     source_statement_refs = _build_source_statement_refs(obj, info, column)
     rag_context = _retrieve_rag_context(
         rag_store, relevant_sql, canonical_model.technical_summary, canonical_model.business_summary
+    )
+    undeterminable_note = (
+        "This column is also written inside an exception handler whose only apparent "
+        "trigger condition is the same row-scoping filter the normal-flow write also "
+        "uses -- \"an unhandled exception occurred\" is a runtime event, not a fact "
+        "present in row data, so it cannot be reliably expressed as a per-row Formula "
+        "Expression condition. The exception-handler write has been excluded from this "
+        "derivation; only the normal-flow value is represented below. Confirm with the "
+        "platform whether this column needs a different mechanism (e.g. a batch-run "
+        "audit log) to capture the exception state, rather than a DD Formula Expression."
+        if excluded_sites
+        else None
     )
 
     derivation_option = DerivationOption.FORMULA_EXPRESSION
@@ -2173,7 +2921,7 @@ def _generate_for_column(
     if assignment_context:
         source_sql_excerpt = assignment_context
 
-    deterministic_expression = _compose_simple_assignment_expression(_assignment_sites(info, column), entity_name, column)
+    deterministic_expression = _compose_simple_assignment_expression(sites, entity_name, column)
     if deterministic_expression:
         grammar_result = validate_expression(deterministic_expression)
         semantic_result = check_semantic_consistency(
@@ -2259,6 +3007,10 @@ def _generate_for_column(
 
     confidence = info.confidence if not validation_errors else min(info.confidence, 0.3)
     status = DDStatus.PENDING_REVIEW if validation_errors else DDStatus.ACTIVE
+    if undeterminable_note:
+        status = DDStatus.PENDING_REVIEW
+        confidence = min(confidence, 0.5)
+        validation_errors = [*validation_errors, undeterminable_note]
 
     periods = effective_periods_for_column(info.version_thresholds, timekey_map)
     if not periods:

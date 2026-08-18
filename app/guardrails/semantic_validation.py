@@ -18,10 +18,6 @@ specific to any one procedure or column):
 - dropped row-scoping WHERE guard: if the column is assigned via a plain
   UPDATE whose WHERE clause scopes it to specific rows (not the target
   column's own value), the expression must show some trace of that too.
-- redundant nested condition: a condition must never be tested again,
-  unchanged, inside a branch where its truth value has already been
-  established by an enclosing IF/ELSEIF/ELSE in the same chain -- see
-  check_redundant_nested_condition for why this exists.
 """
 from __future__ import annotations
 
@@ -589,6 +585,63 @@ def check_dropped_override_conditions(
     return errors
 
 
+_AGGREGATE_FUNCTION_CHECK_RE = re.compile(r"\b(MIN|MAX|SUM|COUNT|AVG|LISTAGG)\s*\(", re.IGNORECASE)
+_GROUP_BY_CHECK_RE = re.compile(r"\bGROUP\s+BY\b", re.IGNORECASE)
+_TABLE_QUALIFIED_REF_RE = re.compile(r'"([^"]+)"\s*\.\s*"([^"]+)"')
+
+
+def check_dropped_aggregation(expression: str, relevant_chunks: list[SmartChunk], entity_name: str) -> list[str]:
+    """If any relevant source statement computes its value via a cross-row
+    aggregate (MIN/MAX/SUM/COUNT/AVG/LISTAGG combined with GROUP BY --
+    e.g. "the highest DPD across several DPD-type columns for one
+    account" or "the earliest NPA date across all of a customer's
+    accounts"), the generated expression must show real evidence that it
+    deferred to that pre-computed cross-row result rather than silently
+    dropping the aggregation and inventing unrelated row-level logic.
+
+    A per-row Formula Expression is fundamentally incapable of computing
+    a GROUP BY itself -- there is no way to look across other rows from
+    inside a single row's own formula -- so the only honest way to
+    represent a column driven by a cross-row aggregate is to reference
+    the joined/merged source that already computed it (a table-qualified
+    reference to some table OTHER than the column's own entity_name).
+    An expression that only references entity_name's own columns (or
+    nothing at all) cannot possibly reflect the aggregate correctly; that
+    is not a stylistic judgment; it's a fact about what a per-row formula
+    can and cannot express.
+
+    Deliberately conservative: this only fires when a genuine aggregate +
+    GROUP BY was found in the relevant source AND the expression shows no
+    table-qualified reference to any table other than entity_name at all
+    -- it does not try to verify the aggregate was represented *correctly*,
+    only that it was not obviously and entirely dropped.
+    """
+    has_aggregate = any(
+        _AGGREGATE_FUNCTION_CHECK_RE.search(chunk.raw_sql) and _GROUP_BY_CHECK_RE.search(chunk.raw_sql)
+        for chunk in relevant_chunks
+    )
+    if not has_aggregate:
+        return []
+
+    entity_upper = entity_name.strip().upper()
+    other_table_refs = {
+        table.upper()
+        for table, _column in _TABLE_QUALIFIED_REF_RE.findall(expression)
+        if table.upper() != entity_upper and table.upper() != "VAR"
+    }
+    if other_table_refs:
+        return []
+
+    return [
+        "Expression does not reference any joined/merged source table, but the "
+        "source SQL for this column computes its value via a cross-row aggregate "
+        "(MIN/MAX/SUM/COUNT/AVG/LISTAGG grouped by another column). A per-row "
+        "Formula Expression cannot perform a GROUP BY itself -- it must reference "
+        "the table that already computed the aggregated result instead of "
+        "re-deriving it from this row's own columns alone."
+    ]
+
+
 _semantic_tree_parser: Lark | None = None
 
 
@@ -716,12 +769,118 @@ def check_redundant_nested_condition(expression: str) -> list[str]:
     -- grammar validation is what rejects an unparseable expression; this
     check only adds an additional, independent signal on top of an
     expression that already parses."""
+    # Cheap pre-check before paying for a full Earley parse: a duplicate
+    # condition across an enclosing IF/ELSEIF/ELSE chain can only exist if
+    # there is more than one IF-shaped keyword in the expression at all
+    # (the root IF plus at least one ELSEIF or nested IF). Skipping the
+    # parse for the common case of a single IF/THEN/ELSE with no nesting
+    # keeps this check from adding meaningful latency across a whole
+    # job's worth of expressions.
+    if expression.upper().count("IF(") <= 1:
+        return []
     try:
         tree = _get_semantic_tree_parser().parse(expression)
     except Exception:
         return []
     try:
         return _walk_for_redundant_conditions(tree, expression, [])
+    except Exception:
+        return []
+
+
+def _is_explicitly_parenthesized(node, expression: str) -> bool:
+    """True if `node`'s own span in `expression` is immediately wrapped in
+    a literal '(' ... ')' pair (skipping only whitespace) -- i.e. the
+    grouping was written explicitly by whoever produced the expression,
+    not merely implied by grammar precedence. The grammar's `"(" expr ")"`
+    alternative doesn't produce a distinguishable node in the parse tree
+    (the parens are literal terminals, not captured), so this has to be
+    checked against the original text directly."""
+    if isinstance(node, Token) or node.meta.empty:
+        return False
+    start, end = node.meta.start_pos, node.meta.end_pos
+
+    before = start - 1
+    while before >= 0 and expression[before].isspace():
+        before -= 1
+    if before < 0 or expression[before] != "(":
+        return False
+
+    after = end
+    while after < len(expression) and expression[after].isspace():
+        after += 1
+    if after >= len(expression) or expression[after] != ")":
+        return False
+
+    return True
+
+
+def _walk_for_ambiguous_boolean_grouping(node, expression: str) -> list[str]:
+    """Find every `or_op` (an OR combining two conditions) where either
+    side is itself an `and_op` (an AND combining two conditions) that was
+    NOT explicitly parenthesized in the original text.
+
+    The grammar resolves `A AND B OR C` unambiguously as `(A AND B) OR C`
+    -- AND binds tighter than OR, standard precedence, so this is never a
+    *parsing* ambiguity. The real risk is translation fidelity: this is
+    exactly the shape produced when an LLM expands a single source
+    comparison like `NVL(col,'N')='N'` into the equivalent
+    `ISEMPTY(col) OR col=='N'` and then combines that with a preceding
+    `AND` from the surrounding condition, without preserving the implicit
+    grouping the single source comparison had -- confirmed against a real
+    generation defect this way: the source's own
+    `A.REFCUSTOMERID=C.REFCUSTOMERID AND NVL(A.FlgProcessing,'N')='N'`
+    became `REFCUSTOMERID==C.REFCUSTOMERID AND ISEMPTY(FlgProcessing) OR
+    FlgProcessing=="N"` with no parens around the OR pair, silently
+    changing `A AND (B OR C)` into `(A AND B) OR C`.
+
+    This flags the shape, not a specific bug -- an expression that
+    genuinely means `(A AND B) OR C` and was written that way on purpose
+    should just add the parens explicitly; this check costs nothing on a
+    correct expression beyond asking for that.
+    """
+    errors: list[str] = []
+    if isinstance(node, Tree):
+        if node.data == "or_op":
+            for side in node.children:
+                unwrapped = _unwrap_to_if_expr_or_column_ref(side)
+                if (
+                    isinstance(unwrapped, Tree)
+                    and unwrapped.data == "and_op"
+                    and not _is_explicitly_parenthesized(unwrapped, expression)
+                ):
+                    errors.append(
+                        "Semantic validation: "
+                        f'"{_condition_span_text(unwrapped, expression)}" is combined with OR '
+                        "immediately next to it, without parentheses around the AND -- "
+                        "by grammar precedence this reads as (A AND B) OR C, not A AND (B OR C). "
+                        "If this came from expanding a single source comparison (e.g. "
+                        "NVL(x,'N')='N' -> ISEMPTY(x) OR x==\"N\") that was itself combined with "
+                        "a preceding/following AND, the OR pair must be wrapped in its own "
+                        "parentheses to preserve the source's actual grouping."
+                    )
+        for child in node.children:
+            errors.extend(_walk_for_ambiguous_boolean_grouping(child, expression))
+    return errors
+
+
+def check_ambiguous_boolean_grouping(expression: str) -> list[str]:
+    """See _walk_for_ambiguous_boolean_grouping for the full rationale.
+    Returns an empty list (never raises) if the expression doesn't parse
+    -- grammar validation is what rejects an unparseable expression; this
+    check only adds an additional, independent signal on top of an
+    expression that already parses."""
+    upper = expression.upper()
+    # Cheap pre-check before paying for a full Earley parse: this check
+    # can only ever fire when both AND and OR appear in the expression.
+    if " AND " not in upper or " OR " not in upper:
+        return []
+    try:
+        tree = _get_semantic_tree_parser().parse(expression)
+    except Exception:
+        return []
+    try:
+        return _walk_for_ambiguous_boolean_grouping(tree, expression)
     except Exception:
         return []
 
@@ -745,6 +904,8 @@ def check_semantic_consistency(
     errors.extend(_check_constant_conditions(expression))
     errors.extend(_check_identical_simple_branches(expression))
     errors.extend(check_dropped_override_conditions(expression, relevant_chunks, column))
+    errors.extend(check_dropped_aggregation(expression, relevant_chunks, entity_name))
     errors.extend(check_redundant_nested_condition(expression))
+    errors.extend(check_ambiguous_boolean_grouping(expression))
 
     return GuardrailResult(passed=not errors, errors=errors)
