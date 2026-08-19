@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import streamlit as st
 
 from app.review import review_store
-from app.report.excel_export import export_reviewed_dd_rows_for_job_csv
+from app.report.dd_export import export_reviewed_dd_rows_for_job_csv
 from app.utils import db
 from app.utils.config import settings
 

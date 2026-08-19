@@ -145,12 +145,6 @@ def _is_literal_like_quoted_value(candidate: str) -> bool:
         return True
     if _NUMBER_RE.fullmatch(token):
         return True
-    # Short all-caps codes are overwhelmingly used as literal values in
-    # the DD formulas we validate here (e.g. Y/N/ODA/STD). Longer mixed-
-    # case or underscore-bearing names are much more likely to be actual
-    # source fields, so we leave those alone.
-    if token.upper() == token and token.isalpha() and len(token) <= 4:
-        return True
     return False
 
 
@@ -304,15 +298,16 @@ def check_invented_references(expression: str, source_text: str, entity_name: st
         if not _looks_like_identifier_reference(candidate):
             continue
         tail = expression[match.end() :].lstrip()
-        if tail.startswith("."):
-            # Namespace/table aliases in expressions are often mapped
-            # targets rather than literal source identifiers, so only the
-            # final path segment is checked against the source text.
-            continue
         candidate_upper = candidate.upper()
         if candidate_upper in _KEYWORD_STOPWORDS or candidate_upper in _KNOWN_4X_SYMBOLS:
             continue
         if entity_upper and candidate_upper == entity_upper:
+            continue
+        if tail.startswith(".") and candidate_upper not in source_tokens:
+            errors.append(
+                f'Expression references "{candidate}", which does not appear '
+                "anywhere in the source SQL for this column."
+            )
             continue
         if candidate_upper not in source_tokens:
             errors.append(

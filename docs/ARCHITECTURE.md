@@ -20,7 +20,7 @@ doc is a terse code-to-concept index, not a repeat of that discussion.
 | AI Output Guardrails | `app/guardrails/output_guardrails.py` | Grammar validity + evidence/hallucination check |
 | Human Review | `app/review/review_store.py`, `app/review/streamlit_app.py` | SQLite-backed queue |
 | Report Generator | `app/report/report_generator.py` | One combined doc, DD section only if generation ran |
-| DD Excel Export | `app/report/excel_export.py` | Matches the platform's real Derivations schema exactly |
+| DD CSV Export | `app/report/dd_export.py` | Matches the platform's real Derivations schema exactly |
 | Persistence / Audit | `app/utils/db.py` | Jobs, DD rows, review decisions, audit log |
 | Orchestration | `app/orchestration/pipeline.py` | LangGraph `StateGraph`, conditional DD-generation routing |
 
@@ -33,7 +33,7 @@ SQLObject (per split unit)
         -> CanonicalModel (per chain: technical + business summary)
            -> DDRow[] (per chain: one or more rows per written column,
                         split by Effective Start Date when versioned)
-              -> DD Excel + Combined Report
+              -> DD CSV + Combined Report
 ```
 
 ## Where the real engineering risk still lives

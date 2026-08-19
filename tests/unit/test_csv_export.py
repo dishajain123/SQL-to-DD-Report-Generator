@@ -2,7 +2,7 @@ from datetime import date
 import csv
 
 from app.models.core import ColumnType, DDRow, DDStatus, DerivationOption
-from app.report.excel_export import COLUMNS, export_dd_rows, read_existing_dd_excel
+from app.report.dd_export import COLUMNS, export_dd_rows, read_existing_dd_excel
 
 
 def _sample_row(**overrides) -> DDRow:

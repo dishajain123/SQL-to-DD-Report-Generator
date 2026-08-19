@@ -1,15 +1,15 @@
 # DD Automation
 
 Turns Oracle/MySQL stored procedures into a Derivation Dictionary (DD): a
-technical + business report, and (optionally) a DD Excel export matching a
+technical + business report, and (optionally) a DD CSV export matching the
 banking platform's own Derivations schema. Built around a LangGraph
 pipeline: parse SQL -> build cross-procedure lineage -> understand what the
 logic does -> translate it into the platform's Formula Expression grammar
--> validate -> human review/edit -> report + Excel.
+-> validate -> human review/edit -> report + CSV.
 
 ## What's real vs. what needs an API key
 
-Parsing, lineage graph construction, grammar validation, guardrails, Excel
+Parsing, lineage graph construction, grammar validation, guardrails, CSV
 export, report generation, persistence, and the review UI are deterministic
 code — no LLM involved, fully covered by tests, nothing to configure.
 
@@ -80,16 +80,16 @@ source .venv/bin/activate
 ```
 
 The review tab lets you inspect the generated DD rows, edit flagged
-findings, and re-download the latest reviewed Excel export.
+findings, and re-download the latest reviewed CSV export.
 
 ## Output Flow
 
 The app now follows this sequence:
 
 1. Generate the DD report for the job.
-2. Generate the DD Excel export.
+2. Generate the DD CSV export.
 3. Let a user review and edit the DD findings in the Human Review tab.
-4. Re-download the reviewed Excel so the final workbook reflects the
+4. Re-download the reviewed CSV so the final export reflects the
    latest human-reviewed values.
 
 The report itself is presentation-focused and does not include internal
@@ -169,7 +169,7 @@ All configuration is environment variables (loaded from `.env` via
 | `LLM_BASE_URL` | provider-specific | Override for the provider's chat-completions endpoint. |
 | `CHROMA_PERSIST_DIR` | `.chroma` | Where the RAG vector store persists to disk. |
 | `SQLITE_DB_PATH` | `dd_automation.db` | Job history / DD rows / review decisions / audit log. |
-| `OUTPUT_DIR` | `output` | Where reports and DD Excel exports are written. |
+| `OUTPUT_DIR` | `output` | Where reports and DD CSV exports are written. |
 | `STRUCTURAL_CONFIDENCE_THRESHOLD` | `0.5` | Below this, Structural Guardrails fail an object. |
 | `OUTPUT_GUARDRAIL_CONFIDENCE_THRESHOLD` | `0.7` | Below this, a DD row is flagged for review. |
 
@@ -250,13 +250,13 @@ result = pipeline.invoke({
 })
 print('DD rows generated:', len(result['dd_rows']))
 print('Report:', result['report_path'])
-print('Excel:', result.get('excel_path'))
+print('CSV export:', result.get('excel_path'))
 "
 ```
 
 This correctly reconstructs the real dependency chain across the three
 sample procs (`DPD_Calculation` -> `MaxDPD_ReferencePeriod_Calculation` ->
-`NPA_Date_Calculation`), generates DD rows, and writes a report + Excel file
+`NPA_Date_Calculation`), generates DD rows, and writes a report + CSV file
 to `output/sample-job-1/`.
 
 To run it for real (actual LLM calls instead of the mock), set
@@ -322,7 +322,7 @@ app/
   guardrails/              Input / structural / output validation
   rag/                     Chroma-backed RAG for domain + platform knowledge
   review/                  Review queue + Streamlit UI
-  report/                  Combined report + DD Excel export
+  report/                  Combined report + DD CSV export
   orchestration/pipeline.py  LangGraph wiring of the whole pipeline
   api/                     FastAPI routes/schemas
   utils/                   Config, logging, SQLite persistence
@@ -368,8 +368,8 @@ tests/
 ## Preserving existing DD data across re-runs
 
 Re-running the pipeline (e.g. after one proc changes) does not wipe out a
-previously-generated DD Excel. Pass `existing_dd_path` to `export_dd_rows`
-(or set `existing_dd_excel_path` in the pipeline state) and rows are merged
+previously-generated DD CSV. Pass `existing_dd_path` to `export_dd_rows`
+(or set `existing_dd_csv_path` in the pipeline state) and rows are merged
 by `(Entity Name, Column Name, Effective Start Date)`: new rows replace a
 matching existing row, everything else is preserved untouched. See
-`app/report/excel_export.py::merge_dd_rows`.
+`app/report/dd_export.py::merge_dd_rows`.

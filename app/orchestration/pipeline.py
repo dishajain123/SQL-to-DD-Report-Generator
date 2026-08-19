@@ -20,7 +20,7 @@ from app.parsing.dialect import detect_dialect
 from app.parsing.object_splitter import split_objects
 from app.parsing.structural_analysis import analyze_object
 from app.rag.chroma_store import ChromaStore
-from app.report.excel_export import export_dd_rows_csv
+from app.report.dd_export import export_dd_rows_csv
 from app.report.report_generator import generate_report
 from app.utils import db
 from app.utils.config import settings

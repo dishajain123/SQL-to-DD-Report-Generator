@@ -11,7 +11,7 @@ from app.api.schemas import JobSubmitRequest, JobSubmitResponse
 from app.guardrails.input_guardrails import check_input_file, check_job_plan
 from app.models.core import JobPlan
 from app.orchestration.pipeline import build_pipeline
-from app.report.excel_export import export_reviewed_dd_rows_for_job_csv
+from app.report.dd_export import export_reviewed_dd_rows_for_job_csv
 from app.utils import db
 
 router = APIRouter()

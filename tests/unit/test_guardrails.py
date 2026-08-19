@@ -134,6 +134,29 @@ def test_semantic_guardrail_allows_field_vs_literal_comparisons():
     assert result.passed
 
 
+def test_semantic_guardrail_allows_field_to_field_comparison_with_joined_source():
+    result = check_semantic_consistency(
+        'IF("A"."X"=="B"."Y")THEN(1)ELSE(0)',
+        column="Z",
+        entity_name="A",
+        relevant_chunks=[],
+        source_sql="SELECT A.X, B.Y FROM A JOIN B ON A.ID = B.ID",
+    )
+    assert result.passed
+
+
+def test_semantic_guardrail_flags_invented_qualified_namespace():
+    result = check_semantic_consistency(
+        'IF("A"."X"=="B"."Y")THEN(1)ELSE(0)',
+        column="Z",
+        entity_name="A",
+        relevant_chunks=[],
+        source_sql="SELECT A.X FROM A",
+    )
+    assert not result.passed
+    assert any('"B"' in e or '"B' in e for e in result.errors)
+
+
 def test_semantic_guardrail_ignores_nested_where_inside_exists():
     result = check_semantic_consistency(
         'IF("A"."INITIALNPADT"==1)THEN(0)ELSE(1)',

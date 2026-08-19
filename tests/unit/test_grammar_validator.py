@@ -116,6 +116,15 @@ def test_valid_mixed_qualified_identifier_segments():
     assert validate_expression(expr).valid
 
 
+def test_valid_complex_nested_boolean_and_function_expression():
+    expr = (
+        'IF((ISNOTEMPTY("A"."X") AND ("A"."Y" BETWEEN [1,30] OR ISEMPTY("B"."Z"))) '
+        'OR ("A"."Q"+1)>2)THEN(CONCAT("A"."X","B"."Y"))ELSE('
+        'IF("A"."FLAG"=="Y")THEN("YES")ELSE("NO"))'
+    )
+    assert validate_expression(expr).valid
+
+
 def test_rejects_truncated_mixed_qualified_identifier_expression():
     result = validate_expression(
         'IF(("AccountCal_Stg".FINALASSETCLASSALT_KEY > 1 OR )THEN("YES")ELSE("NO")'
