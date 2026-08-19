@@ -11,10 +11,12 @@ import uuid
 
 from app.models.core import Dialect, ObjectType, SQLObject
 
+_OBJECT_NAME_RE = r'(?:"[^"]+"|\[[^\]]+\]|[A-Za-z0-9_]+)'
+_QUALIFIED_OBJECT_NAME_RE = rf"{_OBJECT_NAME_RE}(?:\s*\.\s*{_OBJECT_NAME_RE})*"
 _OBJECT_START_RE = re.compile(
-    r"CREATE\s+(?:OR\s+REPLACE\s+)?"
+    r"CREATE\s+(?:OR\s+(?:REPLACE|ALTER)\s+)?"
     r"(PROCEDURE|FUNCTION|TRIGGER|VIEW)\s+"
-    r'([A-Za-z0-9_."]+)',
+    rf"({_QUALIFIED_OBJECT_NAME_RE})",
     re.IGNORECASE,
 )
 
@@ -46,7 +48,7 @@ def split_objects(sql_text: str, source_file: str, dialect: Dialect) -> list[SQL
         body = sql_text[start:end].strip()
 
         obj_type_raw = match.group(1).upper()
-        name_raw = match.group(2).strip('"')
+        name_raw = _normalize_object_name(match.group(2))
         # Strip schema qualifier (PRO.DPD_Calculation -> DPD_Calculation) but
         # keep the full qualified name available in raw_sql for traceability.
         name = name_raw.split(".")[-1]
@@ -68,3 +70,13 @@ def _derive_name(source_file: str) -> str:
     base = source_file.rsplit("/", 1)[-1]
     base = re.sub(r"\.sql$", "", base, flags=re.IGNORECASE)
     return base
+
+
+def _normalize_object_name(name: str) -> str:
+    parts = []
+    for part in re.split(r"\s*\.\s*", name.strip()):
+        part = part.strip().strip('"')
+        if part.startswith("[") and part.endswith("]"):
+            part = part[1:-1]
+        parts.append(part)
+    return ".".join(parts)

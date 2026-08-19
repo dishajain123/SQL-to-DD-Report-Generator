@@ -1,4 +1,4 @@
-"""Detects whether a SQL object is Oracle or MySQL flavoured.
+"""Detects whether a SQL object is Oracle, MySQL, or SQL Server flavoured.
 
 Uses simple, explainable signal-counting rather than a black box classifier —
 each dialect has syntax markers that essentially never appear in the other.
@@ -31,11 +31,30 @@ _MYSQL_MARKERS = [
     r"\bUNSIGNED\b",
 ]
 
+_SQLSERVER_MARKERS = [
+    r"\bSET\s+ANSI_NULLS\b",
+    r"\bSET\s+QUOTED_IDENTIFIER\b",
+    r"\bBEGIN\s+TRY\b",
+    r"\bEND\s+TRY\b",
+    r"\bBEGIN\s+CATCH\b",
+    r"\bEND\s+CATCH\b",
+    r"\bOBJECT_ID\s*\(",
+    r"\bISNULL\s*\(",
+    r"\bDATEADD\s*\(",
+    r"\bDATEDIFF\s*\(",
+    r"\bTOP\s+\d+\b",
+    r"\[[A-Za-z0-9_]+\](?:\s*\.\s*\[[A-Za-z0-9_]+\])?",
+    r"^\s*GO\s*$",
+]
+
 
 def detect_dialect(sql_text: str) -> Dialect:
     oracle_score = sum(1 for pat in _ORACLE_MARKERS if re.search(pat, sql_text, re.IGNORECASE))
     mysql_score = sum(1 for pat in _MYSQL_MARKERS if re.search(pat, sql_text, re.IGNORECASE))
+    sqlserver_score = sum(1 for pat in _SQLSERVER_MARKERS if re.search(pat, sql_text, re.IGNORECASE | re.MULTILINE))
 
+    if sqlserver_score > oracle_score and sqlserver_score >= mysql_score:
+        return Dialect.SQLSERVER
     if mysql_score > oracle_score:
         return Dialect.MYSQL
     # Default to Oracle: it's the dialect most markers here are unambiguous

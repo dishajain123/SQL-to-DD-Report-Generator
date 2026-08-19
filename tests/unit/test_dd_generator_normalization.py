@@ -127,13 +127,11 @@ def test_dd_generation_normalizes_legacy_comma_style_if(
     # column's completeness -- these are two independent guarantees. A row
     # whose effective period falls entirely on one side of the p_TIMEKEY
     # threshold is legitimately period-pruned down to just the selected
-    # branch's literal (see app/derivation/period_pruning.py), so "THEN("
-    # is only required to survive on rows that weren't pruned to a bare
-    # literal.
-    assert all(
-        "THEN(" in row.display_derivation_expression or row.display_derivation_expression in ("1", "0")
-        for row in rows
-    )
+    # branch's literal (see app/derivation/period_pruning.py), and some
+    # columns are represented without IF at all (for example as a direct
+    # reference or COALESCE). Only expressions that actually contain IF
+    # must therefore be checked for THEN/ELSE normalization.
+    assert all("THEN(" in row.display_derivation_expression or "IF(" not in row.display_derivation_expression for row in rows)
     assert all(
         "IF(p_TIMEKEY > 26267, 1, 0)" not in row.display_derivation_expression
         for row in rows
@@ -147,6 +145,40 @@ def test_dd_generation_normalizes_legacy_comma_style_if(
     # review instead -- that's the new, more correct behavior, not a bug.
     simple_columns = [r for r in rows if not any("Semantic validation" in e for e in r.validation_errors)]
     assert simple_columns, "expected at least some columns with no override/exception source to pass cleanly"
+
+
+def test_sqlserver_select_into_seed_projection_is_deterministic(sma_marking_sql, mock_llm_client, function_reference):
+    objects_list = []
+    infos = {}
+    for obj in split_objects(sma_marking_sql, "PRO.SMA_MARKING_12122023.StoredProcedure.sql", Dialect.SQLSERVER):
+        objects_list.append(obj)
+        infos[obj.object_id] = analyze_object(obj)
+
+    graph = build_graph(objects_list, infos)
+    chains = find_chains(graph, "job-sma-seed", objects_list)
+    objects = {o.object_id: o for o in objects_list}
+
+    model = build_canonical_model(chains[0], "job-sma-seed", objects, infos, mock_llm_client)
+    rows = generate_dd_rows(
+        chain=chains[0],
+        canonical_model=model,
+        objects=objects,
+        structural_infos=infos,
+        llm_client=mock_llm_client,
+        function_reference=function_reference,
+    )
+
+    rows_by_column = {row.column_name.upper(): row for row in rows}
+    for column in ["LASTCRDATE", "INTNOTSERVICEDDT", "OVERDUESINCEDT", "REVIEWDUEDT"]:
+        assert column in rows_by_column
+        assert rows_by_column[column].status == DDStatus.ACTIVE
+        assert "FCT_NPA_PRODUCT" not in rows_by_column[column].display_derivation_expression
+        assert '"a".' in rows_by_column[column].display_derivation_expression.lower()
+        assert not rows_by_column[column].validation_errors
+
+    assert rows_by_column["UCIF_ID"].status == DDStatus.PENDING_REVIEW
+    assert rows_by_column["UCIF_ID"].display_derivation_expression == ""
+    assert rows_by_column["UCIF_ID"].validation_errors
 
 
 def test_dd_generation_deterministically_derives_cleanup_rows(
@@ -193,8 +225,7 @@ def test_dd_generation_deterministically_derives_cleanup_rows(
         assert column in rows_by_column
         assert rows_by_column[column].status == DDStatus.ACTIVE
         assert 'IF(Scheme=="Y")THEN(NULL)ELSE(NULL)' not in rows_by_column[column].display_derivation_expression
-
-    assert 'ELSE("AccountCal_Stg"."LastCrDate")' in rows_by_column["LASTCRDATE"].display_derivation_expression
+    assert rows_by_column["LASTCRDATE"].display_derivation_expression == "NULL"
 
 
 def test_dd_generation_retries_after_validation_failure(

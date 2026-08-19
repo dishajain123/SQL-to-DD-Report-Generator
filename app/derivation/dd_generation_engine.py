@@ -52,12 +52,14 @@ from app.models.core import (
     DDRow,
     DDStatus,
     DerivationOption,
+    Dialect,
     LineageChain,
     SmartChunk,
     SQLObject,
     StatementInfo,
     StructuralInfo,
 )
+from app.parsing.dialect import detect_dialect
 from app.parsing.sql_parser import classify_statement, split_statements
 from app.utils.identity import canonical_logical_name
 from app.rag.chroma_store import ChromaStore, DOMAIN_COLLECTION, PLATFORM_COLLECTION
@@ -71,6 +73,7 @@ logger = get_logger(__name__)
 # exported unchanged.
 _MAX_GENERATION_ATTEMPTS = max(1, settings.dd_generation_max_attempts)
 _MAX_SOURCE_SQL_CONTEXT_CHARS = 5000
+_SQLGLOT_DIALECT = {Dialect.ORACLE: "oracle", Dialect.MYSQL: "mysql", Dialect.SQLSERVER: "tsql"}
 
 
 @dataclass(frozen=True)
@@ -2725,16 +2728,15 @@ def _translate_case_to_4x(case_node) -> str | None:
         if condition_node is None or value_node is None:
             return None
         condition_sql = _render_sql_condition_to_4x(condition_node) or condition_node.sql(dialect="oracle")
-        value_sql = value_node.sql(dialect="oracle")
-        normalized_value = _normalize_expression(value_sql, "")
-        if not _is_simple_stage_value(normalized_value):
+        value_sql = _render_value_expression_to_4x(value_node)
+        if value_sql is None:
             return None
-        branches.append((condition_sql, normalized_value))
+        branches.append((condition_sql, value_sql))
 
     default_node = case_node.args.get("default")
     if default_node is not None:
-        default_sql = _normalize_expression(default_node.sql(dialect="oracle"), "")
-        if not _is_simple_stage_value(default_sql):
+        default_sql = _render_value_expression_to_4x(default_node)
+        if default_sql is None:
             return None
     else:
         default_sql = "NULL"
@@ -2747,6 +2749,46 @@ def _translate_case_to_4x(case_node) -> str | None:
 
     result = "".join(parts)
     return result if validate_expression(result).valid else None
+
+
+def _render_value_expression_to_4x(node) -> str | None:
+    while isinstance(node, exp.Paren):
+        node = node.this
+
+    if isinstance(node, exp.Add):
+        left = _render_value_expression_to_4x(node.this)
+        right = _render_value_expression_to_4x(node.expression)
+        if left is None or right is None:
+            return None
+        return f"({left} + {right})"
+
+    if isinstance(node, exp.Sub):
+        left = _render_value_expression_to_4x(node.this)
+        right = _render_value_expression_to_4x(node.expression)
+        if left is None or right is None:
+            return None
+        return f"({left} - {right})"
+
+    if isinstance(node, exp.Mul):
+        left = _render_value_expression_to_4x(node.this)
+        right = _render_value_expression_to_4x(node.expression)
+        if left is None or right is None:
+            return None
+        return f"({left} * {right})"
+
+    if isinstance(node, exp.Div):
+        left = _render_value_expression_to_4x(node.this)
+        right = _render_value_expression_to_4x(node.expression)
+        if left is None or right is None:
+            return None
+        return f"({left} / {right})"
+
+    try:
+        text = node.sql(dialect="oracle")
+    except Exception:
+        return None
+    normalized = _normalize_expression(text, "")
+    return normalized if _is_simple_stage_value(normalized) else None
 
 
 def _strip_leading_comments(text: str) -> str:
@@ -2786,6 +2828,7 @@ def _render_boolean_predicate_leaf(node) -> str | None:
         text = node.sql(dialect="oracle")
     except Exception:
         return None
+    text = _strip_sql_comments_for_guard_matching(text)
     normalized = _normalize_expression(text, "")
     probe = f"IF({normalized})THEN(1)ELSE(0)"
     if validate_expression(probe).valid:
@@ -2889,79 +2932,68 @@ def _parse_simple_assignment_stage(raw_sql: str, target_column: str) -> tuple[st
     assigns a simple literal, NULL, or direct column reference. More
     complex CASE/IF formulas are intentionally left to the LLM path.
     """
-    candidates = split_statements(raw_sql)
-    stmt = ""
-    for candidate in reversed(candidates):
-        if classify_statement(candidate) in {"UPDATE", "MERGE"}:
-            stmt = _strip_leading_comments(candidate).strip()
-            break
-    if not stmt:
-        stmt = _strip_leading_comments(raw_sql).strip()
-    if not stmt:
-        return None
-
-    try:
-        tree = sqlglot.parse_one(stmt, read="oracle")
-    except Exception:
-        return None
-
     target_upper = target_column.upper()
 
-    def unwrap_parens(node):
-        """Strip enclosing exp.Paren wrappers -- e.g. `(CASE WHEN ... END)`,
-        a very common real-world style -- so a parenthesized CASE is still
-        recognized as exp.Case rather than silently bailing to the LLM
-        path just because of one extra layer of source parentheses.
-        Confirmed against a real case: PRO_DPD_Calculation_StoredProcedure_2.sql's
-        `SET A.DPD_IntService = (CASE WHEN A.IntNotServicedDt IS NOT NULL
-        THEN (v_ProcessDate - A.IntNotServicedDt) ELSE 0 END)` was bailing
-        for exactly this reason before this fix."""
-        while isinstance(node, exp.Paren):
-            node = node.this
-        return node
+    dialect_candidates = [detect_dialect(raw_sql), Dialect.ORACLE, Dialect.SQLSERVER, Dialect.MYSQL]
+    seen_dialects: set[Dialect] = set()
+    for dialect in dialect_candidates:
+        if dialect in seen_dialects:
+            continue
+        seen_dialects.add(dialect)
 
-    if isinstance(tree, exp.Update):
-        guard = ""
-        where = tree.args.get("where")
-        if where is not None:
-            guard = _render_sql_condition_to_4x(where.this) or where.this.sql(dialect="oracle")
+        candidates = split_statements(raw_sql, dialect)
+        stmt = ""
+        for candidate in reversed(candidates):
+            if classify_statement(candidate) in {"UPDATE", "MERGE"}:
+                stmt = _strip_leading_comments(candidate).strip()
+                break
+        if not stmt:
+            stmt = _strip_leading_comments(raw_sql).strip()
+        if not stmt:
+            continue
 
-        for assignment in tree.args.get("expressions", []) or []:
-            if not isinstance(assignment, exp.EQ) or not isinstance(assignment.this, exp.Column):
-                continue
-            if assignment.this.name.upper() != target_upper:
-                continue
-            value_node = unwrap_parens(assignment.expression)
-            if isinstance(value_node, exp.Case):
-                case_translation = _translate_case_to_4x(value_node)
-                if case_translation is None:
-                    return None
-                return guard, case_translation, assignment.this.name
-            value = value_node.sql(dialect="oracle")
-            if not _is_simple_stage_value(value):
-                return None
-            return guard, value, assignment.this.name
-        return None
+        select_into_stmt = _extract_select_into_statement(stmt)
+        if select_into_stmt:
+            try:
+                select_tree = sqlglot.parse_one(select_into_stmt, read=_SQLGLOT_DIALECT[dialect])
+            except Exception:
+                select_tree = None
+            if isinstance(select_tree, exp.Select) and select_tree.args.get("into") is not None:
+                projection = _render_select_into_projection(select_tree, target_upper)
+                if projection is not None:
+                    guard = ""
+                    where = select_tree.args.get("where")
+                    if where is not None:
+                        guard = _render_sql_condition_to_4x(where.this) or where.this.sql(dialect=_SQLGLOT_DIALECT[dialect])
+                    return guard, projection, target_column
 
-    if isinstance(tree, exp.Merge):
-        guard_parts: list[str] = []
-        using = tree.args.get("using")
-        if isinstance(using, exp.Subquery) and isinstance(using.this, exp.Select):
-            where = using.this.args.get("where")
+        try:
+            tree = sqlglot.parse_one(stmt, read=_SQLGLOT_DIALECT[dialect])
+        except Exception:
+            continue
+
+        def unwrap_parens(node):
+            """Strip enclosing exp.Paren wrappers -- e.g. `(CASE WHEN ... END)`,
+            a very common real-world style -- so a parenthesized CASE is still
+            recognized as exp.Case rather than silently bailing to the LLM
+            path just because of one extra layer of source parentheses.
+            Confirmed against a real case: PRO_DPD_Calculation_StoredProcedure_2.sql's
+            `SET A.DPD_IntService = (CASE WHEN A.IntNotServicedDt IS NOT NULL
+            THEN (v_ProcessDate - A.IntNotServicedDt) ELSE 0 END)` was bailing
+            for exactly this reason before this fix."""
+            while isinstance(node, exp.Paren):
+                node = node.this
+            return node
+
+        fallback_rhs = _extract_update_assignment_rhs(stmt, target_upper)
+
+        if isinstance(tree, exp.Update):
+            guard = ""
+            where = tree.args.get("where")
             if where is not None:
-                guard_parts.append(_render_sql_condition_to_4x(where.this) or where.this.sql(dialect="oracle"))
-        on_clause = tree.args.get("on")
-        if on_clause is not None:
-            guard_parts.append(_render_sql_condition_to_4x(on_clause) or on_clause.sql(dialect="oracle"))
+                guard = _render_sql_condition_to_4x(where.this) or where.this.sql(dialect=_SQLGLOT_DIALECT[dialect])
 
-        whens = tree.args.get("whens")
-        when_list = whens.expressions if whens is not None else []
-        for when in when_list:
-            then = when.args.get("then")
-            if not isinstance(then, exp.Update):
-                continue
-            when_cond = when.args.get("condition")
-            for assignment in then.args.get("expressions", []) or []:
+            for assignment in tree.args.get("expressions", []) or []:
                 if not isinstance(assignment, exp.EQ) or not isinstance(assignment.this, exp.Column):
                     continue
                 if assignment.this.name.upper() != target_upper:
@@ -2970,19 +3002,270 @@ def _parse_simple_assignment_stage(raw_sql: str, target_column: str) -> tuple[st
                 if isinstance(value_node, exp.Case):
                     case_translation = _translate_case_to_4x(value_node)
                     if case_translation is None:
-                        return None
-                    value = case_translation
-                else:
-                    value = value_node.sql(dialect="oracle")
-                    if not _is_simple_stage_value(value):
-                        return None
-                if when_cond is not None:
-                    guard_parts.append(_render_sql_condition_to_4x(when_cond) or when_cond.sql(dialect="oracle"))
-                guard = " AND ".join(f"({part})" for part in guard_parts if part)
+                        break
+                    return guard, case_translation, assignment.this.name
+                value = value_node.sql(dialect=_SQLGLOT_DIALECT[dialect])
+                if not _is_simple_stage_value(value):
+                    break
                 return guard, value, assignment.this.name
-        return None
+
+        if fallback_rhs:
+            try:
+                rhs_tree = sqlglot.parse_one(fallback_rhs, read=_SQLGLOT_DIALECT[dialect])
+            except Exception:
+                rhs_tree = None
+            if rhs_tree is not None:
+                value = _render_value_expression_to_4x(rhs_tree)
+                if value is not None:
+                    guard = ""
+                    if isinstance(tree, exp.Update):
+                        where = tree.args.get("where")
+                        if where is not None:
+                            guard = _render_sql_condition_to_4x(where.this) or where.this.sql(dialect=_SQLGLOT_DIALECT[dialect])
+                    return guard, value, target_column
+
+        if isinstance(tree, exp.Select) and tree.args.get("into") is not None:
+            projection = _render_select_into_projection(tree, target_upper)
+            if projection is not None:
+                guard = ""
+                where = tree.args.get("where")
+                if where is not None:
+                    guard = _render_sql_condition_to_4x(where.this) or where.this.sql(dialect=_SQLGLOT_DIALECT[dialect])
+                return guard, projection, target_column
+
+        select_into_stmt = _extract_select_into_statement(stmt)
+        if select_into_stmt:
+            try:
+                select_tree = sqlglot.parse_one(select_into_stmt, read=_SQLGLOT_DIALECT[dialect])
+            except Exception:
+                select_tree = None
+            if isinstance(select_tree, exp.Select) and select_tree.args.get("into") is not None:
+                projection = _render_select_into_projection(select_tree, target_upper)
+                if projection is not None:
+                    guard = ""
+                    where = select_tree.args.get("where")
+                    if where is not None:
+                        guard = _render_sql_condition_to_4x(where.this) or where.this.sql(dialect=_SQLGLOT_DIALECT[dialect])
+                    return guard, projection, target_column
+
+        if isinstance(tree, exp.Merge):
+            guard_parts: list[str] = []
+            using = tree.args.get("using")
+            if isinstance(using, exp.Subquery) and isinstance(using.this, exp.Select):
+                where = using.this.args.get("where")
+                if where is not None:
+                    guard_parts.append(_render_sql_condition_to_4x(where.this) or where.this.sql(dialect=_SQLGLOT_DIALECT[dialect]))
+            on_clause = tree.args.get("on")
+            if on_clause is not None:
+                guard_parts.append(_render_sql_condition_to_4x(on_clause) or on_clause.sql(dialect=_SQLGLOT_DIALECT[dialect]))
+
+            whens = tree.args.get("whens")
+            when_list = whens.expressions if whens is not None else []
+            for when in when_list:
+                then = when.args.get("then")
+                if not isinstance(then, exp.Update):
+                    continue
+                when_cond = when.args.get("condition")
+                for assignment in then.args.get("expressions", []) or []:
+                    if not isinstance(assignment, exp.EQ) or not isinstance(assignment.this, exp.Column):
+                        continue
+                    if assignment.this.name.upper() != target_upper:
+                        continue
+                    value_node = unwrap_parens(assignment.expression)
+                    if isinstance(value_node, exp.Case):
+                        case_translation = _translate_case_to_4x(value_node)
+                        if case_translation is None:
+                            break
+                        value = case_translation
+                    else:
+                        value = value_node.sql(dialect=_SQLGLOT_DIALECT[dialect])
+                        if not _is_simple_stage_value(value):
+                            break
+                    if when_cond is not None:
+                        guard_parts.append(_render_sql_condition_to_4x(when_cond) or when_cond.sql(dialect=_SQLGLOT_DIALECT[dialect]))
+                    guard = " AND ".join(f"({part})" for part in guard_parts if part)
+                    return guard, value, assignment.this.name
+
+        # Try the next candidate dialect.
+        continue
 
     return None
+
+
+def _extract_select_into_statement(stmt_text: str) -> str | None:
+    """Isolate the actual `SELECT ... INTO ...` statement from a glued
+    procedural block.
+
+    SQL Server procedures often glue control-flow cleanup (`IF OBJECT_ID...
+    DROP TABLE...`) directly in front of a `SELECT ... INTO #temp ...`
+    projection. sqlglot can usually parse the select just fine once that
+    preamble is removed, so this helper trims the block down to the
+    projection statement itself without changing any logic.
+    """
+    cleaned = _strip_sql_comments_for_guard_matching(stmt_text)
+    select_matches = list(re.finditer(r"\bSELECT\b", cleaned, re.IGNORECASE))
+    if not select_matches:
+        return None
+
+    candidate = cleaned[select_matches[-1].start() :].strip()
+    if not candidate.upper().startswith("SELECT"):
+        return None
+
+    boundary_match = None
+    for match in re.finditer(
+        r"(?mi)^\s*(UPDATE|INSERT|DELETE|MERGE|IF|BEGIN|END|ELSE|WHEN|CREATE|DROP|EXEC|RETURN|WHILE)\b",
+        candidate,
+    ):
+        if match.start() > 0:
+            boundary_match = match
+            break
+
+    if boundary_match is not None:
+        candidate = candidate[: boundary_match.start()].strip()
+    return candidate or None
+
+
+def _render_select_into_projection(tree: exp.Select, target_upper: str) -> str | None:
+    source_alias = _select_into_source_alias(tree)
+    for expr in tree.args.get("expressions", []) or []:
+        value_node = expr
+        alias = None
+
+        if isinstance(expr, exp.Alias):
+            alias = expr.alias_or_name or expr.alias
+            value_node = expr.this
+        elif isinstance(expr, exp.Column):
+            alias = expr.alias_or_name or expr.name
+        elif isinstance(expr, exp.Identifier):
+            alias = expr.this
+        else:
+            alias = getattr(expr, "alias", None)
+
+        if not alias or alias.upper() != target_upper:
+            continue
+
+        if isinstance(value_node, exp.Case):
+            case_translation = _translate_case_to_4x(value_node)
+            if case_translation is not None:
+                return case_translation
+
+        if isinstance(value_node, exp.Column) and source_alias and not value_node.table:
+            return f'"{source_alias}"."{value_node.name}"'
+
+        rendered = _render_value_expression_to_4x(value_node)
+        if rendered is not None:
+            return rendered
+    return None
+
+
+def _select_into_source_alias(tree: exp.Select) -> str | None:
+    """Return the single source alias used by a `SELECT ... INTO` seed
+    projection when the query clearly reads from one base relation.
+
+    Bare projections in SQL Server often rely on the surrounding `FROM`
+    alias rather than repeating it in every select item. For deterministic
+    DD generation we need that alias preserved, otherwise a direct source
+    column like `LastCrDate` looks identical to the target column name and
+    semantic validation incorrectly treats it as circular.
+    """
+    from_clause = tree.args.get("from_")
+    if not isinstance(from_clause, exp.From):
+        return None
+    source = from_clause.this
+    if source is None:
+        sources = list(from_clause.expressions or [])
+        if len(sources) != 1:
+            return None
+        source = sources[0]
+    alias = getattr(source, "alias_or_name", None) or getattr(source, "alias", None)
+    if isinstance(alias, exp.TableAlias):
+        alias = alias.this
+    if isinstance(alias, exp.Identifier):
+        alias = alias.this
+    if isinstance(alias, str) and alias.strip():
+        return alias.strip()
+    if isinstance(source, exp.Alias):
+        alias = source.alias_or_name or source.alias
+        if isinstance(alias, str) and alias.strip():
+            return alias.strip()
+        if isinstance(alias, exp.Identifier):
+            return alias.this
+    return None
+
+
+def _extract_update_assignment_rhs(stmt_text: str, target_upper: str) -> str | None:
+    pattern = re.compile(
+        rf"(?is)(?:^|,)\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?{re.escape(target_upper)}\s*=\s*"
+    )
+    match = pattern.search(stmt_text.upper())
+    if not match:
+        return None
+
+    start = match.end()
+    i = start
+    n = len(stmt_text)
+    paren_depth = 0
+    in_single = False
+    in_double = False
+    in_line_comment = False
+    in_block_comment = False
+
+    while i < n:
+        ch = stmt_text[i]
+        nxt = stmt_text[i + 1] if i + 1 < n else ""
+
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+        if in_single:
+            if ch == "'" and nxt != "'":
+                in_single = False
+            elif ch == "'" and nxt == "'":
+                i += 1
+            i += 1
+            continue
+        if in_double:
+            if ch == '"':
+                in_double = False
+            i += 1
+            continue
+
+        if ch == "-" and nxt == "-":
+            in_line_comment = True
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            i += 2
+            continue
+        if ch == "'":
+            in_single = True
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            i += 1
+            continue
+        if ch == "(":
+            paren_depth += 1
+        elif ch == ")":
+            paren_depth = max(0, paren_depth - 1)
+        elif ch == "," and paren_depth == 0:
+            return stmt_text[start:i].strip()
+        elif paren_depth == 0 and stmt_text[i : i + 5].upper() == "WHERE":
+            return stmt_text[start:i].strip()
+        i += 1
+
+    return stmt_text[start:].strip() or None
 
 
 def _strip_sql_comments_for_guard_matching(text: str) -> str:
@@ -3106,7 +3389,22 @@ def _compose_simple_assignment_expression(
         return None
 
     current_target = stages[0][2] or fallback_column
-    expression = f'"{entity_name}"."{current_target}"' if entity_name else f'"{current_target}"'
+    first_kind = assignment_sites[0].kind.upper() if assignment_sites else ""
+    first_raw = assignment_sites[0].raw_sql if assignment_sites else ""
+    first_is_seed_projection = first_kind in {"SELECT", "INSERT"}
+    if not first_is_seed_projection and first_kind == "CONTROL_FLOW_BLOCK":
+        select_stmt = _extract_select_into_statement(first_raw)
+        if select_stmt:
+            for dialect in (detect_dialect(select_stmt), Dialect.ORACLE, Dialect.SQLSERVER, Dialect.MYSQL):
+                try:
+                    tree = sqlglot.parse_one(select_stmt, read=_SQLGLOT_DIALECT[dialect])
+                except Exception:
+                    continue
+                if isinstance(tree, exp.Select) and tree.args.get("into") is not None:
+                    if _render_select_into_projection(tree, current_target.upper()) is not None:
+                        first_is_seed_projection = True
+                        break
+    expression = "NULL" if first_is_seed_projection else (f'"{entity_name}"."{current_target}"' if entity_name else f'"{current_target}"')
 
     for guard, value, source_target in stages:
         source_target = source_target or current_target
@@ -3452,6 +3750,8 @@ def _generate_for_column(
         periods = [(date.today(), True, "", 0)]
 
     if _expression_should_be_rejected(validation_errors):
+        expression = ""
+    elif validation_errors and deterministic_expression is None:
         expression = ""
 
     data_type = _infer_data_type(column)

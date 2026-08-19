@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 class Dialect(str, Enum):
     ORACLE = "oracle"
     MYSQL = "mysql"
+    SQLSERVER = "sqlserver"
 
 
 class ObjectType(str, Enum):

@@ -1,6 +1,7 @@
 from datetime import date
 
 from app.models.core import CanonicalModel, ColumnType, DDRow, DDStatus, DerivationOption, GlossaryTerm, Intent, JobPlan
+from app.report.condition_explainer import explain_expression
 from app.report.report_generator import generate_report
 
 
@@ -76,20 +77,17 @@ def test_report_uses_required_structure_and_rule_ids(tmp_path):
     assert "#### BR-001 — REFPERIODMAX" in text
     assert text.count("BR-001") >= 2
     assert 'IF(ISEMPTY("FCT_NPA_PRODUCT"."REFPERIODMAX"))THEN(0)ELSE("FCT_NPA_PRODUCT"."REFPERIODMAX")' in text
-    assert "**Purpose:** Keeps the rolling reference period value aligned with the latest applicable period." in text
+    assert "**Platform Condition:**" in text
+    assert "**Human-Readable Explanation:**" in text
+    assert "the result is 0" in text
+    assert "the refperiodmax field in fct npa product" in text
+    assert "**Purpose:**" not in text
 
-    # The formula must appear as its own exact platform-formula block, not
-    # only embedded inside the decision-logic rendering.
-    assert "**Platform Formula**" in text
-    assert "**Decision Logic**" in text
 
-
-def test_decision_logic_is_deterministic_reformatting_not_a_rewrite(tmp_path):
-    """The pretty-printed Decision Logic block must be a faithful,
-    whitespace-only reformatting of the exact Platform Formula -- proven
-    here by stripping all whitespace from both and asserting they're
-    identical, which would fail if pretty-printing ever changed operators,
-    quoting, or literal values."""
+def test_platform_condition_is_preserved_and_explanation_is_separate(tmp_path):
+    """The machine-readable condition must remain byte-for-byte stable,
+    while the human-readable explanation is allowed to rephrase the logic
+    as long as it preserves the same meaning."""
     job_plan = JobPlan(job_id="job-4", intent=Intent.GENERATE_DD, company="Acme", platform="4X")
     model = CanonicalModel(
         chain_id="chain-4",
@@ -116,35 +114,88 @@ def test_decision_logic_is_deterministic_reformatting_not_a_rewrite(tmp_path):
     )
     text = out.read_text()
 
-    decision_logic = text.split("**Decision Logic**")[1].split("**Platform Formula**")[0]
-    decision_logic = decision_logic.split("```text")[1].split("```")[0]
-    platform_formula = text.split("**Platform Formula**")[1].split("```text")[1].split("```")[0]
+    platform_condition = text.split("**Platform Condition:**")[1].split("**Human-Readable Explanation:**")[0]
+    platform_condition = platform_condition.split("```text")[1].split("```")[0]
+    explanation = text.split("**Human-Readable Explanation:**")[1].split("\n---")[0]
 
     def squash(s: str) -> str:
         return "".join(s.split())
 
-    # The Platform Formula block must be byte-for-byte (modulo surrounding
-    # whitespace) identical to what was stored on the row -- it's meant
-    # for copy-paste into the platform, so it must never be touched.
-    assert squash(platform_formula) == squash(expression)
+    assert squash(platform_condition) == squash(expression)
 
-    # The Decision Logic block legitimately replaces THEN(...)/ELSE(...)
-    # with arrows and indentation -- that's the whole point -- but every
-    # literal condition and branch value must survive completely
-    # unchanged as an exact substring, proving no token was rewritten.
     for fragment in [
-        '"A"."X">1 OR "A"."Y"=="Y"',
-        'ISNOTEMPTY("B"."Z")',
-        '"B"."Z"',
-        '"B"."W"',
-        '"A"."X"<=0',
+        "at least one of the following is true",
+        "the x field in a is greater than 1",
+        "the y field in a equals yes",
+        "another rule applies",
+        "the z field in b has a value",
+        "the result is the z field in b",
+        "the result is the w field in b",
+        "the result is no value",
     ]:
-        assert fragment in decision_logic, f"missing fragment: {fragment!r}"
+        assert fragment in explanation, f"missing fragment: {fragment!r}"
 
-    # And it must actually be laid out across multiple lines (not just a
-    # no-op single-line passthrough) to prove the pretty-printer did
-    # something.
-    assert decision_logic.strip().count("\n") >= 3
+    assert explanation.strip().count("\n") >= 1
+
+
+def test_condition_explainer_covers_simple_and_complex_cases():
+    simple = explain_expression('IF(ISEMPTY("A"."B"))THEN(0)ELSE("A"."B")')
+    complex_expr = (
+        'IF("A"."X">1 OR "A"."Y"=="Y")'
+        'THEN(IF(ISNOTEMPTY("B"."Z"))THEN("B"."Z")ELSE("B"."W"))'
+        'ELSEIF("A"."X"<=0)THEN(0)'
+        'ELSE(NULL)'
+    )
+    complex_explanation = explain_expression(complex_expr)
+
+    assert simple == "If the b field in a is blank or missing, the result is 0. Otherwise, the result is the b field in a."
+    assert complex_explanation is not None
+    assert "at least one of the following is true" in complex_explanation
+    assert "another rule applies" in complex_explanation
+    assert "the result is no value" in complex_explanation
+
+
+def test_condition_explainer_covers_nested_boolean_ranges_and_functions():
+    expression = (
+        'IF(AND('
+        'NOT(ISEMPTY("A"."X")),'
+        '("A"."Y" BETWEEN [1,30]),'
+        '("A"."Z" IN ["Y","N"])'
+        '))THEN('
+        'IF(LOWER(TRIM("A"."CODE"))=="abc")THEN(REPLACE("A"."CODE","-"," "))ELSE(SUBSTR("A"."CODE",1,3))'
+        ')ELSE('
+        'IF(LEN(SUBSTR("A"."CODE",1,3))>0 OR "A"."DATE" BETWEEN [SOM("A"."DATE"),EOM("A"."DATE")])'
+        'THEN(DATE("2026-01-01"))ELSE(PERIOD("A"."P"))'
+        ')'
+    )
+
+    explanation = explain_expression(expression)
+
+    assert explanation is not None
+    for fragment in [
+        "all of the following are true",
+        "it is not true that",
+        "is between 1 and 30",
+        "is one of yes or no",
+        "lowercased value",
+        "trimmed value",
+        "replaced by",
+        "substring of the code field in a starting at 1 with length 3",
+        "length of",
+        "start of the month",
+        "end of the month",
+        "date value for",
+        "period value for",
+    ]:
+        assert fragment in explanation
+
+
+def test_condition_explainer_uses_safe_fallback_for_unknown_function():
+    explanation = explain_expression('IF(BOGUSFUNC("A"."X"))THEN(1)ELSE(0)')
+
+    assert explanation is not None
+    assert "result of the function call" in explanation
+    assert "bogusfunc" not in explanation.lower()
 
 
 def test_report_separates_technical_housekeeping_columns(tmp_path):
@@ -204,6 +255,37 @@ def test_report_marks_pending_review_items_without_altering_formula(tmp_path):
     # Business Meaning table column itself is gone (moved into the card),
     # so this checks the summary line specifically.
     assert "PENDING_REVIEW: Keeps the rolling reference period" in text
+
+
+def test_report_renders_cleanup_null_conditions_with_human_readable_explanation(tmp_path):
+    job_plan = JobPlan(job_id="job-6", intent=Intent.GENERATE_DD, company="Acme", platform="4X")
+    model = CanonicalModel(
+        chain_id="chain-6",
+        job_id="job-6",
+        object_ids=["obj-6"],
+        technical_summary="technical summary",
+        business_summary="business summary",
+        evidence=["PRO.SampleProc"],
+    )
+    row = _row(
+        column_name="LASTCRDATE",
+        display_derivation_expression="NULL",
+        business_meaning="Clears the last credit date as part of a cleanup reset.",
+    )
+
+    out = generate_report(
+        job_plan,
+        [model],
+        [row],
+        tmp_path / "report.md",
+        objects={"obj-6": type("Obj", (), {"name": "PRO.SampleProc"})()},
+    )
+    text = out.read_text()
+
+    assert "**Platform Condition:**" in text
+    assert "```text\nNULL\n```" in text
+    assert "**Human-Readable Explanation:**" in text
+    assert "The result is no value." in text
 
 
 def test_tables_read_and_written_reflect_structural_info(tmp_path):

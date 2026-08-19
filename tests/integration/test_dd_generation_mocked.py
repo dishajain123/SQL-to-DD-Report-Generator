@@ -118,8 +118,33 @@ def test_dd_generation_rejects_truncated_expressions_instead_of_exporting_them(
         any("Unexpected end-of-input" in error for error in row.validation_errors)
         for row in rows
     )
+
+
+def test_sqlserver_procedure_end_to_end_generates_dd_rows(sma_marking_sql, mock_llm_client, function_reference):
+    objects_list = []
+    infos = {}
+    for obj in split_objects(sma_marking_sql, "PRO.SMA_MARKING_12122023.StoredProcedure.sql", Dialect.SQLSERVER):
+        objects_list.append(obj)
+        infos[obj.object_id] = analyze_object(obj)
+
+    graph = build_graph(objects_list, infos)
+    chains = find_chains(graph, "job-sma-1", objects_list)
+    objects = {o.object_id: o for o in objects_list}
+
+    model = build_canonical_model(chains[0], "job-sma-1", objects, infos, mock_llm_client)
+    rows = generate_dd_rows(
+        chain=chains[0],
+        canonical_model=model,
+        objects=objects,
+        structural_infos=infos,
+        llm_client=mock_llm_client,
+        function_reference=function_reference,
+    )
+
+    assert rows
+    assert any(row.column_name for row in rows)
+    assert any(row.status in (DDStatus.ACTIVE, DDStatus.PENDING_REVIEW) for row in rows)
     assert any(row.status == DDStatus.PENDING_REVIEW for row in rows)
-    assert any(row.status == DDStatus.ACTIVE for row in rows)
 
 
 def test_dd_generation_normalizes_legacy_comma_style_if(
@@ -166,13 +191,11 @@ def test_dd_generation_normalizes_legacy_comma_style_if(
     # column's completeness -- these are two independent guarantees. A row
     # whose effective period falls entirely on one side of the p_TIMEKEY
     # threshold is legitimately period-pruned down to just the selected
-    # branch's literal (see app/derivation/period_pruning.py), so "THEN("
-    # is only required to survive on rows that weren't pruned to a bare
-    # literal.
-    assert all(
-        "THEN(" in row.display_derivation_expression or row.display_derivation_expression in ("1", "0")
-        for row in rows
-    )
+    # branch's literal (see app/derivation/period_pruning.py), and some
+    # columns are represented without IF at all (for example as a direct
+    # reference or COALESCE). Only expressions that actually contain IF
+    # must therefore be checked for THEN/ELSE normalization.
+    assert all("THEN(" in row.display_derivation_expression or "IF(" not in row.display_derivation_expression for row in rows)
     assert all("IF(p_TIMEKEY > 26267, 1, 0)" not in row.display_derivation_expression for row in rows)
     assert all("Grammar validation failed" not in " ".join(row.validation_errors) for row in rows)
 

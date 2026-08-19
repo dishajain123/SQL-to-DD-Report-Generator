@@ -23,7 +23,7 @@ _VERSION_THRESHOLD_RE = re.compile(
 
 
 def analyze_object(obj: SQLObject) -> StructuralInfo:
-    raw_statements = split_statements(obj.raw_sql)
+    raw_statements = split_statements(obj.raw_sql, obj.dialect)
     statements: list[StatementInfo] = [
         parse_statement(stmt, i, obj.dialect) for i, stmt in enumerate(raw_statements)
     ]

@@ -18,11 +18,9 @@ Structure:
      links into the detail cards below, so a reviewer can jump straight to
      the one rule they care about instead of scrolling a giant table.
   4. Detailed Business Rules & DD Conditions -- one card per rule, grouped
-     by target table, each with a deterministically pretty-printed
-     decision-chain rendering of the formula (see
-     app/report/formula_pretty_printer.py -- reformats, never rewrites,
-     the accepted expression) alongside the exact platform formula text a
-     reviewer would paste into the platform.
+     by target table, each showing the exact platform condition
+     alongside a deterministic plain-English explanation derived from
+     the same parsed logic.
 
 There is no separate "Business Rules / Logic Explanation" section
 duplicating the same explanation already shown per rule in the cards, and
@@ -37,7 +35,7 @@ from pathlib import Path
 import re
 
 from app.models.core import CanonicalModel, DDRow, JobPlan, SQLObject, StructuralInfo
-from app.report.formula_pretty_printer import pretty_print_expression
+from app.report.condition_explainer import explain_expression
 from app.utils.identity import canonical_expression_key, canonical_logical_name
 from app.grammar.validator import KNOWN_FUNCTIONS
 
@@ -382,69 +380,12 @@ def _rules_by_entity(rule_groups: list[_RuleGroup]) -> list[tuple[str, list[_Rul
     return [(entity, grouped[entity]) for entity in order]
 
 
-def _business_rule_explanation_lines(rule: _RuleGroup) -> list[str]:
-    """Deterministic, pattern-based supporting detail -- shown only when
-    `rule.business_meaning` is itself the deterministic fallback sentence
-    (i.e. no real per-rule explanation was available from the LLM), so a
-    card is never left with just a generic one-liner and nothing else. If
-    a genuine LLM-authored explanation exists, this returns nothing and
-    the card relies on that instead of also showing these pattern notes."""
-    expr = rule.formula.upper()
-    if not _is_fallback_business_meaning(rule):
-        return []
-    lines: list[str] = []
-
-    if "TODATE(" in expr and "1900-01-01" in expr:
-        lines.append(
-            "This rule clears placeholder dates so downstream calculations do not treat 1 Jan 1900 as a real business date."
-        )
-    if "P_TIMEKEY" in expr and "26267" in expr:
-        lines.append(
-            "This rule changes behavior after a period cutoff, which means the business logic was revised for later processing dates."
-        )
-    if "AQUA_SCHEME" in expr or "SCHEMETYPE" in expr:
-        lines.append(
-            "This rule gives special treatment to Aqua/ODA accounts so those products follow their own processing rules instead of the normal one."
-        )
-    if "SOURCEALT_KEY" in expr and "==6" in expr:
-        lines.append(
-            "This rule keeps a special zero-day adjustment for SourceAlt_Key 6, so that branch follows the documented exception."
-        )
-    if "MAX(" in expr:
-        lines.append(
-            "This rule compares the eligible drivers and keeps the highest one, because the business outcome depends on the most severe applicable value."
-        )
-    if "COALESCE(" in expr:
-        lines.append(
-            "This rule uses fallback values when a field is blank, so missing data does not break the calculation."
-        )
-    if "ELSEIF(" in expr or "CASE" in expr:
-        lines.append(
-            "This rule is branch-based, so the final value depends on which source condition is true first."
-        )
-    if "SP_EXPIRYDATE" in expr or "RESTRUCTUREDT" in expr or "PRERESTRUCTURENPA_DATE" in expr:
-        lines.append(
-            "This rule checks whether a restructure or expiry is still active, then chooses the appropriate NPA-related date."
-        )
-    if "REFPERIOD" in expr:
-        lines.append(
-            "This rule preserves the period-specific reference amount tied to the chosen DPD driver, then carries that value forward into later calculations."
-        )
-    if "NULL" in expr and "ELSE(NULL)" in expr:
-        lines.append(
-            "This rule intentionally returns no value when none of the business conditions match, which prevents a false positive result."
-        )
-    if not lines:
-        lines.append(
-            "This rule follows the source procedure exactly and maps the source conditions into a business decision for the target column."
-        )
-
-    if len(rule.rows) > 1:
-        lines.append(
-            f"The same rule appears on multiple effective dates ({rule.effective_dates}), which means the business logic was revised over time and both versions are preserved."
-        )
-
-    return lines
+def _human_readable_explanation(rule: _RuleGroup) -> str:
+    formula = rule.formula or ""
+    explanation = explain_expression(formula)
+    if explanation:
+        return explanation
+    return "This platform condition could not be rendered safely in plain English, but the exact machine-readable condition is preserved above."
 
 
 def _tables_read_written_lines(
@@ -568,11 +509,6 @@ def _rule_card_lines(rule: _RuleGroup) -> list[str]:
     lines.append("")
     lines.append(f"**Table:** `{rule.entity_name}`  ")
 
-    lines.append(f"**Purpose:** {rule.business_meaning}")
-    for detail in _business_rule_explanation_lines(rule):
-        lines.append(f"- {detail}")
-    lines.append("")
-
     lines.append(f"**Effective Date(s):** {rule.effective_dates}  ")
     if rule.status == "PENDING_REVIEW":
         notes = rule.validation_notes or "Validation did not fully pass; see the formula below before approving."
@@ -584,21 +520,18 @@ def _rule_card_lines(rule: _RuleGroup) -> list[str]:
     lines.append("")
 
     formula = rule.formula or "(pending review \u2014 no formula was accepted)"
-    pretty = pretty_print_expression(formula) if rule.formula else None
+    explanation = _human_readable_explanation(rule)
 
-    if pretty:
-        lines.append("**Decision Logic**")
-        lines.append("")
-        lines.append("```text")
-        lines.append(pretty)
-        lines.append("```")
-        lines.append("")
-
-    lines.append("**Platform Formula**")
+    lines.append("**Platform Condition:**")
     lines.append("")
     lines.append("```text")
     lines.append(formula)
     lines.append("```")
+    lines.append("")
+
+    lines.append("**Human-Readable Explanation:**")
+    lines.append("")
+    lines.extend(explanation.splitlines() or [explanation])
     lines.append("")
 
     if rule.depends_on:

@@ -8,6 +8,9 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 SAMPLES_DIR = ROOT / "samples"
+ATTACHED_SMA_SQL = Path("/Users/dishajain/Downloads/proc project/PRO.SMA_MARKING_12122023.StoredProcedure.sql")
+
+from app.utils.text_encoding import decode_text_bytes
 
 
 class MockLLMClient:
@@ -94,6 +97,23 @@ def multi_object_sql(samples_dir: Path) -> str:
 @pytest.fixture
 def mysql_sample_sql(samples_dir: Path) -> str:
     return (samples_dir / "sql" / "customer_risk_flag_mysql.sql").read_text()
+
+
+@pytest.fixture
+def sma_marking_sql(samples_dir: Path) -> str:
+    if ATTACHED_SMA_SQL.exists():
+        return decode_text_bytes(ATTACHED_SMA_SQL.read_bytes()).text
+    return (
+        "CREATE PROCEDURE [PRO].[SMA_MARKING_12122023] @TIMEKEY INT AS BEGIN\n"
+        "IF OBJECT_ID('TEMPDB..#DPD') IS NOT NULL DROP TABLE #DPD\n"
+        "SELECT A.AccountEntityID, A.CustomerEntityID, CASE WHEN ISNULL(A.DPD_Overdrawn,0) > 30 "
+        "THEN 1 ELSE 0 END AS DPD_FLAG INTO #DPD FROM PRO.AccountCal A "
+        "WHERE ISNULL(A.DPD_Overdrawn,0) > 30 OR ISNULL(A.DPD_Overdue,0) > 0\n"
+        "UPDATE #DPD SET DPD_FLAG = 0 WHERE ISNULL(DPD_FLAG,0) < 0\n"
+        "INSERT INTO PRO.SMA_MOVEMENT_HISTORY (TIMEKEY, CustomerAcID, PREVSTATUS, CURRENTSTATUS) "
+        "SELECT @TIMEKEY, B.CustomerAcID, A.DPD_FLAG, B.DPD_FLAG FROM #DPD A INNER JOIN #DPD B ON A.CustomerEntityID = B.CustomerEntityID\n"
+        "END\n"
+    )
 
 
 @pytest.fixture

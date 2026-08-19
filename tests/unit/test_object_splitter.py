@@ -31,3 +31,10 @@ def test_no_create_statement_falls_back_to_single_object():
     assert len(objs) == 1
     assert objs[0].raw_sql == text
     assert objs[0].object_type == ObjectType.UNKNOWN
+
+
+def test_sqlserver_bracketed_object_name_is_split_correctly(sma_marking_sql):
+    objs = split_objects(sma_marking_sql, "PRO.SMA_MARKING_12122023.StoredProcedure.sql", Dialect.SQLSERVER)
+    assert len(objs) == 1
+    assert objs[0].name == "SMA_MARKING_12122023"
+    assert objs[0].object_type == ObjectType.PROCEDURE

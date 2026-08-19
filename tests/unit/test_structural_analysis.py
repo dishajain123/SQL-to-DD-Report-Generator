@@ -39,3 +39,18 @@ def test_object_with_no_dml_has_neutral_confidence():
     )
     info = analyze_object(obj)
     assert info.confidence == 1.0
+
+
+def test_sqlserver_sm_marking_procedure_produces_written_columns(sma_marking_sql):
+    objs = split_objects(
+        sma_marking_sql,
+        "PRO.SMA_MARKING_12122023.StoredProcedure.sql",
+        Dialect.SQLSERVER,
+    )
+    info = analyze_object(objs[0])
+
+    assert info.statements
+    assert info.tables_written
+    assert info.columns_written_by_table
+    assert "DPD" in info.tables_written
+    assert any(cols for cols in info.columns_written_by_table.values())

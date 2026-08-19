@@ -524,6 +524,9 @@ def check_dropped_override_conditions(
     source SQL actually updates, which is exactly the kind of dropped
     guard this check exists to catch.
     """
+    if _is_simple_cleanup_reset(expression, relevant_chunks, column):
+        return []
+
     errors: list[str] = []
     expr_tokens = _extract_identifiers(expression)
     column_upper = column.strip().upper()
@@ -578,6 +581,34 @@ def check_dropped_override_conditions(
             "over-apply to unrelated rows."
         )
     return errors
+
+
+def _is_simple_cleanup_reset(expression: str, relevant_chunks: list[SmartChunk], column: str) -> bool:
+    """Return True when the generated expression is a bare cleanup/reset
+    value (typically NULL or 0) and the source contains an explicit
+    matching cleanup assignment for the same target column.
+
+    These rows are intentionally different from business-rule overrides:
+    the source statement itself is just wiping or resetting a field, so
+    there is no meaningful branch condition to preserve in the
+    expression. Treating them as override drops would incorrectly force a
+    review status on legitimate deterministic cleanup rows.
+    """
+    normalized_expression = expression.strip().upper()
+    if normalized_expression not in {"NULL", "0"}:
+        return False
+    if not column:
+        return False
+
+    column_pattern = re.escape(column.strip().upper())
+    assignment_pattern = re.compile(
+        rf'(?is)\bSET\b.*?(?:[A-Z_][A-Z0-9_]*\s*\.\s*)?"?{column_pattern}"?\s*=\s*{normalized_expression}\b'
+    )
+
+    for chunk in relevant_chunks:
+        if assignment_pattern.search(_strip_sql_comments(chunk.raw_sql)):
+            return True
+    return False
 
 
 _AGGREGATE_FUNCTION_CHECK_RE = re.compile(r"\b(MIN|MAX|SUM|COUNT|AVG|LISTAGG)\s*\(", re.IGNORECASE)

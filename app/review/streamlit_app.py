@@ -20,6 +20,7 @@ from app.review import review_store
 from app.report.dd_export import export_reviewed_dd_rows_for_job_csv
 from app.utils import db
 from app.utils.config import settings
+from app.utils.text_encoding import decode_text_bytes
 
 
 DEFAULT_API_BASE_URL = os.getenv("DD_AUTOMATION_API_URL", "http://127.0.0.1:8000")
@@ -268,11 +269,13 @@ def _render_submission_tab() -> None:
             st.error(f"Unsupported file type: {uploaded.name}")
             return
         try:
-            files[uploaded.name] = uploaded.getvalue().decode("utf-8")
+            decoded = decode_text_bytes(uploaded.getvalue())
+            files[uploaded.name] = decoded.text
+            _log(f"Accepted file: {uploaded.name} (decoded as {decoded.encoding})")
         except UnicodeDecodeError:
-            _log(f"Rejected file: {uploaded.name} (invalid UTF-8)")
+            _log(f"Rejected file: {uploaded.name} (unreadable text encoding)")
             _render_logs()
-            st.error(f"{uploaded.name} is not valid UTF-8 text.")
+            st.error(f"{uploaded.name} could not be read as plain text.")
             return
 
     try:
