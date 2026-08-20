@@ -176,7 +176,16 @@ def _split_tsql_statement(stmt: str) -> list[str]:
             and not in_block_comment
             and lead in _TSQL_STATEMENT_START_KEYWORDS
         )
-        if should_split and not (buffer_lead == "WITH" and lead == "SELECT"):
+        # An UPDATE ... SET col1=x, col2=y FROM ... WHERE ... statement
+        # (the common T-SQL multi-column UPDATE-FROM shape) puts SET on its
+        # own line. SET is otherwise a valid statement-start keyword (for
+        # standalone `SET @var = x`), so without this carve-out the splitter
+        # treats that SET line as the start of a brand-new statement and
+        # shreds one real UPDATE into two meaningless fragments: "UPDATE tbl"
+        # and "SET ... FROM ... WHERE ...". Mirrors the WITH->SELECT
+        # carve-out immediately below for the same reason.
+        is_update_awaiting_set = buffer_lead == "UPDATE" and lead == "SET"
+        if should_split and not (buffer_lead == "WITH" and lead == "SELECT") and not is_update_awaiting_set:
             result.append(buffer_text)
             buf = []
 

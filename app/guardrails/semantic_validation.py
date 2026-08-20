@@ -616,7 +616,12 @@ _GROUP_BY_CHECK_RE = re.compile(r"\bGROUP\s+BY\b", re.IGNORECASE)
 _TABLE_QUALIFIED_REF_RE = re.compile(r'"([^"]+)"\s*\.\s*"([^"]+)"')
 
 
-def check_dropped_aggregation(expression: str, relevant_chunks: list[SmartChunk], entity_name: str) -> list[str]:
+def check_dropped_aggregation(
+    expression: str,
+    relevant_chunks: list[SmartChunk],
+    entity_name: str,
+    assignment_sqls: list[str] | None = None,
+) -> list[str]:
     """If any relevant source statement computes its value via a cross-row
     aggregate (MIN/MAX/SUM/COUNT/AVG/LISTAGG combined with GROUP BY --
     e.g. "the highest DPD across several DPD-type columns for one
@@ -642,9 +647,10 @@ def check_dropped_aggregation(expression: str, relevant_chunks: list[SmartChunk]
     -- it does not try to verify the aggregate was represented *correctly*,
     only that it was not obviously and entirely dropped.
     """
+    source_sqls = assignment_sqls if assignment_sqls is not None else [chunk.raw_sql for chunk in relevant_chunks]
     has_aggregate = any(
-        _AGGREGATE_FUNCTION_CHECK_RE.search(chunk.raw_sql) and _GROUP_BY_CHECK_RE.search(chunk.raw_sql)
-        for chunk in relevant_chunks
+        _AGGREGATE_FUNCTION_CHECK_RE.search(sql) and _GROUP_BY_CHECK_RE.search(sql)
+        for sql in source_sqls
     )
     if not has_aggregate:
         return []
@@ -917,6 +923,7 @@ def check_semantic_consistency(
     entity_name: str,
     relevant_chunks: list[SmartChunk],
     source_sql: str,
+    assignment_sqls: list[str] | None = None,
 ) -> GuardrailResult:
     """Run every semantic check and return a single combined result."""
     source_text = _strip_sql_comments(
@@ -930,7 +937,7 @@ def check_semantic_consistency(
     errors.extend(_check_constant_conditions(expression))
     errors.extend(_check_identical_simple_branches(expression))
     errors.extend(check_dropped_override_conditions(expression, relevant_chunks, column))
-    errors.extend(check_dropped_aggregation(expression, relevant_chunks, entity_name))
+    errors.extend(check_dropped_aggregation(expression, relevant_chunks, entity_name, assignment_sqls))
     errors.extend(check_redundant_nested_condition(expression))
     errors.extend(check_ambiguous_boolean_grouping(expression))
 

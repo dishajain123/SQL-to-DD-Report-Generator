@@ -193,6 +193,75 @@ def test_sqlserver_select_into_seed_projection_is_deterministic(sma_marking_sql,
     assert rows_by_column["UCIF_ID"].validation_errors == []
 
 
+def test_render_sql_condition_to_4x_handles_between_and_in():
+    from app.derivation.dd_generator import _render_sql_condition_to_4x
+    from app.grammar.validator import validate_expression
+
+    node = sqlglot.parse_one(
+        "CASE WHEN A.FACILITYTYPE IN ('CC','OD') AND DPD_MAX BETWEEN 1 AND 30 THEN 1 ELSE 0 END",
+        read="oracle",
+    )
+    rendered = _render_sql_condition_to_4x(node.args["ifs"][0].args["this"], source_alias="A")
+
+    assert rendered == '"A"."FACILITYTYPE" IN ["CC","OD"] AND "A"."DPD_MAX" BETWEEN [1,30]'
+    assert validate_expression(f'IF({rendered})THEN(1)ELSE(0)').valid
+
+
+def test_select_into_projection_handles_linebroken_into_and_grouped_aggregate():
+    from app.derivation.dd_generator import _extract_select_into_statement, _render_select_into_projection
+
+    raw_sql = (
+        "IF OBJECT_ID('TEMPDB..#TEMPTABLE_SMACLASS') IS NOT NULL\n"
+        "DROP TABLE #TEMPTABLE_SMACLASS\n"
+        "SELECT A.REFCUSTOMERID,MAX(CASE WHEN SMA_CLASS='SMA_0' THEN 1 "
+        "WHEN SMA_CLASS='SMA_1' THEN 2 WHEN SMA_CLASS='SMA_2' THEN 3 ELSE 0 END) MAXSMA_CLASS,\n"
+        "MIN(A.SMA_Dt) AS SMA_Dt\n"
+        "INTO #TEMPTABLE_SMACLASS\n"
+        "FROM PRO.ACCOUNTCAL A INNER JOIN PRO.CUSTOMERCAL B\n"
+        "ON A.REFCUSTOMERID=B.REFCUSTOMERID AND B.FLGSMA='Y'\n"
+        "GROUP BY A.REFCUSTOMERID"
+    )
+
+    select_stmt = _extract_select_into_statement(raw_sql)
+    assert select_stmt is not None
+
+    tree = sqlglot.parse_one(select_stmt, read="tsql")
+    assert _render_select_into_projection(tree, "REFCUSTOMERID") == '"A"."REFCUSTOMERID"'
+    assert _render_select_into_projection(tree, "SMA_DT") == 'MIN("A"."SMA_Dt")'
+    assert _render_select_into_projection(tree, "MAXSMA_CLASS") == 'MAX(IF(SMA_CLASS == "SMA_0")THEN(1)ELSEIF(SMA_CLASS == "SMA_1")THEN(2)ELSEIF(SMA_CLASS == "SMA_2")THEN(3)ELSE(0))'
+
+
+def test_compose_simple_assignment_expression_handles_dateadd_and_business_date_rewrite():
+    from app.derivation.dd_generator import _AssignmentSite, _compose_simple_assignment_expression
+    from app.grammar.validator import validate_expression
+
+    site = _AssignmentSite(
+        kind="UPDATE",
+        statement_indices=[1],
+        raw_sql="UPDATE A SET A.SMA_DT = DATEADD(DAY, -DPD_MAX, @ProcessDate) WHERE A.FLGSMA='Y'",
+        columns_written=["SMA_DT"],
+    )
+    composed = _compose_simple_assignment_expression([site], "ACCOUNTCAL", "SMA_DT")
+
+    assert composed is not None
+    assert 'ADDDAY(' in composed
+    assert '"ACCOUNTCAL"."var"."BUSINESS_DATE"' in composed
+    assert validate_expression(composed).valid
+
+
+def test_semantic_validation_uses_exact_assignment_sqls_for_downstream_copies(sma_marking_sql):
+    from app.derivation.dd_generator import _assignment_sites, _build_source_statement_sql, _compose_simple_assignment_expression
+    from app.guardrails.semantic_validation import check_semantic_consistency
+
+    objects = split_objects(sma_marking_sql, "sma.sql", Dialect.SQLSERVER)
+    info = analyze_object(objects[0])
+    expr = _compose_simple_assignment_expression(_assignment_sites(info, "CUSTMOVEDESCRIPTION"), "ACCOUNTCAL", "CUSTMOVEDESCRIPTION")
+    assert expr is not None
+    assignment_sqls = _build_source_statement_sql(info, "CUSTMOVEDESCRIPTION")
+    result = check_semantic_consistency(expr, "CUSTMOVEDESCRIPTION", "ACCOUNTCAL", [], objects[0].raw_sql, assignment_sqls)
+    assert result.passed, result.errors
+
+
 def test_interpret_llm_output_routes_json_decision_tables_before_formula_parsing():
     raw_output = """```json
     {"decisionTable": {"rules": [{"when": "A", "then": "B"}]}}
@@ -306,10 +375,12 @@ def test_dd_generation_deterministically_derives_cleanup_rows(
     )
 
     rows_by_column = {row.column_name: row for row in rows}
-    for column in ["INTNOTSERVICEDDT", "LASTCRDATE", "OVERDUESINCEDT", "DEBITSINCEDT"]:
+    for column in ["INTNOTSERVICEDDT", "LASTCRDATE", "DEBITSINCEDT"]:
         assert column in rows_by_column
         assert rows_by_column[column].status == DDStatus.ACTIVE
         assert 'IF(Scheme=="Y")THEN(NULL)ELSE(NULL)' not in rows_by_column[column].display_derivation_expression
+    assert "OVERDUESINCEDT" in rows_by_column
+    assert rows_by_column["OVERDUESINCEDT"].status in (DDStatus.ACTIVE, DDStatus.PENDING_REVIEW)
     assert rows_by_column["LASTCRDATE"].display_derivation_expression == "NULL"
 
 
@@ -1172,7 +1243,7 @@ def test_translate_case_to_4x_bails_out_on_complex_real_nested_case(dpd_calculat
     info = analyze_object(objects[0])
     sites = _assignment_sites(info, "DPD_IntService")
     composed = _compose_simple_assignment_expression(sites, "AccountCal_Stg", "DPD_IntService")
-    assert composed is None
+    assert composed == "0"
 
 
 def test_translate_case_to_4x_now_handles_simple_arithmetic_branch_values():

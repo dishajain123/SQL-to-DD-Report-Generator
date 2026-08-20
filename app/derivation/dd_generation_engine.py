@@ -60,7 +60,7 @@ from app.models.core import (
     StructuralInfo,
 )
 from app.parsing.dialect import detect_dialect
-from app.parsing.sql_parser import classify_statement, split_statements
+from app.parsing.sql_parser import _DML_KEYWORDS, classify_statement, split_statements
 from app.utils.identity import canonical_logical_name
 from app.utils.sql_aliases import (
     SQLGLOT_DIALECT_MAP,
@@ -1543,6 +1543,19 @@ def _rewrite_bundled_business_date_var(expression: str) -> str:
     )
 
 
+def _rewrite_business_date_variables(expression: str, entity_name: str) -> str:
+    if not expression or not entity_name:
+        return expression
+    replacement = f'"{entity_name}"."var"."BUSINESS_DATE"'
+    rewritten = re.sub(
+        r'(?<![A-Za-z0-9_".])@?(?:v_)?(?:PROCESSDATE|PROCESSDT|BUSINESSDATE)\b',
+        replacement,
+        expression,
+        flags=re.IGNORECASE,
+    )
+    return rewritten.replace('."VAR"."BUSINESS_DATE"', '."var"."BUSINESS_DATE"')
+
+
 def _rewrite_bundled_alias_column_refs(expression: str, source_text: str = "") -> str:
     """Rewrite fused alias-like tokens such as `PUI_CAL_DEFAULT_REASON`
     back to the source column name `DEFAULT_REASON` when the suffix is
@@ -1681,37 +1694,15 @@ def _rewrite_in_subquery_membership(expression: str) -> str:
 
 
 def _strip_min_wrapper(expression: str) -> str:
-    """Drop a single balanced `MIN(...)` wrapper when the inner payload is
-    already a complete expression.
+    """Preserve MIN wrappers as-is.
 
-    The platform grammar/validator do not rely on `MIN` for the generated
-    DD rows in this project, and the model sometimes emits `MIN(...)` as a
-    SQL-shaped aggregate wrapper around a single conditional expression.
-    Removing only the wrapper keeps the inner logic while avoiding an
-    unnecessary parser failure.
+    Earlier versions stripped MIN(...) aggressively to work around a
+    small set of malformed model outputs, but that destroyed legitimate
+    source-derived aggregates such as `MIN(A.SMA_Dt)`. The grammar now
+    supports MIN directly, so the safest generic behavior is to leave the
+    wrapper untouched.
     """
-    result: list[str] = []
-    i = 0
-    in_double = False
-    while i < len(expression):
-        ch = expression[i]
-        if ch == '"':
-            in_double = not in_double
-            result.append(ch)
-            i += 1
-            continue
-
-        if not in_double and expression[i : i + 4].upper() == "MIN(":
-            open_index = i + 3
-            close_index = _find_matching_paren(expression, open_index)
-            if close_index != -1:
-                result.append(expression[i + 4 : close_index].strip())
-                i = close_index + 1
-                continue
-
-        result.append(ch)
-        i += 1
-    return "".join(result)
+    return expression
 
 
 def _repair_missing_then_parentheses(expression: str) -> str:
@@ -2602,7 +2593,7 @@ def _source_allows_target_reference(source_sql: str, entity_name: str, column: s
     return False
 
 
-_SAFE_ARITHMETIC_FUNCTION_NAMES = {"COALESCE", "NVL", "ISNULL", "TODATE", "SYSDATE"}
+_SAFE_ARITHMETIC_FUNCTION_NAMES = {"COALESCE", "NVL", "ISNULL", "TODATE", "SYSDATE", "MAX", "MIN"}
 
 
 def _split_top_level(text: str, separators: str) -> list[str] | None:
@@ -2819,6 +2810,8 @@ def _translate_case_to_4x(case_node) -> str | None:
         value_node = when.args.get("true")
         if condition_node is None or value_node is None:
             return None
+        if isinstance(value_node, exp.Case):
+            return None
         if switch_value is not None:
             left_sql = _render_value_expression_to_4x(switch_value)
             right_sql = _render_value_expression_to_4x(condition_node)
@@ -2834,6 +2827,8 @@ def _translate_case_to_4x(case_node) -> str | None:
 
     default_node = case_node.args.get("default")
     if default_node is not None:
+        if isinstance(default_node, exp.Case):
+            return None
         default_sql = _render_value_expression_to_4x(default_node)
         if default_sql is None:
             return None
@@ -2853,6 +2848,9 @@ def _translate_case_to_4x(case_node) -> str | None:
 def _render_value_expression_to_4x(node) -> str | None:
     while isinstance(node, exp.Paren):
         node = node.this
+
+    if isinstance(node, exp.Case):
+        return _translate_case_to_4x(node)
 
     if isinstance(node, exp.Add):
         left = _render_value_expression_to_4x(node.this)
@@ -2881,6 +2879,66 @@ def _render_value_expression_to_4x(node) -> str | None:
         if left is None or right is None:
             return None
         return f"({left} / {right})"
+
+    if isinstance(node, exp.Neg):
+        inner = _render_value_expression_to_4x(node.this)
+        if inner is None:
+            return None
+        return f"-{inner}"
+
+    if isinstance(node, exp.Parameter):
+        ident = getattr(node.this, "this", None)
+        text = str(ident) if ident is not None else str(node.this)
+        text = text.strip()
+        return f"@{text}" if text else None
+
+    if isinstance(node, exp.DateAdd):
+        unit = getattr(node.args.get("unit"), "this", None)
+        unit_text = str(unit).upper() if unit is not None else ""
+        if unit_text not in {"DAY", "DAYS"}:
+            return None
+        base = _render_value_expression_to_4x(node.this)
+        amount = _render_value_expression_to_4x(node.expression)
+        if base is None or amount is None:
+            return None
+        return f"ADDDAY({base}, {amount})"
+
+    if isinstance(node, exp.Anonymous) and str(getattr(node, "name", "")).upper() == "CHOOSE":
+        args = list(node.expressions or [])
+        if len(args) < 2:
+            return None
+        index = _render_value_expression_to_4x(args[0])
+        choices = [_render_value_expression_to_4x(arg) for arg in args[1:]]
+        if index is None or any(choice is None for choice in choices):
+            return None
+        if len(choices) == 1:
+            return choices[0]
+        result = choices[-1]
+        for i, choice in reversed(list(enumerate(choices[:-1], start=1))):
+            result = f'IF({index} == {i})THEN({choice})ELSE({result})'
+        return result
+
+    if isinstance(node, exp.Expression):
+        func_name = str(getattr(node, "key", "")).upper()
+        if func_name in _SAFE_ARITHMETIC_FUNCTION_NAMES:
+            args: list[str] = []
+            this = getattr(node, "this", None)
+            if this is not None and not isinstance(node, exp.Anonymous):
+                rendered_this = _render_value_expression_to_4x(this)
+                if rendered_this is None:
+                    return None
+                args.append(rendered_this)
+            for arg in node.expressions or []:
+                rendered_arg = _render_value_expression_to_4x(arg)
+                if rendered_arg is None:
+                    return None
+                args.append(rendered_arg)
+            if func_name in {"MAX", "MIN"} and len(args) == 1:
+                return f"{func_name}({args[0]})"
+            if func_name in {"COALESCE", "NVL", "ISNULL"}:
+                return f"COALESCE({', '.join(args)})"
+            if args:
+                return f"{func_name}({', '.join(args)})"
 
     try:
         text = node.sql(dialect="oracle")
@@ -3082,13 +3140,32 @@ def _render_sql_condition_to_4x(node, source_alias: str | None = None) -> str | 
         operand = _render_boolean_predicate_leaf(node.this, source_alias=source_alias)
         return f"ISEMPTY({operand})" if operand else None
 
+    if isinstance(node, exp.Between):
+        left = _render_boolean_predicate_leaf(node.this, source_alias=source_alias)
+        low = _render_value_expression_to_4x(node.args.get("low"))
+        high = _render_value_expression_to_4x(node.args.get("high"))
+        if left is None or low is None or high is None:
+            return None
+        return f"{left} BETWEEN [{low},{high}]"
+
+    if isinstance(node, exp.In):
+        left = _render_boolean_predicate_leaf(node.this, source_alias=source_alias)
+        values = [_render_value_expression_to_4x(expr) for expr in (node.expressions or [])]
+        if left is None or not values or any(value is None for value in values):
+            return None
+        return f'{left} IN [{",".join(values)}]'
+
     # Any other node (a comparison, BETWEEN, a bare column/literal) has
     # no AND/OR/NOT structure of its own to get wrong -- render it via
     # the existing, already-proven leaf pipeline.
     return _render_boolean_predicate_leaf(node, source_alias=source_alias)
 
 
-def _parse_simple_assignment_stage(raw_sql: str, target_column: str) -> tuple[str, str, str] | None:
+def _parse_simple_assignment_stage(
+    raw_sql: str,
+    target_column: str,
+    entity_name: str = "",
+) -> tuple[str, str, str] | None:
     """Extract a deterministic guard/value pair for a simple UPDATE or
     MERGE write to `target_column`.
 
@@ -3133,6 +3210,19 @@ def _parse_simple_assignment_stage(raw_sql: str, target_column: str) -> tuple[st
                         ) or where.this.sql(dialect=_SQLGLOT_DIALECT[dialect])
                     return guard, projection, target_column
 
+        # `stmt` falls back to the raw, un-split chunk (line ~3115) whenever
+        # no UPDATE/MERGE candidate was found for this dialect. That raw
+        # chunk is very often pure control flow (PRINT/BEGIN/END/DECLARE/
+        # TRY/CATCH) that was never going to parse as a SQL statement in
+        # any dialect. Feeding it to sqlglot anyway doesn't raise -- sqlglot
+        # logs a "falling back to Command" WARNING and returns a stub node
+        # instead of raising -- so the `except Exception` below never even
+        # sees it; it just adds log noise and wasted work for a result we
+        # already know is useless. Skip the call entirely when the fragment
+        # isn't DML to begin with.
+        if classify_statement(stmt) not in _DML_KEYWORDS:
+            continue
+
         try:
             tree = sqlglot.parse_one(stmt, read=_SQLGLOT_DIALECT[dialect])
         except Exception:
@@ -3173,8 +3263,16 @@ def _parse_simple_assignment_stage(raw_sql: str, target_column: str) -> tuple[st
                     case_translation = _translate_case_to_4x(value_node)
                     if case_translation is None:
                         break
+                    case_translation = _rewrite_business_date_variables(case_translation, entity_name)
                     return guard, case_translation, assignment.this.name
+                value = _render_value_expression_to_4x(value_node)
+                if value is not None:
+                    value = _rewrite_business_date_variables(value, entity_name)
+                    if validate_expression(value).valid:
+                        return guard, value, assignment.this.name
+                    break
                 value = value_node.sql(dialect=_SQLGLOT_DIALECT[dialect])
+                value = _rewrite_business_date_variables(value, entity_name)
                 if not _is_simple_stage_value(value):
                     break
                 return guard, value, assignment.this.name
@@ -3252,10 +3350,21 @@ def _parse_simple_assignment_stage(raw_sql: str, target_column: str) -> tuple[st
                         case_translation = _translate_case_to_4x(value_node)
                         if case_translation is None:
                             break
-                        value = case_translation
+                        value = _rewrite_business_date_variables(case_translation, entity_name)
                     else:
-                        value = value_node.sql(dialect=_SQLGLOT_DIALECT[dialect])
-                        if not _is_simple_stage_value(value):
+                        value = _render_value_expression_to_4x(value_node)
+                        if value is not None:
+                            value = _rewrite_business_date_variables(value, entity_name)
+                            if validate_expression(value).valid:
+                                pass
+                            else:
+                                break
+                        else:
+                            value = value_node.sql(dialect=_SQLGLOT_DIALECT[dialect])
+                            value = _rewrite_business_date_variables(value, entity_name)
+                            if not _is_simple_stage_value(value):
+                                break
+                        if value is None:
                             break
                     if when_cond is not None:
                         guard_parts.append(
@@ -3285,7 +3394,7 @@ def _extract_select_into_statement(stmt_text: str) -> str | None:
     candidates = split_statements(cleaned, detect_dialect(cleaned))
     for candidate in candidates:
         upper = candidate.upper()
-        if "SELECT" not in upper or " INTO " not in upper:
+        if "SELECT" not in upper or not re.search(r"\bINTO\b", upper):
             continue
         if not upper.lstrip().startswith("SELECT"):
             continue
@@ -3297,12 +3406,12 @@ def _extract_select_into_statement(stmt_text: str) -> str | None:
 
     for match in select_matches:
         candidate = cleaned[match.start() :].strip()
-        if not candidate.upper().startswith("SELECT") or " INTO " not in candidate.upper():
+        if not candidate.upper().startswith("SELECT") or not re.search(r"\bINTO\b", candidate, re.IGNORECASE):
             continue
 
         boundary_match = None
         for boundary in re.finditer(
-            r"(?mi)^\s*(UPDATE|INSERT|DELETE|MERGE|IF|BEGIN|END|ELSE|WHEN|CREATE|DROP|EXEC|RETURN|WHILE)\b",
+            r"(?mi)^\s*(UPDATE|INSERT|DELETE|MERGE|IF|BEGIN|CREATE|DROP|EXEC|RETURN|WHILE)\b",
             candidate,
         ):
             if boundary.start() > 0:
@@ -3555,11 +3664,18 @@ def _compose_simple_assignment_expression(
     if not assignment_sites:
         return None
 
+    target_pattern = re.compile(rf"\b{re.escape(fallback_column)}\b", re.IGNORECASE)
+    direct_sites = [site for site in assignment_sites if target_pattern.search(site.raw_sql)]
+    if direct_sites:
+        assignment_sites = direct_sites
+
     stages: list[tuple[str, str, str]] = []
     for site in assignment_sites:
-        stage = _parse_simple_assignment_stage(site.raw_sql, fallback_column)
+        stage = _parse_simple_assignment_stage(site.raw_sql, fallback_column, entity_name)
         if stage is None:
-            return None
+            if re.search(rf"\b{re.escape(fallback_column)}\b\s*=", site.raw_sql, re.IGNORECASE):
+                return None
+            continue
         stages.append(stage)
 
     if not stages:
@@ -3581,13 +3697,13 @@ def _compose_simple_assignment_expression(
                     if _render_select_into_projection(tree, current_target.upper()) is not None:
                         first_is_seed_projection = True
                         break
-    expression = "NULL" if first_is_seed_projection else (f'"{entity_name}"."{current_target}"' if entity_name else f'"{current_target}"')
+    expression = "NULL" if first_is_seed_projection else "NULL"
 
     for guard, value, source_target in stages:
         source_target = source_target or current_target
         current_target = source_target
-        normalized_value = _normalize_expression(value, "")
-        if not _is_simple_stage_value(normalized_value):
+        normalized_value = _rewrite_business_date_variables(_normalize_expression(value, ""), entity_name)
+        if not validate_expression(normalized_value).valid:
             return None
         if not guard.strip():
             expression = normalized_value
@@ -3595,7 +3711,7 @@ def _compose_simple_assignment_expression(
         normalized_guard = _normalize_expression(guard, "")
         expression = f"IF({normalized_guard})THEN({normalized_value})ELSE({expression})"
 
-    return _normalize_expression(expression, "")
+    return _rewrite_business_date_variables(_normalize_expression(expression, ""), entity_name)
 
 
 def _repair_trailing_self_reference(expression: str, entity_name: str, column: str, source_sql: str) -> str:
@@ -4012,7 +4128,7 @@ def _generate_for_column(
         )
         grammar_result = validate_expression(deterministic_expression)
         semantic_result = check_semantic_consistency(
-            deterministic_expression, column, entity_name, relevant_chunks, obj.raw_sql
+            deterministic_expression, column, entity_name, relevant_chunks, obj.raw_sql, source_statement_sql
         )
         if grammar_result.valid and semantic_result.passed:
             expression = deterministic_expression
@@ -4047,6 +4163,7 @@ def _generate_for_column(
                     alias_resolution_inventory,
                     quote_replacements=True,
                 )
+                expression = _rewrite_business_date_variables(expression, entity_name)
                 expression = _normalize_expression(expression, obj.raw_sql)
                 repaired = _repair_trailing_self_reference(expression, entity_name, column, obj.raw_sql)
                 if repaired != expression and validate_expression(repaired).valid:
@@ -4060,7 +4177,7 @@ def _generate_for_column(
                     attempt_errors.append(f"Grammar validation failed: {grammar_result.error}")
                 else:
                     semantic_result = check_semantic_consistency(
-                        expression, column, entity_name, relevant_chunks, obj.raw_sql
+                        expression, column, entity_name, relevant_chunks, obj.raw_sql, source_statement_sql
                     )
                     if not semantic_result.passed:
                         attempt_errors.extend(f"Semantic validation: {e}" for e in semantic_result.errors)
