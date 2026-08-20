@@ -36,10 +36,14 @@ import re
 
 from lark import Lark, Tree, Token
 
-from app.models.core import CanonicalModel, DDRow, JobPlan, SQLObject, StructuralInfo
+from app.models.core import CanonicalModel, DDRow, Dialect, JobPlan, SQLObject, StructuralInfo
 from app.report.condition_explainer import explain_expression
 from app.utils.identity import canonical_expression_key, canonical_logical_name
-from app.utils.sql_aliases import collect_table_aliases, resolve_aliases_in_expression
+from app.utils.sql_aliases import (
+    collect_known_reference_names,
+    collect_table_aliases,
+    resolve_aliases_in_expression,
+)
 from app.grammar.validator import KNOWN_FUNCTIONS
 
 
@@ -253,11 +257,11 @@ def _process_name(job_plan: JobPlan, canonical_models: list[CanonicalModel], obj
     return f"{job_plan.company} {job_plan.platform}"
 
 
-def _extract_dependencies(expression: str) -> list[str]:
+def _extract_dependencies(expression: str, known_names: frozenset[str] = frozenset()) -> list[str]:
     try:
         tree = _DEPENDENCY_PARSER.parse(expression)
     except Exception:
-        return _extract_dependencies_from_text(expression)
+        return _extract_dependencies_from_text(expression, known_names)
 
     refs: list[str] = []
     seen: set[str] = set()
@@ -274,7 +278,7 @@ def _extract_dependencies(expression: str) -> list[str]:
         if not ref:
             continue
         upper = ref.upper()
-        if upper in _KEYWORDS or upper in KNOWN_FUNCTIONS or _is_dependency_literal(ref):
+        if upper in _KEYWORDS or upper in KNOWN_FUNCTIONS or _is_dependency_literal(ref, known_names):
             continue
         if upper not in seen:
             seen.add(upper)
@@ -283,7 +287,7 @@ def _extract_dependencies(expression: str) -> list[str]:
     return refs
 
 
-def _extract_dependencies_from_text(expression: str) -> list[str]:
+def _extract_dependencies_from_text(expression: str, known_names: frozenset[str] = frozenset()) -> list[str]:
     refs: list[str] = []
     seen: set[str] = set()
     i = 0
@@ -294,7 +298,7 @@ def _extract_dependencies_from_text(expression: str) -> list[str]:
         if not canonical:
             return
         upper = canonical.upper()
-        if upper in _KEYWORDS or upper in KNOWN_FUNCTIONS or _is_dependency_literal(canonical):
+        if upper in _KEYWORDS or upper in KNOWN_FUNCTIONS or _is_dependency_literal(canonical, known_names):
             return
         if upper not in seen:
             seen.add(upper)
@@ -387,18 +391,42 @@ def _render_dependency_ref(node: Tree) -> str | None:
     return ".".join(parts)
 
 
-def _is_dependency_literal(value: str) -> bool:
+def _is_dependency_literal(value: str, known_names: frozenset[str] = frozenset()) -> bool:
+    """Decide whether a candidate reference is a real source column/parameter
+    or a literal/constant.
+
+    The 4X DSL quotes string literals and identifiers identically
+    ("ALWYS_STD" vs "ACCOUNTCAL"), so the grammar alone cannot disambiguate
+    a bare, single-part quoted token -- and neither can a hardcoded list of
+    known business values, since that list can never be complete (e.g.
+    "ALWYS_STD" is a real value that was missing from any such list).
+
+    The generic, source-grounded rule:
+      - A multi-part dotted reference (table.column, or alias.column after
+        alias resolution) is always a real reference -- the DSL only forms
+        these from genuine qualified column access.
+      - A single, bare token is a real reference only if it was actually
+        observed as a column or parameter name in the object's parsed
+        source SQL (`known_names`, from `collect_known_reference_names`).
+        Anything else bare is a literal/constant.
+      - When no source SQL was available to build `known_names` (e.g. the
+        row's source objects couldn't be resolved), fall back to the small
+        curated list of common boolean/status literals as a safety net
+        rather than either accepting or rejecting every bare token.
+    """
     token = value.strip().strip('"')
     if not token:
-        return True
-    upper = token.upper()
-    if upper in _DEPENDENCY_LITERAL_VALUES:
         return True
     if _DEPENDENCY_NUMERIC_RE.fullmatch(token):
         return True
     if _DEPENDENCY_DATE_RE.fullmatch(token):
         return True
-    return False
+    if "." in token:
+        return False
+    upper = token.upper()
+    if known_names:
+        return upper not in known_names
+    return upper in _DEPENDENCY_LITERAL_VALUES
 
 
 def _business_meaning_from_formula(column_name: str, expression: str) -> str:
@@ -441,19 +469,60 @@ class _RuleGroup:
     source_statement_refs: list[str]
 
 
-def _row_alias_map(row: DDRow, objects: dict[str, SQLObject]) -> dict[str, tuple[str, ...]]:
-    alias_map: dict[str, tuple[str, ...]] = {}
+def _row_source_texts(row: DDRow, objects: dict[str, SQLObject]) -> list[tuple[str, "Dialect"]]:
+    """The (text, dialect) pairs to resolve this row's aliases/references
+    against.
+
+    Prefers the row's own `source_statement_sql` -- the exact statement(s)
+    its formula was actually derived from -- because a short alias like
+    "A" is routinely reused for a different table in a different statement
+    elsewhere in the same object; scoping to just this row's statements
+    keeps that unambiguous instead of collapsing it across the whole
+    object. Falls back to the whole object's raw SQL for older rows that
+    don't carry source_statement_sql (or when a source object can't be
+    resolved), which is safe but more conservative -- a genuinely
+    cross-statement-ambiguous alias will still be correctly dropped rather
+    than guessed.
+    """
+    dialects: list["Dialect"] = []
     for object_id in row.source_object_ids or []:
         obj = objects.get(object_id)
-        if obj is None or not obj.raw_sql.strip():
-            continue
-        for alias, parts in collect_table_aliases(obj.raw_sql, obj.dialect).items():
+        if obj is not None:
+            dialects.append(obj.dialect)
+
+    if row.source_statement_sql and dialects:
+        # All of a row's source objects share one dialect in practice (a
+        # DD row is generated per-object); use the first resolved one.
+        return [(text, dialects[0]) for text in row.source_statement_sql if text.strip()]
+
+    texts: list[tuple[str, "Dialect"]] = []
+    for object_id in row.source_object_ids or []:
+        obj = objects.get(object_id)
+        if obj is not None and obj.raw_sql.strip():
+            texts.append((obj.raw_sql, obj.dialect))
+    return texts
+
+
+def _row_alias_map(row: DDRow, objects: dict[str, SQLObject]) -> dict[str, tuple[str, ...]]:
+    alias_map: dict[str, tuple[str, ...]] = {}
+    for text, dialect in _row_source_texts(row, objects):
+        for alias, parts in collect_table_aliases(text, dialect).items():
             existing = alias_map.get(alias)
             if existing is None:
                 alias_map[alias] = parts
             elif existing != parts:
                 alias_map.pop(alias, None)
     return alias_map
+
+
+def _row_known_reference_names(row: DDRow, objects: dict[str, SQLObject]) -> frozenset[str]:
+    """Union of real column/parameter/table names actually parsed out of
+    this row's source SQL -- the ground truth used to tell a genuine source
+    reference apart from a literal/constant in the generated formula."""
+    names: set[str] = set()
+    for text, dialect in _row_source_texts(row, objects):
+        names |= collect_known_reference_names(text, dialect)
+    return frozenset(names)
 
 
 def _build_rule_groups(dd_rows: list[DDRow], objects: dict[str, SQLObject]) -> list[_RuleGroup]:
@@ -468,6 +537,7 @@ def _build_rule_groups(dd_rows: list[DDRow], objects: dict[str, SQLObject]) -> l
         alias_map = _row_alias_map(first, objects)
         if alias_map:
             formula = resolve_aliases_in_expression(formula, alias_map, quote_replacements=True)
+        known_names = _row_known_reference_names(first, objects)
         business_meaning = first.business_meaning.strip() if getattr(first, "business_meaning", "").strip() else ""
         if not business_meaning:
             business_meaning = _business_meaning_from_formula(first.column_name, formula)
@@ -478,7 +548,7 @@ def _build_rule_groups(dd_rows: list[DDRow], objects: dict[str, SQLObject]) -> l
                 column_name=first.column_name,
                 rows=rows,
                 business_meaning=business_meaning,
-                depends_on=_extract_dependencies(formula),
+                depends_on=_extract_dependencies(formula, known_names),
                 formula=formula,
                 effective_dates=_format_effective_dates(rows),
                 status=first.status.value,

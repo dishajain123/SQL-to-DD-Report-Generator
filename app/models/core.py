@@ -214,6 +214,16 @@ class DDRow(BaseModel):
     # app/derivation/dd_generator.py::_generate_for_column from the same
     # _AssignmentSite data already used to build the LLM's prompt context.
     source_statement_refs: list[str] = Field(default_factory=list)
+    # The actual raw SQL text behind each source_statement_refs entry, in
+    # the same order. Lets downstream stages (alias resolution, dependency
+    # extraction) work from the specific statement(s) a row's formula came
+    # from instead of the whole object's SQL -- important because a short
+    # alias like "A" is routinely reused for a different table in a
+    # different statement elsewhere in the same object, which is
+    # unresolvably ambiguous at the whole-object level but perfectly
+    # resolvable within the one or two statements a given row actually
+    # derives from.
+    source_statement_sql: list[str] = Field(default_factory=list)
     confidence: float = 1.0
     validation_errors: list[str] = Field(default_factory=list)
     advisory_notes: list[str] = Field(default_factory=list)

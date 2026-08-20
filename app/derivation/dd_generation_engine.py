@@ -62,7 +62,12 @@ from app.models.core import (
 from app.parsing.dialect import detect_dialect
 from app.parsing.sql_parser import classify_statement, split_statements
 from app.utils.identity import canonical_logical_name
-from app.utils.sql_aliases import collect_table_aliases, resolve_aliases_in_expression
+from app.utils.sql_aliases import (
+    SQLGLOT_DIALECT_MAP,
+    collect_known_reference_names,
+    collect_table_aliases,
+    resolve_aliases_in_expression,
+)
 from app.rag.chroma_store import ChromaStore, DOMAIN_COLLECTION, PLATFORM_COLLECTION
 from app.utils.config import settings
 from app.utils.logging_config import get_logger
@@ -74,7 +79,11 @@ logger = get_logger(__name__)
 # exported unchanged.
 _MAX_GENERATION_ATTEMPTS = max(1, settings.dd_generation_max_attempts)
 _MAX_SOURCE_SQL_CONTEXT_CHARS = 5000
-_SQLGLOT_DIALECT = {Dialect.ORACLE: "oracle", Dialect.MYSQL: "mysql", Dialect.SQLSERVER: "tsql"}
+# Single shared Dialect -> sqlglot-dialect-name mapping, defined once in
+# app.utils.sql_aliases and reused here so the alias resolver, the
+# reference-inventory collector, and this engine's own sqlglot calls can
+# never drift out of sync with each other again.
+_SQLGLOT_DIALECT = SQLGLOT_DIALECT_MAP
 
 
 @dataclass(frozen=True)
@@ -3767,6 +3776,28 @@ def _build_source_statement_refs(obj: SQLObject, info: StructuralInfo, column: s
     return refs
 
 
+def _build_source_statement_sql(info: StructuralInfo, column: str) -> list[str]:
+    """The actual raw SQL text of each write site that could feed this
+    column's expression, in the same order as _build_source_statement_refs.
+
+    This is what lets alias resolution be scoped to the specific
+    statement(s) a row's formula actually came from, instead of the whole
+    object's raw SQL. A generic alias like "A" is very often reused for a
+    different table in a different statement elsewhere in the same
+    stored procedure (a common pattern: repeated `UPDATE A SET ... FROM
+    X A` blocks) -- resolving against the whole object collapses that as
+    unrecoverably ambiguous and drops the alias entirely, even though it
+    is completely unambiguous within the one or two statements this
+    particular row was actually derived from.
+    """
+    snippets: list[str] = []
+    for site in _assignment_sites(info, column):
+        text = site.raw_sql.strip()
+        if text:
+            snippets.append(text)
+    return snippets
+
+
 def _collect_source_reference_inventory(
     text: str,
     dialect: Dialect,
@@ -3937,6 +3968,7 @@ def _generate_for_column(
     relevant_sql = "\n\n".join(chunk.raw_sql.strip() for chunk in relevant_chunks if chunk.raw_sql.strip())
     assignment_context = _format_assignment_context(info, column, sites=sites)
     source_statement_refs = _build_source_statement_refs(obj, info, column)
+    source_statement_sql = _build_source_statement_sql(info, column)
     rag_context = _retrieve_rag_context(
         rag_store, relevant_sql, canonical_model.technical_summary, canonical_model.business_summary
     )
@@ -4131,6 +4163,7 @@ def _generate_for_column(
                 source_chain_id=canonical_model.chain_id,
                 source_object_ids=[obj.object_id],
                 source_statement_refs=source_statement_refs,
+                source_statement_sql=source_statement_sql,
                 confidence=row_confidence,
                 validation_errors=row_validation_errors,
                 advisory_notes=advisory_notes,
