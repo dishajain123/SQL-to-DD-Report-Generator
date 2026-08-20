@@ -44,7 +44,7 @@ from sqlglot import exp
 from app.derivation.llm_client import LLMClient
 from app.derivation.period_pruning import prune_expression_for_period
 from app.derivation.versioning import effective_periods_for_column
-from app.grammar.validator import is_incomplete_expression_error, validate_expression
+from app.grammar.validator import validate_expression
 from app.guardrails.semantic_validation import check_semantic_consistency
 from app.models.core import (
     CanonicalModel,
@@ -62,6 +62,7 @@ from app.models.core import (
 from app.parsing.dialect import detect_dialect
 from app.parsing.sql_parser import classify_statement, split_statements
 from app.utils.identity import canonical_logical_name
+from app.utils.sql_aliases import collect_table_aliases, resolve_aliases_in_expression
 from app.rag.chroma_store import ChromaStore, DOMAIN_COLLECTION, PLATFORM_COLLECTION
 from app.utils.config import settings
 from app.utils.logging_config import get_logger
@@ -82,6 +83,85 @@ class _AssignmentSite:
     statement_indices: list[int]
     raw_sql: str
     columns_written: list[str]
+
+
+@dataclass(frozen=True)
+class _SourceReferenceInventory:
+    """Canonical source-backed reference facts for one DD column.
+
+    The inventory is intentionally conservative: it only records tables,
+    aliases, and column-to-qualifier pairings that were actually observed
+    in parsed source SQL text. The grounding step later uses this as a
+    whitelist for repairing hallucinated table qualifiers without ever
+    inventing a new source relation.
+    """
+
+    target_entity_name: str
+    allowed_qualifiers: set[str]
+    qualifiers_by_column: dict[str, set[str]]
+
+    def allowed_reference_lines(self, limit: int = 40) -> list[str]:
+        lines: list[str] = []
+        if self.target_entity_name:
+            lines.append(f"Target entity mapping: {self.target_entity_name}")
+        if self.allowed_qualifiers:
+            lines.append("Allowed qualifiers: " + ", ".join(sorted(self.allowed_qualifiers)))
+        for column in sorted(self.qualifiers_by_column):
+            qualifiers = sorted(q for q in self.qualifiers_by_column[column] if q)
+            if not qualifiers:
+                continue
+            lines.append(f"{column}: {', '.join(qualifiers)}")
+            if len(lines) >= limit:
+                break
+        return lines
+
+
+def _canonical_alias_text(value: str | None) -> str | None:
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    return canonical_logical_name(stripped) if stripped else None
+
+
+def _extract_alias_name(node) -> str | None:
+    alias = getattr(node, "args", {}).get("alias") if hasattr(node, "args") else None
+    if alias is None:
+        alias = getattr(node, "alias", None)
+    if isinstance(alias, exp.TableAlias):
+        alias = alias.this
+    if isinstance(alias, exp.Identifier):
+        alias = alias.this
+    if isinstance(alias, str) and alias.strip():
+        return canonical_logical_name(alias.strip())
+    if isinstance(node, exp.Alias):
+        alias = node.alias_or_name or node.alias
+        if isinstance(alias, exp.TableAlias):
+            alias = alias.this
+        if isinstance(alias, exp.Identifier):
+            alias = alias.this
+        if isinstance(alias, str) and alias.strip():
+            return canonical_logical_name(alias.strip())
+    return None
+
+
+_LEADING_DOTTED_ALIAS_RE = re.compile(
+    r'(?<![A-Za-z0-9_"])'
+    r'(?P<identifier>"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)'
+    r'(?=\s*\.)'
+)
+
+
+def _canonicalize_leading_dotted_aliases(expression: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        identifier = match.group("identifier")
+        raw = identifier[1:-1] if identifier.startswith('"') and identifier.endswith('"') else identifier
+        if raw != raw.lower():
+            return identifier
+        if identifier.startswith('"') and identifier.endswith('"'):
+            return f'"{canonical_logical_name(raw)}"'
+        return canonical_logical_name(identifier)
+
+    return _LEADING_DOTTED_ALIAS_RE.sub(replace, expression)
 
 
 def _relevant_chunks(info: StructuralInfo, column: str) -> list[SmartChunk]:
@@ -2461,6 +2541,7 @@ def _normalize_expression(expression: str, source_text: str = "") -> str:
     expression = _rewrite_in_subquery_membership(expression)
     expression = _rewrite_bundled_alias_column_refs(expression, source_text)
     expression = _rewrite_unquoted_dotted_refs(expression)
+    expression = _canonicalize_leading_dotted_aliases(expression)
     expression = _rewrite_bundled_business_date_var(expression)
     expression = _rewrite_exists_predicates(expression)
     expression = _auto_parenthesize_null_check_or_pattern(expression)
@@ -2721,13 +2802,22 @@ def _translate_case_to_4x(case_node) -> str | None:
     if not ifs:
         return None
 
+    switch_value = case_node.args.get("this")
+
     branches: list[tuple[str, str]] = []
     for when in ifs:
         condition_node = when.args.get("this")
         value_node = when.args.get("true")
         if condition_node is None or value_node is None:
             return None
-        condition_sql = _render_sql_condition_to_4x(condition_node) or condition_node.sql(dialect="oracle")
+        if switch_value is not None:
+            left_sql = _render_value_expression_to_4x(switch_value)
+            right_sql = _render_value_expression_to_4x(condition_node)
+            if left_sql is None or right_sql is None:
+                return None
+            condition_sql = f"{left_sql} == {right_sql}"
+        else:
+            condition_sql = _render_sql_condition_to_4x(condition_node) or condition_node.sql(dialect="oracle")
         value_sql = _render_value_expression_to_4x(value_node)
         if value_sql is None:
             return None
@@ -2810,7 +2900,69 @@ def _strip_leading_comments(text: str) -> str:
     return text[pos:]
 
 
-def _render_boolean_predicate_leaf(node) -> str | None:
+def _qualify_unqualified_condition_columns(node, source_alias: str):
+    """Attach `source_alias` to bare column references in a boolean AST.
+
+    sqlglot often parses `WHERE Col > 0` as an unqualified `Column`
+    node. For DD output we want that row context preserved explicitly,
+    so the rendered Platform Condition remains tied to the same source
+    relation the SQL statement read from.
+    """
+    if not source_alias:
+        return node
+
+    alias = _canonical_alias_text(source_alias)
+    if not alias:
+        return node
+
+    def transform(n):
+        if isinstance(n, exp.Column) and not n.table:
+            return exp.column(n.name, table=alias)
+        return n
+
+    try:
+        return node.transform(transform)
+    except Exception:
+        return node
+
+
+def _statement_source_alias(tree) -> str | None:
+    """Best-effort source alias for a statement whose boolean guard is
+    being rendered.
+
+    The goal is not perfect SQL semantics for every dialect nuance; it is
+    to preserve the row context that the source SQL clearly uses when
+    conditions are written with bare column names.
+    """
+    if isinstance(tree, exp.Select):
+        from_clause = tree.args.get("from_")
+        if isinstance(from_clause, exp.From):
+            source = from_clause.this or (from_clause.expressions[0] if from_clause.expressions else None)
+            if source is not None:
+                alias = _extract_alias_name(source)
+                if alias:
+                    return alias
+    if isinstance(tree, exp.Update):
+        from_clause = tree.args.get("from_")
+        if isinstance(from_clause, exp.From):
+            source = from_clause.this or (from_clause.expressions[0] if from_clause.expressions else None)
+            if source is not None:
+                alias = _extract_alias_name(source)
+                if alias:
+                    return alias
+        target = tree.args.get("this")
+        if target is not None:
+            alias = _extract_alias_name(target)
+            if alias:
+                return alias
+    if isinstance(tree, exp.Merge):
+        using = tree.args.get("using")
+        if isinstance(using, exp.Subquery) and isinstance(using.this, exp.Select):
+            return _statement_source_alias(using.this)
+    return None
+
+
+def _render_boolean_predicate_leaf(node, source_alias: str | None = None) -> str | None:
     """Render a non-boolean-structural node (a comparison, IS NULL check,
     BETWEEN, or a bare column/literal) into 4X syntax.
 
@@ -2824,6 +2976,9 @@ def _render_boolean_predicate_leaf(node) -> str | None:
     today's existing behavior) if the result isn't independently
     grammar-valid as a standalone condition.
     """
+    if source_alias:
+        node = _qualify_unqualified_condition_columns(node, source_alias)
+
     try:
         text = node.sql(dialect="oracle")
     except Exception:
@@ -2836,7 +2991,7 @@ def _render_boolean_predicate_leaf(node) -> str | None:
     return None
 
 
-def _render_boolean_operand(node, parent_is_or: bool) -> str | None:
+def _render_boolean_operand(node, parent_is_or: bool, source_alias: str | None = None) -> str | None:
     """Render one operand of an AND/OR, adding parentheses whenever the
     operand's own top-level connective differs from its parent's (an AND
     directly under an OR, or vice versa) -- the exact, and only, shape
@@ -2846,7 +3001,7 @@ def _render_boolean_operand(node, parent_is_or: bool) -> str | None:
     node types, never from the rendered text, so it can never be fooled
     by a leaf value that happens to contain the words "AND"/"OR"."""
     unwrapped = node.this if isinstance(node, exp.Paren) else node
-    rendered = _render_sql_condition_to_4x(unwrapped)
+    rendered = _render_sql_condition_to_4x(unwrapped, source_alias=source_alias)
     if rendered is None:
         return None
     if isinstance(unwrapped, exp.Or) and not parent_is_or:
@@ -2856,7 +3011,7 @@ def _render_boolean_operand(node, parent_is_or: bool) -> str | None:
     return rendered
 
 
-def _render_sql_condition_to_4x(node) -> str | None:
+def _render_sql_condition_to_4x(node, source_alias: str | None = None) -> str | None:
     """Deterministically render a sqlglot boolean-condition AST node into
     4X syntax, with every AND/OR/NOT boundary crossing explicitly
     parenthesized based purely on the parsed TREE STRUCTURE -- never
@@ -2885,18 +3040,18 @@ def _render_sql_condition_to_4x(node) -> str | None:
     existing coverage.
     """
     if isinstance(node, exp.Paren):
-        return _render_sql_condition_to_4x(node.this)
+        return _render_sql_condition_to_4x(node.this, source_alias=source_alias)
 
     if isinstance(node, exp.And):
-        left = _render_boolean_operand(node.this, parent_is_or=False)
-        right = _render_boolean_operand(node.expression, parent_is_or=False)
+        left = _render_boolean_operand(node.this, parent_is_or=False, source_alias=source_alias)
+        right = _render_boolean_operand(node.expression, parent_is_or=False, source_alias=source_alias)
         if left is None or right is None:
             return None
         return f"{left} AND {right}"
 
     if isinstance(node, exp.Or):
-        left = _render_boolean_operand(node.this, parent_is_or=True)
-        right = _render_boolean_operand(node.expression, parent_is_or=True)
+        left = _render_boolean_operand(node.this, parent_is_or=True, source_alias=source_alias)
+        right = _render_boolean_operand(node.expression, parent_is_or=True, source_alias=source_alias)
         if left is None or right is None:
             return None
         return f"{left} OR {right}"
@@ -2909,19 +3064,19 @@ def _render_sql_condition_to_4x(node) -> str | None:
         # NOT(ISEMPTY(X)) and avoids depending on
         # _wrap_bare_not_in_parens's text-level fixup for this path.
         if isinstance(inner_unwrapped, exp.Is) and isinstance(inner_unwrapped.expression, exp.Null):
-            operand = _render_boolean_predicate_leaf(inner_unwrapped.this)
+            operand = _render_boolean_predicate_leaf(inner_unwrapped.this, source_alias=source_alias)
             return f"ISNOTEMPTY({operand})" if operand else None
-        rendered = _render_sql_condition_to_4x(inner_unwrapped)
+        rendered = _render_sql_condition_to_4x(inner_unwrapped, source_alias=source_alias)
         return f"NOT({rendered})" if rendered else None
 
     if isinstance(node, exp.Is) and isinstance(node.expression, exp.Null):
-        operand = _render_boolean_predicate_leaf(node.this)
+        operand = _render_boolean_predicate_leaf(node.this, source_alias=source_alias)
         return f"ISEMPTY({operand})" if operand else None
 
     # Any other node (a comparison, BETWEEN, a bare column/literal) has
     # no AND/OR/NOT structure of its own to get wrong -- render it via
     # the existing, already-proven leaf pipeline.
-    return _render_boolean_predicate_leaf(node)
+    return _render_boolean_predicate_leaf(node, source_alias=source_alias)
 
 
 def _parse_simple_assignment_stage(raw_sql: str, target_column: str) -> tuple[str, str, str] | None:
@@ -2964,13 +3119,17 @@ def _parse_simple_assignment_stage(raw_sql: str, target_column: str) -> tuple[st
                     guard = ""
                     where = select_tree.args.get("where")
                     if where is not None:
-                        guard = _render_sql_condition_to_4x(where.this) or where.this.sql(dialect=_SQLGLOT_DIALECT[dialect])
+                        guard = _render_sql_condition_to_4x(
+                            where.this, source_alias=_statement_source_alias(select_tree)
+                        ) or where.this.sql(dialect=_SQLGLOT_DIALECT[dialect])
                     return guard, projection, target_column
 
         try:
             tree = sqlglot.parse_one(stmt, read=_SQLGLOT_DIALECT[dialect])
         except Exception:
             continue
+
+        source_alias = _statement_source_alias(tree)
 
         def unwrap_parens(node):
             """Strip enclosing exp.Paren wrappers -- e.g. `(CASE WHEN ... END)`,
@@ -2991,7 +3150,9 @@ def _parse_simple_assignment_stage(raw_sql: str, target_column: str) -> tuple[st
             guard = ""
             where = tree.args.get("where")
             if where is not None:
-                guard = _render_sql_condition_to_4x(where.this) or where.this.sql(dialect=_SQLGLOT_DIALECT[dialect])
+                guard = _render_sql_condition_to_4x(where.this, source_alias=source_alias) or where.this.sql(
+                    dialect=_SQLGLOT_DIALECT[dialect]
+                )
 
             for assignment in tree.args.get("expressions", []) or []:
                 if not isinstance(assignment, exp.EQ) or not isinstance(assignment.this, exp.Column):
@@ -3021,7 +3182,9 @@ def _parse_simple_assignment_stage(raw_sql: str, target_column: str) -> tuple[st
                     if isinstance(tree, exp.Update):
                         where = tree.args.get("where")
                         if where is not None:
-                            guard = _render_sql_condition_to_4x(where.this) or where.this.sql(dialect=_SQLGLOT_DIALECT[dialect])
+                            guard = _render_sql_condition_to_4x(where.this, source_alias=source_alias) or where.this.sql(
+                                dialect=_SQLGLOT_DIALECT[dialect]
+                            )
                     return guard, value, target_column
 
         if isinstance(tree, exp.Select) and tree.args.get("into") is not None:
@@ -3030,7 +3193,9 @@ def _parse_simple_assignment_stage(raw_sql: str, target_column: str) -> tuple[st
                 guard = ""
                 where = tree.args.get("where")
                 if where is not None:
-                    guard = _render_sql_condition_to_4x(where.this) or where.this.sql(dialect=_SQLGLOT_DIALECT[dialect])
+                    guard = _render_sql_condition_to_4x(where.this, source_alias=source_alias) or where.this.sql(
+                        dialect=_SQLGLOT_DIALECT[dialect]
+                    )
                 return guard, projection, target_column
 
         select_into_stmt = _extract_select_into_statement(stmt)
@@ -3045,7 +3210,9 @@ def _parse_simple_assignment_stage(raw_sql: str, target_column: str) -> tuple[st
                     guard = ""
                     where = select_tree.args.get("where")
                     if where is not None:
-                        guard = _render_sql_condition_to_4x(where.this) or where.this.sql(dialect=_SQLGLOT_DIALECT[dialect])
+                        guard = _render_sql_condition_to_4x(where.this, source_alias=_statement_source_alias(select_tree)) or where.this.sql(
+                            dialect=_SQLGLOT_DIALECT[dialect]
+                        )
                     return guard, projection, target_column
 
         if isinstance(tree, exp.Merge):
@@ -3082,7 +3249,10 @@ def _parse_simple_assignment_stage(raw_sql: str, target_column: str) -> tuple[st
                         if not _is_simple_stage_value(value):
                             break
                     if when_cond is not None:
-                        guard_parts.append(_render_sql_condition_to_4x(when_cond) or when_cond.sql(dialect=_SQLGLOT_DIALECT[dialect]))
+                        guard_parts.append(
+                            _render_sql_condition_to_4x(when_cond, source_alias=source_alias)
+                            or when_cond.sql(dialect=_SQLGLOT_DIALECT[dialect])
+                        )
                     guard = " AND ".join(f"({part})" for part in guard_parts if part)
                     return guard, value, assignment.this.name
 
@@ -3103,26 +3273,37 @@ def _extract_select_into_statement(stmt_text: str) -> str | None:
     projection statement itself without changing any logic.
     """
     cleaned = _strip_sql_comments_for_guard_matching(stmt_text)
+    candidates = split_statements(cleaned, detect_dialect(cleaned))
+    for candidate in candidates:
+        upper = candidate.upper()
+        if "SELECT" not in upper or " INTO " not in upper:
+            continue
+        if not upper.lstrip().startswith("SELECT"):
+            continue
+        return candidate.strip() or None
+
     select_matches = list(re.finditer(r"\bSELECT\b", cleaned, re.IGNORECASE))
     if not select_matches:
         return None
 
-    candidate = cleaned[select_matches[-1].start() :].strip()
-    if not candidate.upper().startswith("SELECT"):
-        return None
+    for match in select_matches:
+        candidate = cleaned[match.start() :].strip()
+        if not candidate.upper().startswith("SELECT") or " INTO " not in candidate.upper():
+            continue
 
-    boundary_match = None
-    for match in re.finditer(
-        r"(?mi)^\s*(UPDATE|INSERT|DELETE|MERGE|IF|BEGIN|END|ELSE|WHEN|CREATE|DROP|EXEC|RETURN|WHILE)\b",
-        candidate,
-    ):
-        if match.start() > 0:
-            boundary_match = match
-            break
+        boundary_match = None
+        for boundary in re.finditer(
+            r"(?mi)^\s*(UPDATE|INSERT|DELETE|MERGE|IF|BEGIN|END|ELSE|WHEN|CREATE|DROP|EXEC|RETURN|WHILE)\b",
+            candidate,
+        ):
+            if boundary.start() > 0:
+                boundary_match = boundary
+                break
 
-    if boundary_match is not None:
-        candidate = candidate[: boundary_match.start()].strip()
-    return candidate or None
+        if boundary_match is not None:
+            candidate = candidate[: boundary_match.start()].strip()
+        return candidate or None
+    return None
 
 
 def _render_select_into_projection(tree: exp.Select, target_upper: str) -> str | None:
@@ -3177,20 +3358,7 @@ def _select_into_source_alias(tree: exp.Select) -> str | None:
         if len(sources) != 1:
             return None
         source = sources[0]
-    alias = getattr(source, "alias_or_name", None) or getattr(source, "alias", None)
-    if isinstance(alias, exp.TableAlias):
-        alias = alias.this
-    if isinstance(alias, exp.Identifier):
-        alias = alias.this
-    if isinstance(alias, str) and alias.strip():
-        return alias.strip()
-    if isinstance(source, exp.Alias):
-        alias = source.alias_or_name or source.alias
-        if isinstance(alias, str) and alias.strip():
-            return alias.strip()
-        if isinstance(alias, exp.Identifier):
-            return alias.this
-    return None
+    return _extract_alias_name(source)
 
 
 def _extract_update_assignment_rhs(stmt_text: str, target_upper: str) -> str | None:
@@ -3444,13 +3612,14 @@ def _repair_trailing_self_reference(expression: str, entity_name: str, column: s
 
 
 def _expression_should_be_rejected(validation_errors: list[str]) -> bool:
-    """Return True when the generated formula is still structurally incomplete.
+    """Return True when the generated formula is not safe to export.
 
-    These rows should stay in the review store with their validation
-    errors, but they must not be exported as if they were complete
-    formulas.
+    Any row that still has validation errors is a review-only row. The
+    safest behavior is to keep the row metadata and validation notes, but
+    omit the expression itself rather than exporting a misleading or
+    hallucinated Platform Condition.
     """
-    return any(is_incomplete_expression_error(error) for error in validation_errors)
+    return bool(validation_errors)
 
 
 _ColumnJob = tuple[
@@ -3598,6 +3767,144 @@ def _build_source_statement_refs(obj: SQLObject, info: StructuralInfo, column: s
     return refs
 
 
+def _collect_source_reference_inventory(
+    text: str,
+    dialect: Dialect,
+    entity_name: str = "",
+) -> _SourceReferenceInventory:
+    """Extract the source-backed reference universe visible in `text`.
+
+    This is used for two purposes:
+    1. give the generator an explicit allowlist of real tables/aliases and
+       column-to-qualifier pairings; and
+    2. let the grounding step rewrite a hallucinated qualifier only when
+       the source SQL already proves an unambiguous real qualifier exists.
+    """
+    allowed_qualifiers: set[str] = set()
+    qualifiers_by_column: dict[str, set[str]] = {}
+
+    dialect_name = _SQLGLOT_DIALECT.get(dialect, "oracle")
+    for stmt in split_statements(text, dialect):
+        cleaned_stmt = _strip_leading_comments(stmt).strip()
+        if not cleaned_stmt:
+            continue
+        try:
+            tree = sqlglot.parse_one(cleaned_stmt, read=dialect_name)
+        except Exception:
+            continue
+
+        statement_qualifiers: set[str] = set()
+
+        for table in tree.find_all(exp.Table):
+            if table.name:
+                table_name = canonical_logical_name(table.name)
+                allowed_qualifiers.add(table_name)
+                statement_qualifiers.add(table_name)
+            alias = _extract_alias_name(table)
+            if alias:
+                allowed_qualifiers.add(alias)
+                statement_qualifiers.add(alias)
+
+        single_statement_qualifier = _statement_source_alias(tree)
+        if not single_statement_qualifier and len(statement_qualifiers) == 1:
+            single_statement_qualifier = next(iter(statement_qualifiers))
+
+        for column_ref in tree.find_all(exp.Column):
+            column_name = canonical_logical_name(column_ref.name or "")
+            if not column_name:
+                continue
+            qualifier = column_ref.table or single_statement_qualifier
+            if qualifier:
+                qualifier_name = canonical_logical_name(str(qualifier))
+                allowed_qualifiers.add(qualifier_name)
+                qualifiers_by_column.setdefault(column_name, set()).add(qualifier_name)
+
+    return _SourceReferenceInventory(
+        target_entity_name=canonical_logical_name(entity_name.strip()) if entity_name.strip() else "",
+        allowed_qualifiers=allowed_qualifiers,
+        qualifiers_by_column=qualifiers_by_column,
+    )
+
+
+def _append_allowed_reference_context(base_context: str, inventory: _SourceReferenceInventory) -> str:
+    lines = inventory.allowed_reference_lines()
+    if not lines:
+        return base_context
+    extra = "[Allowed source references]\n" + "\n".join(f"- {line}" for line in lines)
+    if base_context.strip():
+        return f"{base_context}\n\n{extra}"
+    return extra
+
+
+def _collect_alias_resolution_inventory(
+    text: str,
+    dialect: Dialect,
+) -> dict[str, tuple[str, ...]]:
+    return collect_table_aliases(text, dialect)
+
+
+def _ground_expression_to_source_references(
+    expression: str,
+    inventory: _SourceReferenceInventory,
+    entity_name: str,
+) -> str:
+    """Rewrite hallucinated table qualifiers only when the source proves a
+    unique real qualifier for the referenced column.
+
+    The grounding is deliberately narrow:
+    - already-allowed qualifiers are left untouched;
+    - the entity-name convention for BUSINESS_DATE is preserved;
+    - otherwise, a candidate qualifier is only rewritten when one and only
+      one real source qualifier is observed for the same referenced
+      column, so the fix never invents a new table or alias.
+    """
+    if not expression or not inventory.qualifiers_by_column:
+        return expression
+
+    entity_display = entity_name.strip().strip('"')
+    entity_upper = canonical_logical_name(entity_display) if entity_display else ""
+    allowed_qualifiers = {canonical_logical_name(q) for q in inventory.allowed_qualifiers if q}
+
+    quoted_ref_re = re.compile(r'"[^"]+"(?:\s*\.\s*"[^"]+")+')
+
+    def replace(match: re.Match[str]) -> str:
+        segments = re.findall(r'"([^"]+)"', match.group(0))
+        if len(segments) < 2:
+            return match.group(0)
+
+        qualifier = canonical_logical_name(segments[0])
+        if qualifier in allowed_qualifiers:
+            return match.group(0)
+
+        tail = [canonical_logical_name(segment) for segment in segments[1:]]
+        column_name = tail[-1] if tail else ""
+
+        if len(tail) >= 2 and tail[0] == "VAR" and tail[1] == "BUSINESS_DATE":
+            if entity_display:
+                return f'"{entity_display}"."var"."BUSINESS_DATE"'
+            return match.group(0)
+
+        if not column_name:
+            return match.group(0)
+
+        source_qualifiers = {
+            canonical_logical_name(q)
+            for q in inventory.qualifiers_by_column.get(column_name, set())
+            if q
+        }
+        if len(source_qualifiers) != 1:
+            return match.group(0)
+
+        replacement_qualifier = next(iter(source_qualifiers))
+        if replacement_qualifier in {qualifier, entity_upper}:
+            return match.group(0)
+
+        return '"' + replacement_qualifier + '"' + "".join(f'."{segment}"' for segment in segments[1:])
+
+    grounded = quoted_ref_re.sub(replace, expression)
+    return grounded
+
+
 def _generate_for_column(
     canonical_model: CanonicalModel,
     obj: SQLObject,
@@ -3633,6 +3940,16 @@ def _generate_for_column(
     rag_context = _retrieve_rag_context(
         rag_store, relevant_sql, canonical_model.technical_summary, canonical_model.business_summary
     )
+    source_reference_inventory = _collect_source_reference_inventory(
+        "\n\n".join(part for part in [obj.raw_sql, relevant_sql, assignment_context] if part),
+        obj.dialect,
+        entity_name=entity_name,
+    )
+    alias_resolution_inventory = _collect_alias_resolution_inventory(
+        "\n\n".join(part for part in [obj.raw_sql, relevant_sql, assignment_context] if part),
+        obj.dialect,
+    )
+    allowed_reference_context = _append_allowed_reference_context("", source_reference_inventory)
     undeterminable_note = (
         "This column is also written inside an exception handler whose only apparent "
         "trigger condition is the same row-scoping filter the normal-flow write also "
@@ -3656,6 +3973,11 @@ def _generate_for_column(
 
     deterministic_expression = _compose_simple_assignment_expression(sites, entity_name, column)
     if deterministic_expression:
+        deterministic_expression = resolve_aliases_in_expression(
+            deterministic_expression,
+            alias_resolution_inventory,
+            quote_replacements=True,
+        )
         grammar_result = validate_expression(deterministic_expression)
         semantic_result = check_semantic_consistency(
             deterministic_expression, column, entity_name, relevant_chunks, obj.raw_sql
@@ -3667,19 +3989,32 @@ def _generate_for_column(
             deterministic_expression = None
 
     if expression is None:
+        grounded_source_sql_excerpt = _append_allowed_reference_context(
+            source_sql_excerpt, source_reference_inventory
+        )
+        grounded_relevant_sql = _append_allowed_reference_context(
+            assignment_context or relevant_sql, source_reference_inventory
+        )
         raw_output = llm_client.generate_formula_expression(
             technical_summary=canonical_model.technical_summary,
             business_summary=canonical_model.business_summary,
-            source_sql=source_sql_excerpt,
+            source_sql=grounded_source_sql_excerpt,
             function_reference=function_reference,
             column_name=column,
             entity_name=entity_name,
-            relevant_sql=assignment_context or relevant_sql,
+            relevant_sql=grounded_relevant_sql,
             rag_context=rag_context,
         )
         for attempt in range(_MAX_GENERATION_ATTEMPTS):
             derivation_option, expression, decision_table_json, parse_errors = _interpret_llm_output(raw_output)
             if expression:
+                expression = _normalize_expression(expression, obj.raw_sql)
+                expression = _ground_expression_to_source_references(expression, source_reference_inventory, entity_name)
+                expression = resolve_aliases_in_expression(
+                    expression,
+                    alias_resolution_inventory,
+                    quote_replacements=True,
+                )
                 expression = _normalize_expression(expression, obj.raw_sql)
                 repaired = _repair_trailing_self_reference(expression, entity_name, column, obj.raw_sql)
                 if repaired != expression and validate_expression(repaired).valid:
@@ -3712,9 +4047,10 @@ def _generate_for_column(
                     f'Target column: "{entity_name}"."{column}"',
                     f"Ordered assignment context:\n{assignment_context}" if assignment_context else "",
                     f"Relevant SQL:\n{relevant_sql}" if relevant_sql else "",
+                    f"{allowed_reference_context}" if allowed_reference_context else "",
                     f"Technical summary:\n{canonical_model.technical_summary}" if canonical_model.technical_summary else "",
                     f"Business summary:\n{canonical_model.business_summary}" if canonical_model.business_summary else "",
-                    f"Source SQL:\n{source_sql_excerpt}",
+                    f"Source SQL:\n{_append_allowed_reference_context(source_sql_excerpt, source_reference_inventory)}",
                     f"Platform reference:\n{function_reference}",
                     f"RAG context:\n{rag_context}" if rag_context else "",
                 ]
@@ -3750,8 +4086,6 @@ def _generate_for_column(
         periods = [(date.today(), True, "", 0)]
 
     if _expression_should_be_rejected(validation_errors):
-        expression = ""
-    elif validation_errors and deterministic_expression is None:
         expression = ""
 
     data_type = _infer_data_type(column)
@@ -3809,21 +4143,52 @@ def _generate_for_column(
 def _interpret_llm_output(
     raw_output: str,
 ) -> tuple[DerivationOption, str | None, str | None, list[str]]:
-    stripped = raw_output.strip().strip("`")
-    if stripped.startswith("{"):
+    stripped = raw_output.strip()
+    if not stripped:
+        return DerivationOption.FORMULA_EXPRESSION, "", None, []
+
+    def unwrap_code_fence(text: str) -> str:
+        fenced = re.match(r"(?is)^\s*```(?:json|text)?\s*(.*?)\s*```\s*$", text)
+        return fenced.group(1).strip() if fenced else text.strip("`").strip()
+
+    def extract_json_candidate(text: str) -> str | None:
+        candidate = unwrap_code_fence(text)
+        start = candidate.find("{")
+        end = candidate.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return None
+        return candidate[start : end + 1].strip()
+
+    def is_decision_table_payload(parsed: object) -> bool:
+        if isinstance(parsed, dict):
+            keys = {str(key).replace("-", "_").lower() for key in parsed.keys()}
+            if {"decision_table", "decisiontable"} & keys:
+                return True
+            if {"rules", "buckets", "input_columns", "output_columns"} & keys and not {"expression", "formula"} & keys:
+                return True
+        return False
+
+    json_candidate = extract_json_candidate(stripped)
+    if json_candidate is not None:
         try:
-            parsed = json.loads(stripped)
-            if "decision_table" in parsed:
+            parsed = json.loads(json_candidate)
+        except json.JSONDecodeError:
+            pass
+        else:
+            if is_decision_table_payload(parsed):
+                decision_table = parsed.get("decision_table") if isinstance(parsed, dict) else None
+                if decision_table is None and isinstance(parsed, dict):
+                    decision_table = parsed.get("decisionTable")
+                if decision_table is None:
+                    decision_table = parsed
                 return (
                     DerivationOption.DECISION_TABLE,
                     None,
-                    json.dumps(parsed["decision_table"]),
+                    json.dumps(decision_table),
                     [],
                 )
-        except json.JSONDecodeError as exc:
-            return DerivationOption.FORMULA_EXPRESSION, None, None, [f"Could not parse decision table JSON: {exc}"]
 
-    return DerivationOption.FORMULA_EXPRESSION, stripped, None, []
+    return DerivationOption.FORMULA_EXPRESSION, unwrap_code_fence(stripped), None, []
 
 
 def _infer_data_type(column_name: str) -> str:

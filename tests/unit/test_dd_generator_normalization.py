@@ -1,19 +1,28 @@
+import json
+
+import sqlglot
 import pytest
 
 from app.derivation.canonical_model import build_canonical_model
 from app.derivation.dd_generator import (
     _build_source_statement_refs,
+    _collect_alias_resolution_inventory,
     _extract_aggregate_info,
+    _collect_source_reference_inventory,
     _extract_variable_trace,
     _format_assignment_context,
+    _interpret_llm_output,
+    _ground_expression_to_source_references,
     _normalize_expression,
+    _translate_case_to_4x,
     generate_dd_rows,
 )
 from app.grammar.validator import validate_expression
 from app.lineage.dependency_graph import build_graph, find_chains
-from app.models.core import DDStatus, Dialect, SmartChunk
+from app.models.core import DDStatus, Dialect, DerivationOption, SmartChunk
 from app.parsing.object_splitter import split_objects
 from app.parsing.structural_analysis import analyze_object
+from app.utils.sql_aliases import resolve_aliases_in_expression
 
 
 def _build_chain(dpd_sql, maxdpd_sql, npa_sql):
@@ -173,12 +182,88 @@ def test_sqlserver_select_into_seed_projection_is_deterministic(sma_marking_sql,
         assert column in rows_by_column
         assert rows_by_column[column].status == DDStatus.ACTIVE
         assert "FCT_NPA_PRODUCT" not in rows_by_column[column].display_derivation_expression
-        assert '"a".' in rows_by_column[column].display_derivation_expression.lower()
+        assert '"A".' in rows_by_column[column].display_derivation_expression
         assert not rows_by_column[column].validation_errors
 
-    assert rows_by_column["UCIF_ID"].status == DDStatus.PENDING_REVIEW
-    assert rows_by_column["UCIF_ID"].display_derivation_expression == ""
-    assert rows_by_column["UCIF_ID"].validation_errors
+    assert 'COALESCE("A"."DPD_IntService", 0) >= COALESCE("A"."RefPeriodIntService", 0)' in rows_by_column["DPD_INTSERVICE"].display_derivation_expression
+    assert 'COALESCE("A"."DPD_NoCredit", 0) >= COALESCE("A"."RefPeriodNoCredit", 0)' in rows_by_column["DPD_NOCREDIT"].display_derivation_expression
+
+    assert rows_by_column["UCIF_ID"].status == DDStatus.ACTIVE
+    assert "FCT_NPA_PRODUCT" not in rows_by_column["UCIF_ID"].display_derivation_expression
+    assert rows_by_column["UCIF_ID"].validation_errors == []
+
+
+def test_interpret_llm_output_routes_json_decision_tables_before_formula_parsing():
+    raw_output = """```json
+    {"decisionTable": {"rules": [{"when": "A", "then": "B"}]}}
+    ```"""
+
+    derivation_option, expression, decision_table_json, parse_errors = _interpret_llm_output(raw_output)
+
+    assert derivation_option == DerivationOption.DECISION_TABLE
+    assert expression is None
+    assert json.loads(decision_table_json) == {"rules": [{"when": "A", "then": "B"}]}
+    assert parse_errors == []
+
+
+def test_simple_case_expression_translates_to_valid_if_else_chain():
+    case_node = sqlglot.parse_one("CASE x WHEN 1 THEN 'A' WHEN 2 THEN 'B' ELSE 'C' END", read="oracle")
+    translated = _translate_case_to_4x(case_node)
+
+    assert translated == 'IF(x == 1)THEN("A")ELSEIF(x == 2)THEN("B")ELSE("C")'
+    assert validate_expression(translated).valid
+
+
+def test_semantic_validation_errors_blank_review_only_expressions(
+    sma_marking_sql, function_reference
+):
+    class SemanticHallucinationLLMClient:
+        def technical_reasoning(self, sql_snippets: list[str]) -> str:
+            return "technical"
+
+        def business_reasoning(self, technical_summary: str) -> str:
+            return "business"
+
+        def generate_formula_expression(
+            self,
+            technical_summary,
+            business_summary,
+            source_sql,
+            function_reference,
+            column_name="",
+            entity_name="",
+            relevant_sql="",
+            rag_context="",
+        ) -> str:
+            return '"DPD_AGGREGATED"."ACCOUNTENTITYID"'
+
+        def retry_with_error(self, previous_expression, error, context) -> str:
+            return '"DPD_AGGREGATED"."ACCOUNTENTITYID"'
+
+    objects_list = []
+    infos = {}
+    for obj in split_objects(sma_marking_sql, "PRO.SMA_MARKING_12122023.StoredProcedure.sql", Dialect.SQLSERVER):
+        objects_list.append(obj)
+        infos[obj.object_id] = analyze_object(obj)
+
+    graph = build_graph(objects_list, infos)
+    chains = find_chains(graph, "job-sma-hallucination", objects_list)
+    objects = {o.object_id: o for o in objects_list}
+
+    client = SemanticHallucinationLLMClient()
+    model = build_canonical_model(chains[0], "job-sma-hallucination", objects, infos, client)
+    rows = generate_dd_rows(
+        chain=chains[0],
+        canonical_model=model,
+        objects=objects,
+        structural_infos=infos,
+        llm_client=client,
+        function_reference=function_reference,
+    )
+
+    assert any(row.validation_errors for row in rows)
+    assert all(row.display_derivation_expression == "" for row in rows if row.validation_errors)
+    assert all("DPD_AGGREGATED" not in row.display_derivation_expression for row in rows)
 
 
 def test_dd_generation_deterministically_derives_cleanup_rows(
@@ -291,6 +376,58 @@ def test_dd_generator_rewrites_misused_isnotempty_with_default_argument():
     expr = 'IF(ISNOTEMPTY("A"."ASSET_NORM","NORMAL")<>"ALWYS_STD")THEN(1)ELSE(0)'
     normalized = _normalize_expression(expr)
     assert 'COALESCE("A"."ASSET_NORM","NORMAL")!="ALWYS_STD"' in normalized.replace(" ", "")
+
+
+def test_grounded_source_references_rewrite_only_to_unique_source_qualifiers():
+    inventory = _collect_source_reference_inventory(
+        """
+        SELECT A.OverDueSinceDt, A.CustomerEntityID, B.OtherColumn
+        FROM AccountCal A
+        JOIN CustomerCal B ON A.CustomerEntityID = B.CustomerEntityID
+        """,
+        Dialect.ORACLE,
+        entity_name="TARGET_ENTITY",
+    )
+
+    expr = (
+        'IF(ISNOTEMPTY("FCT_NPA_PRODUCT"."OverDueSinceDt"))'
+        'THEN(DATEDIFF("FCT_NPA_PRODUCT"."var"."BUSINESS_DATE",'
+        '"FCT_NPA_PRODUCT"."OverDueSinceDt","d")+1)ELSE(0)'
+    )
+    grounded = _ground_expression_to_source_references(expr, inventory, "TARGET_ENTITY")
+
+    assert '"A"."OverDueSinceDt"' in grounded
+    assert '"FCT_NPA_PRODUCT"."OverDueSinceDt"' not in grounded
+    assert '"TARGET_ENTITY"."var"."BUSINESS_DATE"' in grounded
+
+
+def test_grounded_source_references_do_not_guess_when_multiple_source_qualifiers_exist():
+    inventory = _collect_source_reference_inventory(
+        """
+        SELECT A.SharedColumn, B.SharedColumn
+        FROM AccountCal A
+        JOIN CustomerCal B ON A.CustomerEntityID = B.CustomerEntityID
+        """,
+        Dialect.ORACLE,
+        entity_name="FCT_NPA_PRODUCT",
+    )
+
+    expr = 'IF(ISNOTEMPTY("FCT_NPA_PRODUCT"."SharedColumn"))THEN("FCT_NPA_PRODUCT"."SharedColumn")ELSE(0)'
+    grounded = _ground_expression_to_source_references(expr, inventory, "FCT_NPA_PRODUCT")
+
+    assert grounded == expr
+
+
+def test_alias_resolution_rewrites_final_platform_condition_to_source_table_name():
+    inventory = _collect_alias_resolution_inventory(
+        "SELECT a.AccountEntityID FROM ACCOUNTCAL a",
+        Dialect.ORACLE,
+    )
+
+    expr = 'IF(ISNOTEMPTY("a"."AccountEntityID"))THEN("a"."AccountEntityID")ELSE(NULL)'
+    resolved = resolve_aliases_in_expression(expr, inventory, quote_replacements=True)
+
+    assert resolved == 'IF(ISNOTEMPTY("ACCOUNTCAL"."AccountEntityID"))THEN("ACCOUNTCAL"."AccountEntityID")ELSE(NULL)'
 
 
 def test_dd_generator_rewrites_string_concatenation_to_concat():

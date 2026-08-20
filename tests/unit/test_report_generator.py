@@ -1,8 +1,20 @@
 from datetime import date
 
-from app.models.core import CanonicalModel, ColumnType, DDRow, DDStatus, DerivationOption, GlossaryTerm, Intent, JobPlan
+from app.models.core import (
+    CanonicalModel,
+    ColumnType,
+    DDRow,
+    DDStatus,
+    DerivationOption,
+    Dialect,
+    GlossaryTerm,
+    Intent,
+    JobPlan,
+    ObjectType,
+    SQLObject,
+)
 from app.report.condition_explainer import explain_expression
-from app.report.report_generator import generate_report
+from app.report.report_generator import _extract_dependencies, generate_report
 
 
 def _row(**overrides) -> DDRow:
@@ -79,8 +91,10 @@ def test_report_uses_required_structure_and_rule_ids(tmp_path):
     assert 'IF(ISEMPTY("FCT_NPA_PRODUCT"."REFPERIODMAX"))THEN(0)ELSE("FCT_NPA_PRODUCT"."REFPERIODMAX")' in text
     assert "**Platform Condition:**" in text
     assert "**Human-Readable Explanation:**" in text
-    assert "the result is 0" in text
-    assert "the refperiodmax field in fct npa product" in text
+    assert "- If the reference period max is blank or missing:" in text
+    assert "- Return 0." in text
+    assert "- Otherwise:" in text
+    assert "- Return the reference period max." in text
     assert "**Purpose:**" not in text
 
 
@@ -124,14 +138,13 @@ def test_platform_condition_is_preserved_and_explanation_is_separate(tmp_path):
     assert squash(platform_condition) == squash(expression)
 
     for fragment in [
-        "at least one of the following is true",
-        "the x field in a is greater than 1",
-        "the y field in a equals yes",
-        "another rule applies",
-        "the z field in b has a value",
-        "the result is the z field in b",
-        "the result is the w field in b",
-        "the result is no value",
+        "- If at least one of the following is true: the x field is greater than 1 or the y field equals yes:",
+        "- If the z field has a value:",
+        "- Return the z field.",
+        "- Otherwise, if the x field is less than or equal to 0:",
+        "- Return 0.",
+        "- Otherwise:",
+        "- Leave the field blank.",
     ]:
         assert fragment in explanation, f"missing fragment: {fragment!r}"
 
@@ -148,11 +161,106 @@ def test_condition_explainer_covers_simple_and_complex_cases():
     )
     complex_explanation = explain_expression(complex_expr)
 
-    assert simple == "If the b field in a is blank or missing, the result is 0. Otherwise, the result is the b field in a."
+    assert simple == "- If the b field is blank or missing:\n- Return 0.\n- Otherwise:\n- Return the b field."
     assert complex_explanation is not None
-    assert "at least one of the following is true" in complex_explanation
-    assert "another rule applies" in complex_explanation
-    assert "the result is no value" in complex_explanation
+    assert "- If at least one of the following is true" in complex_explanation
+    assert "- Otherwise, if the x field is less than or equal to 0:" in complex_explanation
+    assert "- Leave the field blank." in complex_explanation
+
+
+def test_condition_explainer_formats_coalesce_naturally():
+    explanation = explain_expression(
+        'IF(COALESCE("A"."BALANCE",0)>0 AND COALESCE("A"."FLGPROCESSING","N")=="N")'
+        'THEN(COALESCE("ACCOUNTCAL"."var"."BUSINESS_DATE",NULL)-COALESCE("DPD"."DPD_MAX",0)+1)'
+        'ELSE(COALESCE("A"."RefPeriodOverDrawn",0))'
+    )
+
+    assert explanation is not None
+    assert "- If all of the following are true: the balance is greater than 0, treating blank as 0 and the flag processing equals no, treating blank as no:" in explanation
+    assert "the business date minus the DPD max plus 1" in explanation
+    assert "- Return the reference overdrawn period, treating blank as 0." in explanation
+
+
+def test_condition_explainer_renders_flg_as_flag():
+    explanation = explain_expression('IF("A"."FLGSMA"=="Y")THEN(1)ELSE(0)')
+
+    assert explanation is not None
+    assert "the flag SMA field equals yes" in explanation
+
+
+def test_condition_explainer_handles_coalesce_comparisons_and_dates():
+    explanation = explain_expression(
+        'IF(COALESCE("A"."FLAG","N")=="Y" OR COALESCE("A"."AMOUNT",0)>=10)THEN(DATE("2026-01-01"))ELSE(NULL)'
+    )
+
+    assert explanation is not None
+    assert "the flag equals yes, treating blank as no" in explanation
+    assert "the amount is greater than or equal to 10, treating blank as 0" in explanation
+    assert "the date value for 2026-01-01" in explanation
+
+
+def test_report_dependency_extraction_omits_literals_and_constants():
+    expression = (
+        'IF("A"."FLAG"=="Y" AND COALESCE("A"."BALANCE",0)>0 AND "B"."STATUS"=="ACTIVE")'
+        'THEN("A"."TARGET")ELSE(NULL)'
+    )
+
+    assert _extract_dependencies(expression) == [
+        "A.FLAG",
+        "A.BALANCE",
+        "B.STATUS",
+        "A.TARGET",
+    ]
+
+
+def test_report_dependency_extraction_preserves_exact_table_casing():
+    expression = (
+        'IF(ISNOTEMPTY("ACCOUNTCAL"."AccountEntityID") AND "ACCOUNTCAL"."Status"=="ACTIVE")'
+        'THEN("ACCOUNTCAL"."AccountEntityID")ELSE(NULL)'
+    )
+
+    assert _extract_dependencies(expression) == [
+        "ACCOUNTCAL.AccountEntityID",
+        "ACCOUNTCAL.Status",
+    ]
+
+
+def test_report_resolves_aliases_to_source_table_names(tmp_path):
+    job_plan = JobPlan(job_id="job-5", intent=Intent.GENERATE_DD, company="Acme", platform="4X")
+    model = CanonicalModel(
+        chain_id="chain-5",
+        job_id="job-5",
+        object_ids=["obj-5"],
+        technical_summary="technical summary",
+        business_summary="business summary",
+        evidence=["PRO.SampleProc"],
+    )
+    source_object = SQLObject(
+        object_id="obj-5",
+        name="PRO.SampleProc",
+        object_type=ObjectType.PROCEDURE,
+        dialect=Dialect.ORACLE,
+        raw_sql="SELECT a.AccountEntityID FROM ACCOUNTCAL a",
+        source_file="sample.sql",
+    )
+    row = _row(
+        display_derivation_expression='IF(ISNOTEMPTY("a"."AccountEntityID"))THEN("a"."AccountEntityID")ELSE(NULL)',
+        source_object_ids=["obj-5"],
+    )
+
+    out = generate_report(
+        job_plan,
+        [model],
+        [row],
+        tmp_path / "report.md",
+        objects={"obj-5": source_object},
+    )
+    text = out.read_text()
+
+    assert '"ACCOUNTCAL"."AccountEntityID"' in text
+    assert "a.AccountEntityID" not in text
+    assert "Depends On" in text
+    assert "ACCOUNTCAL.AccountEntityID" in text
 
 
 def test_condition_explainer_covers_nested_boolean_ranges_and_functions():
@@ -173,19 +281,18 @@ def test_condition_explainer_covers_nested_boolean_ranges_and_functions():
 
     assert explanation is not None
     for fragment in [
-        "all of the following are true",
-        "it is not true that",
-        "is between 1 and 30",
-        "is one of yes or no",
-        "lowercased value",
-        "trimmed value",
-        "replaced by",
-        "substring of the code field in a starting at 1 with length 3",
-        "length of",
-        "start of the month",
-        "end of the month",
-        "date value for",
-        "period value for",
+        "- If all of the following are true:",
+        "It is not true that the x field is blank or missing",
+        "the y field is between 1 and 30",
+        "the z field is one of yes or no",
+        "the lowercased value of the trimmed value of the code field",
+        "the value of the code field with - replaced by a space",
+        "the substring of the code field starting at 1 with length 3",
+        "the length of the substring of the code field starting at 1 with length 3",
+        "the start of the month for the date field",
+        "the end of the month for the date field",
+        "the date value for 2026-01-01",
+        "the period value for the p field",
     ]:
         assert fragment in explanation
 
@@ -224,7 +331,7 @@ def test_report_separates_technical_housekeeping_columns(tmp_path):
     assert "(technical)" in text  # Rule Summary table marks it too
 
 
-def test_report_marks_pending_review_items_without_altering_formula(tmp_path):
+def test_report_marks_pending_review_items_without_showing_unsafe_formula(tmp_path):
     job_plan = JobPlan(job_id="job-2", intent=Intent.GENERATE_DD, company="Acme", platform="4X")
     model = CanonicalModel(
         chain_id="chain-2",
@@ -236,6 +343,7 @@ def test_report_marks_pending_review_items_without_altering_formula(tmp_path):
     )
     row = _row(
         status=DDStatus.PENDING_REVIEW,
+        display_derivation_expression="",
         validation_errors=["Grammar validation failed: Unexpected end-of-input"],
     )
 
@@ -249,7 +357,8 @@ def test_report_marks_pending_review_items_without_altering_formula(tmp_path):
     text = out.read_text()
 
     assert "PENDING_REVIEW" in text
-    assert 'IF(ISEMPTY("FCT_NPA_PRODUCT"."REFPERIODMAX"))THEN(0)ELSE("FCT_NPA_PRODUCT"."REFPERIODMAX")' in text
+    assert "(pending review — no formula was accepted)" in text
+    assert 'IF(ISEMPTY("FCT_NPA_PRODUCT"."REFPERIODMAX"))THEN(0)ELSE("FCT_NPA_PRODUCT"."REFPERIODMAX")' not in text
     assert "Grammar validation failed: Unexpected end-of-input" in text
     # The Rule Summary table's own row must carry the flag, but the
     # Business Meaning table column itself is gone (moved into the card),
@@ -285,7 +394,7 @@ def test_report_renders_cleanup_null_conditions_with_human_readable_explanation(
     assert "**Platform Condition:**" in text
     assert "```text\nNULL\n```" in text
     assert "**Human-Readable Explanation:**" in text
-    assert "The result is no value." in text
+    assert "- Leave the field blank." in text
 
 
 def test_tables_read_and_written_reflect_structural_info(tmp_path):

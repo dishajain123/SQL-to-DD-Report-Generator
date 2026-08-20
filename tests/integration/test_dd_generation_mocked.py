@@ -1,7 +1,7 @@
 from app.derivation.canonical_model import build_canonical_model
 from app.derivation.dd_generator import generate_dd_rows
 from app.lineage.dependency_graph import build_graph, find_chains
-from app.models.core import DDStatus, Dialect
+from app.models.core import DDStatus, Dialect, DerivationOption
 from app.parsing.object_splitter import split_objects
 from app.parsing.structural_analysis import analyze_object
 
@@ -144,7 +144,7 @@ def test_sqlserver_procedure_end_to_end_generates_dd_rows(sma_marking_sql, mock_
     assert rows
     assert any(row.column_name for row in rows)
     assert any(row.status in (DDStatus.ACTIVE, DDStatus.PENDING_REVIEW) for row in rows)
-    assert any(row.status == DDStatus.PENDING_REVIEW for row in rows)
+    assert any(row.status == DDStatus.ACTIVE for row in rows)
 
 
 def test_dd_generation_normalizes_legacy_comma_style_if(
@@ -206,3 +206,67 @@ def test_dd_generation_normalizes_legacy_comma_style_if(
     # review instead -- that's the new, more correct behavior, not a bug.
     simple_columns = [r for r in rows if not any("Semantic validation" in e for e in r.validation_errors)]
     assert simple_columns, "expected at least some columns with no override/exception source to pass cleanly"
+
+
+def test_decision_table_json_llm_output_is_not_sent_through_formula_parser(
+    sma_marking_sql, monkeypatch, function_reference
+):
+    class DecisionTableLLMClient:
+        def technical_reasoning(self, sql_snippets: list[str]) -> str:
+            return "technical"
+
+        def business_reasoning(self, technical_summary: str) -> str:
+            return "business"
+
+        def generate_formula_expression(
+            self,
+            technical_summary,
+            business_summary,
+            source_sql,
+            function_reference,
+            column_name="",
+            entity_name="",
+            relevant_sql="",
+            rag_context="",
+            ) -> str:
+            return """```json
+            {"decisionTable": {"rules": [{"when": "high", "then": "approve"}]}}
+            ```"""
+
+        def retry_with_error(self, previous_expression, error, context) -> str:
+            return self.generate_formula_expression(None, None, None, None)
+
+    monkeypatch.setattr(
+        "app.derivation.dd_generation_engine._compose_simple_assignment_expression",
+        lambda *args, **kwargs: None,
+    )
+
+    objects = []
+    infos = {}
+    for obj in split_objects(sma_marking_sql, "PRO.SMA_MARKING_12122023.StoredProcedure.sql", Dialect.SQLSERVER):
+        objects.append(obj)
+        infos[obj.object_id] = analyze_object(obj)
+
+    graph = build_graph(objects, infos)
+    chains = find_chains(graph, "job-decision-table", objects)
+    model = build_canonical_model(
+        chains[0],
+        "job-decision-table",
+        {o.object_id: o for o in objects},
+        infos,
+        DecisionTableLLMClient(),
+    )
+    rows = generate_dd_rows(
+        chain=chains[0],
+        canonical_model=model,
+        objects={o.object_id: o for o in objects},
+        structural_infos=infos,
+        llm_client=DecisionTableLLMClient(),
+        function_reference=function_reference,
+        entity_name_map={"AccountCal_Stg": "FCT_NPA_PRODUCT"},
+    )
+
+    assert rows
+    assert any(row.derivation_option == DerivationOption.DECISION_TABLE for row in rows)
+    assert any(row.decision_table_json for row in rows)
+    assert all("Grammar validation failed" not in " ".join(row.validation_errors) for row in rows)

@@ -34,9 +34,12 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 
+from lark import Lark, Tree, Token
+
 from app.models.core import CanonicalModel, DDRow, JobPlan, SQLObject, StructuralInfo
 from app.report.condition_explainer import explain_expression
 from app.utils.identity import canonical_expression_key, canonical_logical_name
+from app.utils.sql_aliases import collect_table_aliases, resolve_aliases_in_expression
 from app.grammar.validator import KNOWN_FUNCTIONS
 
 
@@ -84,6 +87,35 @@ _KEYWORDS = {
     "EOQ",
     "DATE",
 }
+
+_DEPENDENCY_LITERAL_VALUES = {
+    "Y",
+    "N",
+    "YES",
+    "NO",
+    "TRUE",
+    "FALSE",
+    "NULL",
+    "ACTIVE",
+    "INACTIVE",
+    "PENDING",
+    "APPROVED",
+    "REJECTED",
+    "OPEN",
+    "CLOSED",
+    "ENABLED",
+    "DISABLED",
+    "SUCCESS",
+    "FAILED",
+    "HIGH",
+    "LOW",
+    "ON",
+    "OFF",
+}
+_DEPENDENCY_NUMERIC_RE = re.compile(r"^[+-]?\d+(?:\.\d+)?$")
+_DEPENDENCY_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_DEPENDENCY_GRAMMAR_PATH = Path(__file__).resolve().parents[1] / "grammar" / "fourx_grammar.lark"
+_DEPENDENCY_PARSER = Lark(_DEPENDENCY_GRAMMAR_PATH.read_text(), parser="earley", start="start")
 
 _HOW_TO_READ_A_CONDITION = """## How to Read a Condition
 
@@ -222,6 +254,36 @@ def _process_name(job_plan: JobPlan, canonical_models: list[CanonicalModel], obj
 
 
 def _extract_dependencies(expression: str) -> list[str]:
+    try:
+        tree = _DEPENDENCY_PARSER.parse(expression)
+    except Exception:
+        return _extract_dependencies_from_text(expression)
+
+    refs: list[str] = []
+    seen: set[str] = set()
+    
+    def walk(node):
+        if isinstance(node, Tree):
+            if node.data == "column_ref":
+                yield node
+            for child in node.children:
+                yield from walk(child)
+
+    for node in walk(tree):
+        ref = _render_dependency_ref(node)
+        if not ref:
+            continue
+        upper = ref.upper()
+        if upper in _KEYWORDS or upper in KNOWN_FUNCTIONS or _is_dependency_literal(ref):
+            continue
+        if upper not in seen:
+            seen.add(upper)
+            refs.append(ref)
+
+    return refs
+
+
+def _extract_dependencies_from_text(expression: str) -> list[str]:
     refs: list[str] = []
     seen: set[str] = set()
     i = 0
@@ -232,7 +294,7 @@ def _extract_dependencies(expression: str) -> list[str]:
         if not canonical:
             return
         upper = canonical.upper()
-        if upper in _KEYWORDS or upper in KNOWN_FUNCTIONS:
+        if upper in _KEYWORDS or upper in KNOWN_FUNCTIONS or _is_dependency_literal(canonical):
             return
         if upper not in seen:
             seen.add(upper)
@@ -274,7 +336,8 @@ def _extract_dependencies(expression: str) -> list[str]:
             if len(parts) > 1:
                 add_ref(".".join(_normalize_display_name(part) for part in parts))
             else:
-                add_ref(_normalize_display_name(parts[0]))
+                i = max(j + 1, i + 1)
+                continue
             i = max(j + 1, i + 1)
             continue
 
@@ -297,6 +360,45 @@ def _extract_dependencies(expression: str) -> list[str]:
         i += 1
 
     return refs
+
+
+def _render_dependency_ref(node: Tree) -> str | None:
+    parts: list[str] = []
+    for child in node.children:
+        if isinstance(child, Tree) and child.data == "path_part" and child.children:
+            token = child.children[0]
+            if isinstance(token, Token):
+                if token.type == "STRING":
+                    value = token.value[1:-1] if len(token.value) >= 2 else str(token).strip('"')
+                    parts.append(_normalize_display_name(value))
+                else:
+                    parts.append(_normalize_display_name(str(token)))
+            else:
+                parts.append(_normalize_display_name(str(token)))
+        elif isinstance(child, Token):
+            parts.append(_normalize_display_name(str(child)))
+        elif isinstance(child, Tree):
+            parts.append(_normalize_display_name(str(child)))
+
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return parts[0]
+    return ".".join(parts)
+
+
+def _is_dependency_literal(value: str) -> bool:
+    token = value.strip().strip('"')
+    if not token:
+        return True
+    upper = token.upper()
+    if upper in _DEPENDENCY_LITERAL_VALUES:
+        return True
+    if _DEPENDENCY_NUMERIC_RE.fullmatch(token):
+        return True
+    if _DEPENDENCY_DATE_RE.fullmatch(token):
+        return True
+    return False
 
 
 def _business_meaning_from_formula(column_name: str, expression: str) -> str:
@@ -339,7 +441,22 @@ class _RuleGroup:
     source_statement_refs: list[str]
 
 
-def _build_rule_groups(dd_rows: list[DDRow]) -> list[_RuleGroup]:
+def _row_alias_map(row: DDRow, objects: dict[str, SQLObject]) -> dict[str, tuple[str, ...]]:
+    alias_map: dict[str, tuple[str, ...]] = {}
+    for object_id in row.source_object_ids or []:
+        obj = objects.get(object_id)
+        if obj is None or not obj.raw_sql.strip():
+            continue
+        for alias, parts in collect_table_aliases(obj.raw_sql, obj.dialect).items():
+            existing = alias_map.get(alias)
+            if existing is None:
+                alias_map[alias] = parts
+            elif existing != parts:
+                alias_map.pop(alias, None)
+    return alias_map
+
+
+def _build_rule_groups(dd_rows: list[DDRow], objects: dict[str, SQLObject]) -> list[_RuleGroup]:
     grouped_rows = _group_dd_rows_for_report(dd_rows)
     rule_groups: list[_RuleGroup] = []
     counter = 1
@@ -348,6 +465,9 @@ def _build_rule_groups(dd_rows: list[DDRow]) -> list[_RuleGroup]:
         rule_id = f"BR-{counter:03d}"
         counter += 1
         formula = first.display_derivation_expression or ""
+        alias_map = _row_alias_map(first, objects)
+        if alias_map:
+            formula = resolve_aliases_in_expression(formula, alias_map, quote_replacements=True)
         business_meaning = first.business_meaning.strip() if getattr(first, "business_meaning", "").strip() else ""
         if not business_meaning:
             business_meaning = _business_meaning_from_formula(first.column_name, formula)
@@ -586,7 +706,7 @@ def generate_report(
     structural_infos: dict[str, StructuralInfo] | None = None,
 ) -> Path:
     objects = objects or {}
-    rule_groups = _build_rule_groups(dd_rows)
+    rule_groups = _build_rule_groups(dd_rows, objects)
     entity_groups = _rules_by_entity(rule_groups)
     business_groups: list[_RuleGroup] = []
     technical_groups: list[_RuleGroup] = []
