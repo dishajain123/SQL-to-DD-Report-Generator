@@ -2556,13 +2556,20 @@ def _normalize_expression(expression: str, source_text: str = "") -> str:
 
 
 def _source_allows_target_reference(source_sql: str, entity_name: str, column: str) -> bool:
-    """Allow a self-reference only when the source SQL explicitly
-    preserves the target value or increments it.
+    """Allow a self-reference when the source SQL either explicitly
+    preserves/increments the target value, OR contains a WHERE-guarded
+    UPDATE that sets this column -- because in real SQL, rows that don't
+    satisfy an UPDATE's WHERE clause are never touched, so "no match"
+    always means "keep the existing value", whether or not the statement
+    spells that out with an NVL/COALESCE self-read.
 
-    This mirrors the semantic validation rule so the generator can
-    mechanically repair the most common false-positive shape: an
-    otherwise-correct expression whose final ELSE clause falls back to the
-    target column even though the source SQL never does that.
+    Previously this only recognized the explicit NVL/COALESCE form, so a
+    plain `UPDATE t SET col = val WHERE cond` (the most common shape in
+    these procedures) was never allowed to preserve the prior value on
+    "no match" -- the generator forced ELSE(NULL) instead, silently
+    turning "this row wasn't touched" into "this row was wiped". See the
+    architecture review: this is root cause A ("UPDATE ... WHERE
+    semantics being converted incorrectly").
     """
     if not source_sql or not column:
         return False
@@ -2590,6 +2597,44 @@ def _source_allows_target_reference(source_sql: str, entity_name: str, column: s
     ):
         return True
 
+    if _has_where_guarded_update_on_column(source_sql, column):
+        return True
+
+    return False
+
+
+def _has_where_guarded_update_on_column(source_sql: str, column: str) -> bool:
+    """True if any statement in source_sql is a plain `UPDATE ... SET
+    <column> = ... WHERE ...` -- i.e. an UPDATE whose WHERE clause means
+    unmatched rows are left untouched, so the column's prior value is
+    implicitly preserved for those rows by ordinary SQL semantics.
+
+    Deliberately conservative: only bare UPDATE/SET/WHERE statements
+    qualify, not MERGE (which has its own explicit WHEN NOT MATCHED
+    branches that should be honored as written, not overridden) and not
+    an UPDATE with no WHERE at all (which touches every row, so there is
+    no "unmatched" case to preserve).
+    """
+    try:
+        statements = split_statements(source_sql)
+    except Exception:
+        statements = [source_sql]
+
+    column_pattern = re.compile(rf"\b{re.escape(column)}\b\s*=", re.IGNORECASE)
+    for stmt in statements:
+        upper = stmt.upper()
+        if not upper.lstrip().startswith("UPDATE"):
+            continue
+        if "MERGE" in upper:
+            continue
+        set_match = re.search(r"\bSET\b(.*?)(\bWHERE\b|$)", stmt, re.IGNORECASE | re.DOTALL)
+        if not set_match:
+            continue
+        set_clause, where_marker = set_match.group(1), set_match.group(2)
+        if not where_marker:
+            continue
+        if column_pattern.search(set_clause):
+            return True
     return False
 
 
@@ -3697,7 +3742,23 @@ def _compose_simple_assignment_expression(
                     if _render_select_into_projection(tree, current_target.upper()) is not None:
                         first_is_seed_projection = True
                         break
-    expression = "NULL" if first_is_seed_projection else "NULL"
+
+    # Base case: what the column resolves to when none of the stages'
+    # guards match. A fresh SELECT/INSERT projection has no prior value to
+    # fall back to, so NULL is correct there. But if any assignment site
+    # feeding this column is a plain WHERE-guarded UPDATE, ordinary SQL
+    # semantics mean rows that don't satisfy that WHERE are never touched
+    # -- so "no guard matched" must resolve to the column's own existing
+    # value, not an unconditional wipe. See architecture review root
+    # cause A ("UPDATE ... WHERE semantics being converted incorrectly").
+    if first_is_seed_projection:
+        expression = "NULL"
+    else:
+        combined_raw_sql = "\n".join(site.raw_sql for site in assignment_sites)
+        if _has_where_guarded_update_on_column(combined_raw_sql, current_target):
+            expression = f'"{entity_name}"."{current_target}"' if entity_name else f'"{current_target}"'
+        else:
+            expression = "NULL"
 
     for guard, value, source_target in stages:
         source_target = source_target or current_target
@@ -4052,6 +4113,46 @@ def _ground_expression_to_source_references(
     return grounded
 
 
+def _has_cross_statement_self_dependency(sites: list["_AssignmentSite"], column: str) -> bool:
+    """True if this column is written by 2+ separate statements AND a
+    statement other than the first one that writes it also *reads* the
+    column somewhere in its own text (a WHERE/subquery/CASE condition,
+    not just its own assignment target).
+
+    This is the exact shape of a genuine sequential dependency: by the
+    time that later statement runs, the column may already hold whatever
+    an earlier statement in this same list just wrote to it, so reading
+    it there means "read what the prior step produced" -- not "read the
+    original source value". The deterministic composer folds separate
+    statements as independent branches of one expression; it has no way
+    to thread that intermediate state through correctly, so a column
+    matching this shape should never be silently composed as if it were
+    a simple set of independent conditions. See architecture review root
+    causes B/C ("sequential-update handling" / "state/dependency
+    tracking").
+
+    Deliberately conservative (may under-flag rather than over-flag):
+    only the *first* writing statement is exempted, since it alone is
+    guaranteed to observe the column's original, unmodified value.
+    """
+    writing_sites = [s for s in sites if any(c.upper() == column.upper() for c in s.columns_written)]
+    if len(writing_sites) < 2:
+        return False
+
+    read_pattern = re.compile(rf"\b{re.escape(column)}\b", re.IGNORECASE)
+    assign_target_pattern = re.compile(
+        rf"(?:\b[A-Z_][A-Z0-9_]*\s*\.\s*)?\b{re.escape(column)}\b\s*=(?!=)",
+        re.IGNORECASE,
+    )
+
+    for site in writing_sites[1:]:
+        total_refs = len(read_pattern.findall(site.raw_sql))
+        assign_target_refs = len(assign_target_pattern.findall(site.raw_sql))
+        if total_refs > assign_target_refs:
+            return True
+    return False
+
+
 def _generate_for_column(
     canonical_model: CanonicalModel,
     obj: SQLObject,
@@ -4111,6 +4212,8 @@ def _generate_for_column(
         else None
     )
 
+    has_cross_statement_dependency = _has_cross_statement_self_dependency(sites, column)
+
     derivation_option = DerivationOption.FORMULA_EXPRESSION
     expression: str | None = None
     decision_table_json: str | None = None
@@ -4119,7 +4222,10 @@ def _generate_for_column(
     if assignment_context:
         source_sql_excerpt = assignment_context
 
-    deterministic_expression = _compose_simple_assignment_expression(sites, entity_name, column)
+    deterministic_expression = (
+        None if has_cross_statement_dependency
+        else _compose_simple_assignment_expression(sites, entity_name, column)
+    )
     if deterministic_expression:
         deterministic_expression = resolve_aliases_in_expression(
             deterministic_expression,
@@ -4245,6 +4351,16 @@ def _generate_for_column(
         row_status = status
         row_validation_errors = list(validation_errors)
         advisory_notes: list[str] = []
+
+        if has_cross_statement_dependency:
+            row_status = DDStatus.PENDING_REVIEW
+            advisory_notes.append(
+                f'"{column}" is written by multiple sequential source statements, and a later '
+                "statement reads the column's own value -- meaning it may depend on what an "
+                "earlier statement already wrote. Automated composition cannot guarantee this "
+                "execution-order dependency is preserved; verify this rule against the source "
+                "SQL statement-by-statement before approving."
+            )
 
         if not is_real_mapping:
             advisory_notes.append(

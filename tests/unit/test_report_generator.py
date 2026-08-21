@@ -151,6 +151,35 @@ def test_platform_condition_is_preserved_and_explanation_is_separate(tmp_path):
     assert explanation.strip().count("\n") >= 1
 
 
+def test_condition_explainer_renders_min_wrapped_conditional_completely():
+    """Regression test: SQL's MIN(CASE WHEN ... END) pattern arrives as
+    MIN(IF(...)THEN(...)ELSE(...)) -- a single conditional argument, not
+    a flat list of values. The old code rendered only the condition and
+    silently dropped the THEN/ELSE branches ("Return the lowest of If X
+    is true."), which is incomplete to the point of misrepresenting what
+    is being compared."""
+    explanation = explain_expression(
+        'MIN(IF(COALESCE("A"."FinalNpaDt","2099-12-31")>COALESCE("B"."DegDate","2099-12-31"))'
+        'THEN("B"."DegDate")ELSE("A"."FinalNpaDt"))'
+    )
+
+    assert explanation is not None
+    assert "the lowest value from" in explanation
+    assert "the deg date" in explanation
+    assert "otherwise the final npa dt" in explanation
+
+
+def test_condition_explainer_renders_addday():
+    """Regression test: ADDDAY is a documented platform function but had
+    no handler, so it silently fell back to the meaningless "the result
+    of the function call"."""
+    explanation = explain_expression('ADDDAY("A"."BUSINESS_DATE",-30)')
+
+    assert explanation is not None
+    assert "the result of the function call" not in explanation
+    assert "adding" in explanation and "days to" in explanation
+
+
 def test_condition_explainer_covers_simple_and_complex_cases():
     simple = explain_expression('IF(ISEMPTY("A"."B"))THEN(0)ELSE("A"."B")')
     complex_expr = (
@@ -186,6 +215,48 @@ def test_condition_explainer_renders_flg_as_flag():
 
     assert explanation is not None
     assert "the flag SMA field equals yes" in explanation
+
+
+def test_condition_explainer_does_not_carve_words_out_of_unrelated_identifiers():
+    """Regression test for a bug where the all-caps identifier splitter
+    matched a dictionary word (e.g. "NO", "ID") purely because it happens
+    to be a substring of an unrelated word -- "ASSET_NORM" -> "asset no
+    rm", "NORMAL" -> "no rmal", "MSME_COVID" -> "msme cov ID". These are
+    not cosmetic: reading "no" into a word that has nothing to do with
+    negation misrepresents the underlying condition. A split must only be
+    accepted when EVERY resulting fragment is a real recognized word --
+    a length check on the leftover is not sufficient, since "RMAL" and
+    "COV" are both long enough to slip past a naive threshold while still
+    being meaningless."""
+    from app.report.condition_explainer import _render_name_text
+
+    assert _render_name_text("ASSET_NORM") == "asset norm"
+    assert _render_name_text("NORMAL") == "normal"
+    assert _render_name_text("MSME_COVID") == "msme covid"
+    assert _render_name_text("COVID_OTR_RF") == "covid otr rf"
+
+    explanation = explain_expression(
+        'IF(COALESCE("AccountCal"."ASSET_NORM","NORMAL")!="ALWYS_STD" '
+        'AND COALESCE("AccountCal"."FlgDeg","N")=="Y")'
+        'THEN("PRO"."PUI_CAL"."Asset_Norm")ELSE(NULL)'
+    )
+    assert explanation is not None
+    assert "asset norm" in explanation
+    assert "treating blank as normal" in explanation
+    assert "no rm" not in explanation
+    assert "cov id" not in explanation.lower()
+
+
+def test_condition_explainer_keeps_existing_all_caps_splits_working():
+    """Splits that are genuinely two real words must keep working after
+    the full-coverage fix -- this is what stops the fix from being
+    over-corrected into never splitting anything."""
+    from app.report.condition_explainer import _render_name_text
+
+    assert _render_name_text("FLGDEG") == "flag deg"
+    assert _render_name_text("FLGPROCESSING") == "flag processing"
+    assert _render_name_text("FLGSMA") == "flag SMA"
+    assert _render_name_text("DPD_NOCREDIT") == "DPD no credit"
 
 
 def test_condition_explainer_handles_coalesce_comparisons_and_dates():

@@ -75,6 +75,53 @@ def test_dd_generation_produces_valid_rows(dpd_calculation_sql, maxdpd_sql, npa_
         assert row.status in (DDStatus.ACTIVE, DDStatus.PENDING_REVIEW)
 
 
+def test_cross_statement_self_dependency_forces_review_not_silent_export(
+    dpd_calculation_sql, maxdpd_sql, npa_date_sql, mock_llm_client, function_reference
+):
+    """Regression test for architecture review root causes B/C: a column
+    written by multiple sequential statements where a later statement
+    reads the column's own value (e.g. FinalNpaDt read-and-rewritten
+    across several MERGE statements) cannot be safely composed into one
+    expression by the current engine -- it has no way to thread
+    intermediate state between statements. Rather than silently exporting
+    a plausible-looking but unverified formula as ACTIVE, this shape must
+    be forced to PENDING_REVIEW with a clear, specific reason. Columns
+    that do NOT have this shape (e.g. InitialNpaDt, a straightforward
+    placeholder-date cleanup) must not be flagged -- over-flagging would
+    just trade one kind of untrustworthy output for reviewer fatigue."""
+    chain, objects, infos = _build_chain(dpd_calculation_sql, maxdpd_sql, npa_date_sql)
+    model = build_canonical_model(chain, "job-cross-dep", objects, infos, mock_llm_client)
+
+    rows = generate_dd_rows(
+        chain=chain, canonical_model=model, objects=objects, structural_infos=infos,
+        llm_client=mock_llm_client, function_reference=function_reference,
+        entity_name_map={"AccountCal_Stg": "FCT_NPA_PRODUCT"},
+    )
+
+    final_npa_rows = [r for r in rows if r.column_name.upper() == "FINALNPADT"]
+    assert final_npa_rows
+    assert all(r.status == DDStatus.PENDING_REVIEW for r in final_npa_rows)
+    assert all(
+        any("sequential source statements" in note for note in r.advisory_notes)
+        for r in final_npa_rows
+    )
+    # The deterministic composer must never run for this column -- it has
+    # no way to represent the cross-statement dependency and would
+    # otherwise silently produce a formula reflecting only a fragment of
+    # the real logic (confirmed: for the real sample file it produced a
+    # formula covering only 1 of this column's 8 source statements). The
+    # mock LLM client used here is a context-blind stub, so its answer
+    # correctly fails semantic validation and the row ships with no
+    # expression at all -- an honest "couldn't safely derive this" is the
+    # correct outcome, not a formula that looks complete and isn't.
+    assert all(not r.display_derivation_expression for r in final_npa_rows)
+
+    initial_npa_rows = [r for r in rows if r.column_name.upper() == "INITIALNPADT"]
+    assert initial_npa_rows
+    assert all(r.status == DDStatus.ACTIVE for r in initial_npa_rows)
+    assert all(not r.advisory_notes for r in initial_npa_rows)
+
+
 def test_dd_generation_flags_grammar_failures_for_review(
     dpd_calculation_sql, maxdpd_sql, npa_date_sql, broken_llm_client, function_reference
 ):

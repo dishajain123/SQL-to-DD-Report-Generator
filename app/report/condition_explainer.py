@@ -47,6 +47,7 @@ _ALL_CAPS_PARTS = sorted(
         "CREDIT",
         "REVIEW",
         "RENEWAL",
+        "PROCESSING",
         "MAX",
         "MIN",
         "FLG",
@@ -56,6 +57,7 @@ _ALL_CAPS_PARTS = sorted(
         "ID",
         "NO",
         "INT",
+        "DEG",
     },
     key=len,
     reverse=True,
@@ -312,6 +314,40 @@ def _render_function_condition(node: Tree) -> str:
     return "the result of the function call"
 
 
+def _is_conditional_value(node) -> bool:
+    """True if this argument node is itself an if/then/else expression --
+    the shape SQL's MIN(CASE...)/MAX(CASE...) takes once translated."""
+    unwrapped = _unwrap(node)
+    return isinstance(unwrapped, Tree) and unwrapped.data == "if_expr"
+
+
+def _render_if_expr_inline(node: Tree) -> str:
+    """Compact single-line rendering of an if/then/else expression used
+    as a VALUE (e.g. the sole argument to MIN/MAX), as opposed to
+    _render_if_chain's multi-line bullet form used for a top-level
+    condition. Rendering it as a full decision chain here would break
+    the surrounding sentence; rendering only the condition (the default
+    value-context behavior) would silently drop the THEN/ELSE branches,
+    which is what produced the original bug."""
+    children = list(node.children)
+    if len(children) < 2:
+        return "the calculated value"
+
+    condition = children[0]
+    then_branch = children[1]
+    rest = children[2:]
+    elseif_clauses = [c for c in rest if isinstance(c, Tree) and c.data == "elseif_clause"]
+    else_clause = next((c for c in rest if isinstance(c, Tree) and c.data == "else_clause"), None)
+
+    parts = [f"if {_render_condition(condition)}, then {_render_value(then_branch)}"]
+    for clause in elseif_clauses:
+        clause_condition, clause_branch = clause.children[0], clause.children[1]
+        parts.append(f"else if {_render_condition(clause_condition)}, then {_render_value(clause_branch)}")
+    if else_clause is not None:
+        parts.append(f"otherwise {_render_value(else_clause.children[0])}")
+    return "; ".join(parts)
+
+
 def _render_function_phrase(name: str, args: list, direct: bool) -> tuple[str | None, str | None]:
     if name == "ISEMPTY":
         return (f"{_render_value(args[0])} is blank or missing" if args else "the value is blank or missing", None)
@@ -352,10 +388,38 @@ def _render_function_phrase(name: str, args: list, direct: bool) -> tuple[str | 
         if len(args) >= 2:
             return f"the {_render_value(args[0]).lower()} from {_render_value(args[1])}", None
         return f"the extracted date part from {_join_items([_render_value(arg) for arg in args], 'and')}", None
-    if name == "MAX":
-        return f"the highest of {_join_items([_render_value(arg) for arg in args], 'and')}", None
-    if name == "MIN":
-        return f"the lowest of {_join_items([_render_value(arg) for arg in args], 'and')}", None
+    if name == "MAX" or name == "MIN":
+        superlative = "highest" if name == "MAX" else "lowest"
+        if len(args) == 1 and _is_conditional_value(args[0]):
+            # SQL's MIN(CASE WHEN ... END) / MAX(CASE WHEN ... END)
+            # pattern arrives here as MIN(IF(...)THEN(...)ELSE(...)) --
+            # a single conditional argument, not a flat list of values to
+            # compare. Rendering it with the generic value-list path below
+            # would only surface the condition text and silently drop the
+            # THEN/ELSE branches (e.g. "the lowest of If X is true"),
+            # which is incomplete to the point of being misleading about
+            # what is actually being compared.
+            return f"the {superlative} value from: {_render_if_expr_inline(_unwrap(args[0]))}", None
+        if len(args) >= 2:
+            # Documented platform signature: MAX(<ColumnName>, [<GroupbyColumns>])
+            # -- the trailing args are grouping columns, not more values
+            # to compare against the first.
+            primary = _render_value(args[0])
+            group_cols = _join_items([_render_value(arg) for arg in args[1:]], "and")
+            return f"the {superlative} {primary}, evaluated per group of {group_cols}", None
+        return f"the {superlative} of {_join_items([_render_value(arg) for arg in args], 'and')}", None
+    if name == "ADDDAY":
+        if len(args) >= 2:
+            return f"the date obtained by adding {_render_value(args[1])} days to {_render_value(args[0])}", None
+        return f"the adjusted date for {_join_items([_render_value(arg) for arg in args], 'and')}", None
+    if name == "CONVERT":
+        if len(args) >= 2:
+            return f"{_render_value(args[0])} converted to {_render_value(args[1])}", None
+        return f"the converted value of {_join_items([_render_value(arg) for arg in args], 'and')}", None
+    if name == "SOQ":
+        return f"the start of the quarter for {_join_items([_render_value(arg) for arg in args], 'and')}", None
+    if name == "EOQ":
+        return f"the end of the quarter for {_join_items([_render_value(arg) for arg in args], 'and')}", None
     if name == "ABS":
         return f"the absolute value of {_join_items([_render_value(arg) for arg in args], 'and')}", None
     if name == "ROUND":
@@ -623,6 +687,28 @@ def _split_identifier_words(text: str) -> list[str]:
 
 
 def _split_all_caps_chunk(chunk: str) -> list[str]:
+    """Split a run-together all-caps identifier into words, but only when
+    EVERY resulting fragment is a real recognized dictionary word -- never
+    a leftover guess.
+
+    A length threshold on leftover fragments is not enough: "NORMAL" ->
+    "NO" + "RMAL" has a 4-character leftover, long enough to pass a naive
+    length check, but "rmal" is still meaningless. Likewise "COVID" ->
+    "COV" + "ID" leaves a plausible-looking 3-letter leftover that is still
+    wrong. The only reliable rule is full coverage: if the whole chunk
+    cannot be built entirely out of known words, don't guess at a partial
+    split -- leave it as one word instead of risking an explanation that
+    quietly changes what the condition means.
+    """
+    parts = _greedy_all_caps_split(chunk)
+    if len(parts) <= 1:
+        return parts
+    if all(part.upper() in _ALL_CAPS_PARTS for part in parts):
+        return parts
+    return [chunk]
+
+
+def _greedy_all_caps_split(chunk: str) -> list[str]:
     upper = chunk.upper()
     parts: list[str] = []
     i = 0
