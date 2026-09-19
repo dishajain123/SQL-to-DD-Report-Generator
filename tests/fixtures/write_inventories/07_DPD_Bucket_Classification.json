@@ -1,0 +1,190 @@
+[
+  {
+    "operation": "UPDATE",
+    "target_table": "LoanAccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "DpdDays"
+    ],
+    "source_line": 27,
+    "excerpt": "UPDATE A         SET A.DpdDays = DATEDIFF(DAY, A.LastPaymentDueDate, @ProcessDate)         FROM PRO.LoanAccountCal A         WHERE A.LastPaymentDueDate IS NOT N",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "LoanAccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "DpdDays"
+    ],
+    "source_line": 34,
+    "excerpt": "UPDATE A         SET A.DpdDays = 0,             A.DpdBucket = 'NOT_APPLICABLE'         FROM PRO.LoanAccountCal A         WHERE A.LastPaymentDueDate IS NULL",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "LoanAccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "DpdBucket"
+    ],
+    "source_line": 41,
+    "excerpt": "UPDATE A         SET A.DpdBucket = (                 CASE                     WHEN A.DpdDays IS NULL THEN 'NOT_APPLICABLE'                     WHEN A.DpdDays =",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "LoanAccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "PenalInterestAmount"
+    ],
+    "source_line": 57,
+    "excerpt": "UPDATE A         SET A.PenalInterestAmount = (                 CASE                     WHEN A.DpdBucket = 'BUCKET_1_30' THEN (A.OutstandingBalance * 0.02) / 36",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "LoanAccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "BucketWorsened"
+    ],
+    "source_line": 73,
+    "excerpt": "UPDATE A             SET A.BucketWorsened = 'N',                 A.GracePeriodApplied = 'Y'             FROM PRO.LoanAccountCal A             WHERE A.LastPaymen",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "LoanAccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "BucketWorsened"
+    ],
+    "source_line": 81,
+    "excerpt": "UPDATE A             SET A.BucketWorsened = 'Y'             FROM PRO.LoanAccountCal A             WHERE A.PrevDpdBucket IS NOT NULL               AND A.DpdBucke",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "LoanAccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "BucketWorsened"
+    ],
+    "source_line": 90,
+    "excerpt": "UPDATE A             SET A.BucketWorsened = 'N'             FROM PRO.LoanAccountCal A         END          IF OBJECT_ID('tempdb..#DpdStaging') IS NOT NULL",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "INSERT",
+    "target_table": "#DpdStaging",
+    "target_kind": "temp_local",
+    "columns": [],
+    "source_line": 108,
+    "excerpt": "INSERT INTO #DpdStaging (AccountId, DpdBucket, FacilityType, AdjustedPenalty)         SELECT A.AccountId, A.DpdBucket, A.FacilityType, A.PenalInterestAmount",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "temp_staging"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "#DpdStaging",
+    "target_kind": "temp_local",
+    "columns": [
+      "AdjustedPenalty"
+    ],
+    "source_line": 115,
+    "excerpt": "UPDATE S         SET S.AdjustedPenalty = (                 CASE                     WHEN S.FacilityType IN ('CC', 'OD') THEN S.AdjustedPenalty * 1.10",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "temp_staging"
+  },
+  {
+    "operation": "MERGE",
+    "target_table": "DpdBucketHistory",
+    "target_kind": "persistent",
+    "columns": [],
+    "source_line": 128,
+    "excerpt": "MERGE PRO.DpdBucketHistory AS Target         USING #DpdStaging AS Source         ON Target.AccountId = Source.AccountId         WHEN MATCHED THEN             UP",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "set_based_merge"
+  },
+  {
+    "operation": "INSERT",
+    "target_table": "CollectionsQueue",
+    "target_kind": "persistent",
+    "columns": [],
+    "source_line": 143,
+    "excerpt": "INSERT INTO PRO.CollectionsQueue (AccountId, EscalationDate, Reason)         SELECT AccountId, @ProcessDate,                CASE                    WHEN DpdBuck",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "set_based_insert"
+  },
+  {
+    "operation": "INSERT",
+    "target_table": "DpdBucketAuditLog",
+    "target_kind": "persistent",
+    "columns": [],
+    "source_line": 157,
+    "excerpt": "INSERT INTO PRO.DpdBucketAuditLog (AccountId, TransitionDate, NewBucket)         SELECT H.AccountId, @ProcessDate, H.DpdBucket         FROM PRO.DpdBucketHistory",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "set_based_insert"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "ACLRUNNINGPROCESSSTATUS",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 162,
+    "excerpt": "UPDATE PRO.ACLRUNNINGPROCESSSTATUS         SET COMPLETED = 'Y', ERRORDATE = NULL, ERRORDESCRIPTION = NULL, COUNT = ISNULL(COUNT, 0) + 1         WHERE RUNNINGPRO",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "ACLRUNNINGPROCESSSTATUS",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 169,
+    "excerpt": "UPDATE PRO.ACLRUNNINGPROCESSSTATUS         SET COMPLETED = 'N', ERRORDATE = GETDATE(), ERRORDESCRIPTION = ERROR_MESSAGE(), COUNT = ISNULL(COUNT, 0) + 1",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  }
+]

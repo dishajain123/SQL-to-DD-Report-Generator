@@ -20,7 +20,7 @@ from app.parsing.dialect import detect_dialect
 from app.parsing.object_splitter import split_objects
 from app.parsing.structural_analysis import analyze_object
 from app.rag.chroma_store import ChromaStore
-from app.report.dd_export import export_dd_rows_csv
+from app.report.dd_export import export_dd_rows_csv, export_dd_rows_excel
 from app.report.report_generator import generate_report
 from app.utils import db
 from app.utils.config import settings
@@ -43,6 +43,7 @@ class PipelineState(TypedDict, total=False):
     entity_name_map: dict[str, str]
     report_path: str
     csv_path: str
+    excel_path: str
     existing_dd_csv_path: str
 
 
@@ -67,6 +68,22 @@ def node_structural_analysis(state: PipelineState) -> PipelineState:
             structural_errors[oid] = guardrail_result.errors
     state["structural_infos"] = structural_infos
     state["structural_errors"] = structural_errors
+
+    # Expand the caller/env entity map with built-in sample overrides and
+    # #temp spellings so live runs match scripts/generate_sample_dd_demo.py.
+    from app.utils.entity_name_map import (
+        build_entity_name_map_for_tables,
+        merge_entity_overrides,
+    )
+
+    all_tables: list[str] = []
+    for info in structural_infos.values():
+        all_tables.extend(info.tables_written or [])
+        all_tables.extend(getattr(info, "tables_read", None) or [])
+    state["entity_name_map"] = build_entity_name_map_for_tables(
+        all_tables,
+        merge_entity_overrides(state.get("entity_name_map")),
+    )
     return state
 
 
@@ -162,9 +179,30 @@ def node_dd_generation(
         guardrail_result = check_dd_row(row, model)
         if not guardrail_result.passed:
             row.validation_errors.extend(guardrail_result.errors)
-            row.status = row.status.__class__.PENDING_REVIEW
+            # Only demote for real grammar/structure failures — never for
+            # advisory confidence notes (those must not reappear as PENDING).
+            hard_errors = [
+                e for e in guardrail_result.errors
+                if "confidence" not in e.lower() and "advisory" not in e.lower()
+            ]
+            if hard_errors:
+                row.status = row.status.__class__.PENDING_REVIEW
+                if hasattr(row, "review_state"):
+                    from app.models.core import ReviewState
+                    row.review_state = ReviewState.NEEDS_REVIEW
+            else:
+                row.advisory_notes = list(row.advisory_notes or []) + list(guardrail_result.errors)
 
     all_rows = flag_duplicate_dd_rows(all_rows)
+    from app.guardrails.dd_row_coverage import flag_rows_with_uncovered_writes
+
+    for object_id, info in state["structural_infos"].items():
+        flag_rows_with_uncovered_writes(
+            all_rows,
+            info,
+            state["objects"][object_id].raw_sql,
+            state.get("entity_name_map"),
+        )
     state["dd_rows"] = all_rows
 
     job_id = state["job_plan"].job_id
@@ -191,16 +229,58 @@ def node_report_and_export(state: PipelineState) -> PipelineState:
     )
     state["report_path"] = str(report_path)
 
+    from app.parsing.coverage_ledger import build_coverage_ledger
+    from app.guardrails.dd_row_coverage import mark_ledger_coverage
+    from app.report.dd_export import write_qa_coverage_report
+
+    coverage_parts: list[str] = []
+    blockers: list[str] = []
+    for object_id, info in (state.get("structural_infos") or {}).items():
+        obj = state["objects"][object_id]
+        ledger = build_coverage_ledger(info, source_sql=obj.raw_sql)
+        mark_ledger_coverage(ledger, state.get("dd_rows") or [], state.get("entity_name_map"))
+        coverage_parts.append(ledger.to_markdown())
+        blockers.extend(ledger.blockers)
+    for row in state.get("dd_rows") or []:
+        if row.validation_errors:
+            blockers.append(
+                f"{row.entity_name}.{row.column_name}: " + "; ".join(row.validation_errors)
+            )
+        if row.advisory_notes:
+            blockers.append(
+                f"{row.entity_name}.{row.column_name} advisory: " + "; ".join(row.advisory_notes)
+            )
+        review_state = getattr(row, "review_state", None)
+        if review_state is not None and getattr(review_state, "value", "") in {
+            "NEEDS_REVIEW",
+            "UNSUPPORTED",
+        }:
+            blockers.append(
+                f"{row.entity_name}.{row.column_name}: review_state={review_state.value}"
+            )
+
+    write_qa_coverage_report(
+        state.get("dd_rows") or [],
+        output_dir / "qa_coverage_report.md",
+        coverage_markdown="\n\n".join(coverage_parts),
+        job_id=job_plan.job_id,
+        blockers=sorted(set(blockers)),
+    )
+
     if state.get("dd_rows"):
         csv_output_path = output_dir / "dd_export.csv"
+        excel_output_path = output_dir / "dd_export.xlsx"
         existing_path = state.get("existing_dd_csv_path")
         csv_path = export_dd_rows_csv(state["dd_rows"], csv_output_path, existing_dd_path=existing_path)
+        excel_path = export_dd_rows_excel(state["dd_rows"], excel_output_path, existing_dd_path=existing_path)
         state["csv_path"] = str(csv_path)
+        state["excel_path"] = str(excel_path)
 
     db.update_job_status(
         job_plan.job_id,
         "COMPLETED",
         report_path=state.get("report_path"),
+        excel_path=state.get("excel_path"),
     )
     return state
 

@@ -1,0 +1,136 @@
+[
+  {
+    "operation": "INSERT",
+    "target_table": "#CollateralStaging",
+    "target_kind": "temp_local",
+    "columns": [],
+    "source_line": 40,
+    "excerpt": "INSERT INTO #CollateralStaging (AccountId, CollateralValue, OutstandingBalance, ShortfallAmount, ReviewPriority)         SELECT A.AccountId,                V.La",
+    "has_join": true,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "temp_staging"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "#CollateralStaging",
+    "target_kind": "temp_local",
+    "columns": [
+      "ShortfallAmount"
+    ],
+    "source_line": 53,
+    "excerpt": "UPDATE S         SET S.ShortfallAmount = S.OutstandingBalance - S.CollateralValue         FROM #CollateralStaging S         WHERE S.OutstandingBalance > S.Colla",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "temp_staging"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "#CollateralStaging",
+    "target_kind": "temp_local",
+    "columns": [
+      "ShortfallAmount"
+    ],
+    "source_line": 59,
+    "excerpt": "UPDATE S         SET S.ShortfallAmount = 0         FROM #CollateralStaging S         WHERE S.OutstandingBalance <= S.CollateralValue          -- Rule 4: sequent",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "temp_staging"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "#CollateralStaging",
+    "target_kind": "temp_local",
+    "columns": [
+      "ReviewPriority"
+    ],
+    "source_line": 69,
+    "excerpt": "UPDATE S             SET S.ReviewPriority = (                     CASE                         WHEN S.ShortfallAmount IS NULL THEN 'NONE'",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "temp_staging"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "#CollateralStaging",
+    "target_kind": "temp_local",
+    "columns": [
+      "ReviewPriority"
+    ],
+    "source_line": 83,
+    "excerpt": "UPDATE S             SET S.ReviewPriority = (                     CASE                         WHEN S.ShortfallAmount > 500000 THEN 'HIGH'",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "temp_staging"
+  },
+  {
+    "operation": "MERGE",
+    "target_table": "CollateralPositionSummary",
+    "target_kind": "persistent",
+    "columns": [],
+    "source_line": 96,
+    "excerpt": "MERGE PRO.CollateralPositionSummary AS Target         USING #CollateralStaging AS Source         ON Target.AccountId = Source.AccountId         WHEN MATCHED THE",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "set_based_merge"
+  },
+  {
+    "operation": "INSERT",
+    "target_table": "CollateralReview",
+    "target_kind": "persistent",
+    "columns": [],
+    "source_line": 111,
+    "excerpt": "INSERT INTO PRO.CollateralReview (AccountId, ReviewDate, ShortfallAmount)         SELECT AccountId, @ProcessDate, ShortfallAmount         FROM #CollateralStagin",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": true,
+    "expected_output_type": "set_based_insert"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "LoanAccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "CollateralStale"
+    ],
+    "source_line": 119,
+    "excerpt": "UPDATE A         SET A.CollateralStale = 'Y'         FROM PRO.LoanAccountCal A         WHERE A.SecuredFlag = 'Y'           AND NOT EXISTS (               SELECT",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "ACLRUNNINGPROCESSSTATUS",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 129,
+    "excerpt": "UPDATE PRO.ACLRUNNINGPROCESSSTATUS         SET COMPLETED = 'Y', ERRORDATE = NULL, ERRORDESCRIPTION = NULL, COUNT = ISNULL(COUNT, 0) + 1         WHERE RUNNINGPRO",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "ACLRUNNINGPROCESSSTATUS",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 136,
+    "excerpt": "UPDATE PRO.ACLRUNNINGPROCESSSTATUS         SET COMPLETED = 'N', ERRORDATE = GETDATE(), ERRORDESCRIPTION = ERROR_MESSAGE(), COUNT = ISNULL(COUNT, 0) + 1",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  }
+]

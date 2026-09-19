@@ -1,0 +1,108 @@
+[
+  {
+    "operation": "INSERT",
+    "target_table": "AssetClassMovementHistory",
+    "target_kind": "persistent",
+    "columns": [],
+    "source_line": 26,
+    "excerpt": "INSERT INTO PRO.AssetClassMovementHistory (TimeKey, AccountId, PreviousClass, CurrentClass, MovementDate)         SELECT @TimeKey, B.AccountId, A.AssetClass, B.",
+    "has_join": true,
+    "has_aggregate_or_window": true,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "set_based_insert"
+  },
+  {
+    "operation": "INSERT",
+    "target_table": "CustomerClassMovementHistory",
+    "target_kind": "persistent",
+    "columns": [],
+    "source_line": 33,
+    "excerpt": "INSERT INTO PRO.CustomerClassMovementHistory (TimeKey, CustomerId, WorstClass, MovementDate)         SELECT @TimeKey, B.CustomerId, MIN(B.AssetClass), GETDATE()",
+    "has_join": false,
+    "has_aggregate_or_window": true,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "set_based_insert"
+  },
+  {
+    "operation": "TRUNCATE",
+    "target_table": "PreviousAssetClass",
+    "target_kind": "persistent",
+    "columns": [],
+    "source_line": 40,
+    "excerpt": "TRUNCATE TABLE PRO.PreviousAssetClass          INSERT INTO PRO.PreviousAssetClass (AccountId, AssetClass)         SELECT AccountId, AssetClass         FROM PRO.",
+    "has_join": false,
+    "has_aggregate_or_window": true,
+    "has_exists_or_in_subquery": true,
+    "expected_output_type": "set_based_delete"
+  },
+  {
+    "operation": "INSERT",
+    "target_table": "PreviousAssetClass",
+    "target_kind": "persistent",
+    "columns": [],
+    "source_line": 42,
+    "excerpt": "INSERT INTO PRO.PreviousAssetClass (AccountId, AssetClass)         SELECT AccountId, AssetClass         FROM PRO.AccountCal          -- Rule 4 (formula): increm",
+    "has_join": false,
+    "has_aggregate_or_window": true,
+    "has_exists_or_in_subquery": true,
+    "expected_output_type": "set_based_insert"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "RunStatistics",
+    "target_kind": "persistent",
+    "columns": [
+      "MovementCount",
+      "MultiAccountMovementFlag",
+      "COMPLETED"
+    ],
+    "source_line": 47,
+    "excerpt": "UPDATE PRO.RunStatistics         SET MovementCount = MovementCount + (SELECT COUNT(*) FROM PRO.AssetClassMovementHistory WHERE TimeKey = @TimeKey)         WHERE",
+    "has_join": false,
+    "has_aggregate_or_window": true,
+    "has_exists_or_in_subquery": true,
+    "expected_output_type": "cross_row_aggregate"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "CustomerCal",
+    "target_kind": "persistent",
+    "columns": [
+      "MultiAccountMovementFlag"
+    ],
+    "source_line": 52,
+    "excerpt": "UPDATE C         SET C.MultiAccountMovementFlag = 'Y'         FROM PRO.CustomerCal C         WHERE C.CustomerId IN (             SELECT CustomerId             F",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "RunStatus",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 63,
+    "excerpt": "UPDATE PRO.RunStatus         SET COMPLETED = 'Y', ErrorDate = NULL, ErrorDescription = NULL, RunCount = ISNULL(RunCount, 0) + 1         WHERE ProcessName = 'NPA",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "RunStatus",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 70,
+    "excerpt": "UPDATE PRO.RunStatus         SET COMPLETED = 'N', ErrorDate = GETDATE(), ErrorDescription = ERROR_MESSAGE(), RunCount = ISNULL(RunCount, 0) + 1         WHERE Pr",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  }
+]

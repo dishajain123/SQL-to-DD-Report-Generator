@@ -1,0 +1,160 @@
+[
+  {
+    "operation": "UPDATE",
+    "target_table": "LoanAccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "DaysSinceLastOverdue"
+    ],
+    "source_line": 41,
+    "excerpt": "UPDATE A         SET A.DaysSinceLastOverdue = DATEDIFF(DAY, A.LastOverdueClearedDate, @ProcessDate)         FROM PRO.LoanAccountCal A         WHERE A.AssetClass",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "INSERT",
+    "target_table": "#WatchlistStaging",
+    "target_kind": "temp_local",
+    "columns": [],
+    "source_line": 51,
+    "excerpt": "INSERT INTO #WatchlistStaging (AccountId, AssetClass, DaysSinceLastOverdue, EligibleForUpgrade)         SELECT A.AccountId, A.AssetClass, A.DaysSinceLastOverdue",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "temp_staging"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "#WatchlistStaging",
+    "target_kind": "temp_local",
+    "columns": [
+      "EligibleForUpgrade"
+    ],
+    "source_line": 59,
+    "excerpt": "UPDATE S         SET S.EligibleForUpgrade = (                 CASE                     WHEN S.DaysSinceLastOverdue IS NULL THEN 'N'                     WHEN S.A",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "temp_staging"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "#WatchlistStaging",
+    "target_kind": "temp_local",
+    "columns": [
+      "EligibleForUpgrade"
+    ],
+    "source_line": 75,
+    "excerpt": "UPDATE S             SET S.EligibleForUpgrade = 'PENDING_APPROVAL'             FROM #WatchlistStaging S             WHERE S.EligibleForUpgrade = 'Y'         END",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "temp_staging"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "#WatchlistStaging",
+    "target_kind": "temp_local",
+    "columns": [
+      "EligibleForUpgrade"
+    ],
+    "source_line": 82,
+    "excerpt": "UPDATE S SET S.EligibleForUpgrade = S.EligibleForUpgrade             FROM #WatchlistStaging S         END          -- Rule 4: upsert every staged account into t",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "temp_staging"
+  },
+  {
+    "operation": "MERGE",
+    "target_table": "NpaUpgradeWatchlist",
+    "target_kind": "persistent",
+    "columns": [],
+    "source_line": 88,
+    "excerpt": "MERGE PRO.NpaUpgradeWatchlist AS Target         USING #WatchlistStaging AS Source         ON Target.AccountId = Source.AccountId         WHEN MATCHED THEN",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": true,
+    "expected_output_type": "set_based_merge"
+  },
+  {
+    "operation": "DELETE",
+    "target_table": "NpaUpgradeWatchlist",
+    "target_kind": "persistent",
+    "columns": [],
+    "source_line": 102,
+    "excerpt": "DELETE FROM PRO.NpaUpgradeWatchlist         WHERE AccountId IN (             SELECT AccountId FROM PRO.LoanAccountCal WHERE OverdueDays > 0         )          -",
+    "has_join": true,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": true,
+    "expected_output_type": "set_based_delete"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "LoanAccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "AssetClass"
+    ],
+    "source_line": 114,
+    "excerpt": "UPDATE A         SET A.AssetClass = 'STANDARD',             A.UpgradeDate = @ProcessDate         FROM PRO.LoanAccountCal A         INNER JOIN PRO.NpaUpgradeWatc",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "INSERT",
+    "target_table": "AccountStatusAuditLog",
+    "target_kind": "persistent",
+    "columns": [],
+    "source_line": 122,
+    "excerpt": "INSERT INTO PRO.AccountStatusAuditLog (AccountId, TransitionDate, NewStatus, Reason)         SELECT A.AccountId, @ProcessDate, 'STANDARD', 'NPA_WATCH_PERIOD_COM",
+    "has_join": true,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "set_based_insert"
+  },
+  {
+    "operation": "DELETE",
+    "target_table": "NpaUpgradeWatchlist",
+    "target_kind": "persistent",
+    "columns": [],
+    "source_line": 130,
+    "excerpt": "DELETE FROM PRO.NpaUpgradeWatchlist         WHERE EligibleForUpgrade = 'Y'          UPDATE PRO.ACLRUNNINGPROCESSSTATUS         SET COMPLETED = 'Y', ERRORDATE =",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "set_based_delete"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "ACLRUNNINGPROCESSSTATUS",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 133,
+    "excerpt": "UPDATE PRO.ACLRUNNINGPROCESSSTATUS         SET COMPLETED = 'Y', ERRORDATE = NULL, ERRORDESCRIPTION = NULL, COUNT = ISNULL(COUNT, 0) + 1         WHERE RUNNINGPRO",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "ACLRUNNINGPROCESSSTATUS",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 140,
+    "excerpt": "UPDATE PRO.ACLRUNNINGPROCESSSTATUS         SET COMPLETED = 'N', ERRORDATE = GETDATE(), ERRORDESCRIPTION = ERROR_MESSAGE(), COUNT = ISNULL(COUNT, 0) + 1",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  }
+]

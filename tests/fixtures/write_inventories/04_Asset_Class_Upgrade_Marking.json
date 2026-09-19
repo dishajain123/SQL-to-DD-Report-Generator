@@ -1,0 +1,100 @@
+[
+  {
+    "operation": "UPDATE",
+    "target_table": "AccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "UpgradeEligible"
+    ],
+    "source_line": 28,
+    "excerpt": "UPDATE A             SET A.UpgradeEligible = 'Y'             FROM PRO.AccountCal A             WHERE A.AssetClass <> 'STANDARD'               AND A.OverdueDays",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "AccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "UpgradeEligible"
+    ],
+    "source_line": 38,
+    "excerpt": "UPDATE A             SET A.UpgradeEligible = 'N'             FROM PRO.AccountCal A         END          -- Rule 3 (formula, same balance * percent / 100 shape a",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "AccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "ProvisionReleaseAmount"
+    ],
+    "source_line": 46,
+    "excerpt": "UPDATE A         SET A.ProvisionReleaseAmount = A.ProvisionAmount - ((A.OutstandingBalance * A.StandardProvisionPct) / 100)         FROM PRO.AccountCal A",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "AccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "AssetClass"
+    ],
+    "source_line": 52,
+    "excerpt": "UPDATE A         SET A.AssetClass = 'STANDARD',             A.ProvisionPct = A.StandardProvisionPct,             A.ProvisionAmount = (A.OutstandingBalance * A.S",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "AccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "UpgradeDate"
+    ],
+    "source_line": 60,
+    "excerpt": "UPDATE A         SET A.UpgradeDate = @ProcessDate         FROM PRO.AccountCal A         WHERE A.UpgradeEligible = 'Y'          UPDATE PRO.RunStatus         SET",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "RunStatus",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 65,
+    "excerpt": "UPDATE PRO.RunStatus         SET COMPLETED = 'Y', ErrorDate = NULL, ErrorDescription = NULL, RunCount = ISNULL(RunCount, 0) + 1         WHERE ProcessName = 'Ass",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "RunStatus",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 72,
+    "excerpt": "UPDATE PRO.RunStatus         SET COMPLETED = 'N', ErrorDate = GETDATE(), ErrorDescription = ERROR_MESSAGE(), RunCount = ISNULL(RunCount, 0) + 1         WHERE Pr",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  }
+]

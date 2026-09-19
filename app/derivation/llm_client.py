@@ -6,6 +6,7 @@ variables only, then keep calling ``LLMClient()`` everywhere else.
 Supported providers:
 - OpenAI via `LLM_PROVIDER=openai`
 - Groq via `LLM_PROVIDER=groq`
+- Amazon Bedrock via `LLM_PROVIDER=bedrock`
 
 If `LLM_PROVIDER=auto` or unset, the client tries to infer the provider from
 `LLM_MODEL_NAME` or `LLM_BASE_URL`. The rest of the app never needs to know
@@ -150,20 +151,24 @@ def _normalize_provider(raw_provider: str, model: str, base_url: str) -> str:
     if provider in {"", "auto"}:
         model_hint = model.strip().lower()
         base_url_hint = base_url.strip().lower()
+        if model_hint.startswith("bedrock/") or model_hint.startswith("amazon."):
+            return "bedrock"
         if model_hint.startswith("gpt-") or "openai" in base_url_hint:
             return "openai"
         if model_hint.startswith("llama") or "groq" in base_url_hint:
             return "groq"
         return "openai"
-    if provider not in {"openai", "groq"}:
+    if provider not in {"openai", "groq", "bedrock"}:
         raise ValueError(
-            f"Unsupported LLM_PROVIDER '{raw_provider}'. Expected 'auto', 'openai', or 'groq'."
+            f"Unsupported LLM_PROVIDER '{raw_provider}'. Expected 'auto', 'openai', 'groq', or 'bedrock'."
         )
     return provider
 
 
 def _provider_from_model(model: str) -> Optional[str]:
     lowered = model.strip().lower()
+    if lowered.startswith("bedrock/") or lowered.startswith("amazon."):
+        return "bedrock"
     if lowered.startswith("gpt-") or lowered.startswith("openai/"):
         return "openai"
     if lowered.startswith("llama") or lowered.startswith("groq/"):
@@ -239,10 +244,11 @@ class LLMClient:
     model: str = ""
     base_url: str = ""
     temperature: float = 0.0
-    max_new_tokens: int = 1024
+    max_new_tokens: int = settings.llm_synthesis_max_tokens
     max_input_chars: int = 12000
     request_timeout_seconds: float = settings.llm_request_timeout_seconds
     transport: Optional[Callable[..., Any]] = None
+    bedrock_client: Optional[Any] = None
 
     def __post_init__(self) -> None:
         self.model = self.model or settings.llm_model_name.strip()
@@ -272,16 +278,22 @@ class LLMClient:
             self.transport = request.urlopen
 
     def _default_base_url(self) -> str:
+        if self.provider == "bedrock":
+            return ""
         if self.provider == "openai":
             return "https://api.openai.com/v1"
         return "https://api.groq.com/openai/v1"
 
     def _default_model(self) -> str:
+        if self.provider == "bedrock":
+            return "amazon.nova-lite-v1:0"
         if self.provider == "openai":
             return "gpt-4.1"
         return "llama-3.3-70b-versatile"
 
     def _candidate_models(self) -> list[str]:
+        if self.provider == "bedrock":
+            return [self.model]
         fallback_models = ["gpt-4o-mini"] if self.provider == "openai" else ["llama-3.1-8b-instant", "openai/gpt-oss-20b"]
         candidates = [self.model, *fallback_models]
         seen: set[str] = set()
@@ -302,6 +314,8 @@ class LLMClient:
         return base_url + "/chat/completions"
 
     def _complete_once(self, model: str, system: str, user: str, max_tokens: int) -> str:
+        if self.provider == "bedrock":
+            return self._complete_bedrock(model, system, user, max_tokens)
         if not self.api_key:
             raise RuntimeError(
                 "No API key is configured for the LLM provider. "
@@ -369,6 +383,41 @@ class LLMClient:
         if not isinstance(content, str) or not content.strip():
             raise RuntimeError(f"{self.provider} returned an empty message content")
         return content.strip()
+
+    def _complete_bedrock(self, model: str, system: str, user: str, max_tokens: int) -> str:
+        model_id = model.removeprefix("bedrock/")
+        if not model_id:
+            raise ValueError("Set GPT_MODEL or LLM_MODEL_NAME to a Bedrock model ID.")
+
+        # Nova Lite supports at most 5K output tokens. Keep the requested
+        # synthesis limit in config, but send a valid per-request limit.
+        if model_id == "amazon.nova-lite-v1:0":
+            max_tokens = min(max_tokens, 5000)
+
+        if self.bedrock_client is None:
+            import boto3
+            from botocore.config import Config
+
+            self.bedrock_client = boto3.client(
+                "bedrock-runtime",
+                config=Config(read_timeout=self.request_timeout_seconds),
+            )
+
+        try:
+            response = self.bedrock_client.converse(
+                modelId=model_id,
+                system=[{"text": system}],
+                messages=[{"role": "user", "content": [{"text": _truncate_for_provider(user, self.max_input_chars)}]}],
+                inferenceConfig={"maxTokens": max_tokens, "temperature": self.temperature},
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Bedrock Converse failed for model '{model_id}': {exc}") from exc
+
+        content = response.get("output", {}).get("message", {}).get("content", [])
+        answer = "".join(block.get("text", "") for block in content if isinstance(block, dict))
+        if not answer.strip():
+            raise RuntimeError("Bedrock returned an empty message content")
+        return answer.strip()
 
     def _complete_with_model(self, system: str, user: str, max_tokens: int = 1024) -> str:
         candidates = self._candidate_models()

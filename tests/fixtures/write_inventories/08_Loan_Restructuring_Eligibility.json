@@ -1,0 +1,136 @@
+[
+  {
+    "operation": "UPDATE",
+    "target_table": "LoanAccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "RestructureEligible"
+    ],
+    "source_line": 33,
+    "excerpt": "UPDATE A             SET A.RestructureEligible =                 CASE                     WHEN A.AssetClass IN ('STANDARD', 'SMA') THEN",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "LoanAccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "RestructureEligible"
+    ],
+    "source_line": 58,
+    "excerpt": "UPDATE A             SET A.RestructureEligible = 'SCHEME_CLOSED'             FROM PRO.LoanAccountCal A         END          -- Rule 4: accounts with no recorded",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "LoanAccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "RestructureEligible"
+    ],
+    "source_line": 65,
+    "excerpt": "UPDATE A         SET A.RestructureEligible = 'NOT_ASSESSED'         FROM PRO.LoanAccountCal A         WHERE A.OutstandingBalance IS NULL          IF OBJECT_ID('",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "INSERT",
+    "target_table": "#RestructureDecisions",
+    "target_kind": "temp_local",
+    "columns": [],
+    "source_line": 84,
+    "excerpt": "INSERT INTO #RestructureDecisions (AccountId, DecisionDate, EligibleFlag, AssetClassAtEval, RevisedTenureMonths)         SELECT A.AccountId, @ProcessDate, A.Res",
+    "has_join": true,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "temp_staging"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "#RestructureDecisions",
+    "target_kind": "temp_local",
+    "columns": [
+      "RevisedTenureMonths"
+    ],
+    "source_line": 92,
+    "excerpt": "UPDATE D         SET D.RevisedTenureMonths = (                 CASE                     WHEN A.OutstandingBalance > 1000000 THEN 60                     WHEN A.O",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "temp_staging"
+  },
+  {
+    "operation": "MERGE",
+    "target_table": "RestructureRegister",
+    "target_kind": "persistent",
+    "columns": [],
+    "source_line": 106,
+    "excerpt": "MERGE PRO.RestructureRegister AS Target         USING #RestructureDecisions AS Source         ON Target.AccountId = Source.AccountId         WHEN MATCHED THEN",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "set_based_merge"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "LoanAccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "AccountStatus"
+    ],
+    "source_line": 121,
+    "excerpt": "UPDATE A         SET A.AccountStatus = 'RESTRUCTURED',             A.LastPaymentDueDate = DATEADD(MONTH, D.RevisedTenureMonths, @ProcessDate),             A.Pri",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "INSERT",
+    "target_table": "RestructureAuditLog",
+    "target_kind": "persistent",
+    "columns": [],
+    "source_line": 131,
+    "excerpt": "INSERT INTO PRO.RestructureAuditLog (AccountId, DecisionDate, EligibleFlag)         SELECT R.AccountId, R.LastEvaluatedDate, R.EligibleFlag         FROM PRO.Res",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "set_based_insert"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "ACLRUNNINGPROCESSSTATUS",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 137,
+    "excerpt": "UPDATE PRO.ACLRUNNINGPROCESSSTATUS         SET COMPLETED = 'Y', ERRORDATE = NULL, ERRORDESCRIPTION = NULL, COUNT = ISNULL(COUNT, 0) + 1         WHERE RUNNINGPRO",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "ACLRUNNINGPROCESSSTATUS",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 144,
+    "excerpt": "UPDATE PRO.ACLRUNNINGPROCESSSTATUS         SET COMPLETED = 'N', ERRORDATE = GETDATE(), ERRORDESCRIPTION = ERROR_MESSAGE(), COUNT = ISNULL(COUNT, 0) + 1",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  }
+]

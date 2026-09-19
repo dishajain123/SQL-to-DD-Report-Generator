@@ -47,6 +47,25 @@ def analyze_object(obj: SQLObject) -> StructuralInfo:
     smart_chunks = build_smart_chunks(obj.object_id, statements)
     chunk_confidence = min((chunk.confidence for chunk in smart_chunks), default=1.0)
 
+    # Attach write coverage ledger blockers as unsupported constructs so
+    # downstream stages cannot treat missing MERGE/INSERT targets as success.
+    from app.parsing.coverage_ledger import build_coverage_ledger
+
+    ledger = build_coverage_ledger(
+        StructuralInfo(
+            object_id=obj.object_id,
+            statements=statements,
+            tables_read=sorted(tables_read),
+            tables_written=sorted(tables_written),
+            columns_written=sorted(columns_written),
+            columns_written_by_table={t: sorted(c) for t, c in columns_written_by_table.items()},
+        ),
+        source_sql=obj.raw_sql,
+    )
+    for blocker in ledger.blockers:
+        if blocker not in unsupported:
+            unsupported.append(blocker)
+
     return StructuralInfo(
         object_id=obj.object_id,
         statements=statements,

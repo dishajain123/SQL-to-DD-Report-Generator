@@ -28,7 +28,7 @@ KNOWN_FUNCTIONS = {
     "SUBSTR", "LOWER", "UPPER", "LEN", "CONVERT", "REGEX", "CONCAT", "TRIM", "REPLACE",
     "SOM", "EOM", "SOY", "EOY", "SOFY", "EOFY", "DATEPART", "DATEDIFF", "TODATE",
     "ADDDAY", "PERIOD", "SOQ", "EOQ",
-    "ROUND", "ABS", "FLOOR", "CEIL", "DATE",
+    "ROUND", "ABS", "FLOOR", "CEIL", "DATE", "SUM", "COUNT",
 }
 
 _INCOMPLETE_TRAILING_TOKENS = {
@@ -49,6 +49,8 @@ _INCOMPLETE_TRAILING_TOKENS = {
     "DATEDIFF",
     "TODATE",
     "DATEPART",
+    "ADDDAY",
+    "CONVERT",
     "ROUND",
     "ABS",
     "FLOOR",
@@ -72,6 +74,8 @@ _INCOMPLETE_TRAILING_TOKENS = {
     "SOQ",
     "EOQ",
     "DATE",
+    "SUM",
+    "COUNT",
 }
 
 
@@ -265,49 +269,8 @@ def _find_matching_paren(text: str, open_index: int) -> int:
 
 
 def _rewrite_exists_predicates(expression: str) -> str:
-    result: list[str] = []
-    i = 0
-    in_double = False
-    while i < len(expression):
-        ch = expression[i]
-        if ch == '"':
-            in_double = not in_double
-            result.append(ch)
-            i += 1
-            continue
-        if not in_double and expression[i : i + 7].upper() == "EXISTS(":
-            open_index = i + 6
-            depth = 0
-            close_index = -1
-            local_in_double = False
-            for j in range(open_index, len(expression)):
-                cur = expression[j]
-                if cur == '"':
-                    local_in_double = not local_in_double
-                elif not local_in_double:
-                    if cur == "(":
-                        depth += 1
-                    elif cur == ")":
-                        depth -= 1
-                        if depth == 0:
-                            close_index = j
-                            break
-            if close_index != -1:
-                inner = expression[i + 7 : close_index].strip()
-                where_match = re.search(r"(?is)\bWHERE\b", inner)
-                if where_match:
-                    result.append(inner[where_match.end():].strip())
-                else:
-                    comma_match = re.search(r"(?s),", inner)
-                    if comma_match:
-                        result.append(inner[comma_match.end():].strip())
-                    else:
-                        result.append(inner)
-                i = close_index + 1
-                continue
-        result.append(ch)
-        i += 1
-    return "".join(result)
+    """Do not flatten EXISTS into its WHERE body — that changes meaning."""
+    return expression
 
 
 def _rewrite_in_subquery_membership(expression: str) -> str:
@@ -789,8 +752,36 @@ def _unwrap_single_child_node(node):
 
 
 def _contains_string_literal_operand(node) -> bool:
-    node = _unwrap_single_child_node(node)
-    return getattr(node, "type", None) == "STRING"
+    """True only for real text literals in +/- expressions.
+
+    The grammar tokenizes both string literals and column path parts as
+    STRING. A single-segment `column_ref` such as `"LateFee"` must not be
+    treated as text concatenation — only non-identifier quoted tokens
+    (e.g. `","`, `"Hello world"`) count as string literals here.
+    """
+    cur = node
+    while hasattr(cur, "children") and len(cur.children) == 1:
+        data = getattr(cur, "data", None)
+        if data == "column_ref":
+            path_parts = list(cur.children or [])
+            if len(path_parts) != 1:
+                return False
+            inner = path_parts[0]
+            while hasattr(inner, "children") and len(inner.children) == 1:
+                inner = inner.children[0]
+            text = str(inner).strip().strip('"')
+            return not bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", text))
+        if data == "path_part":
+            break
+        cur = cur.children[0]
+
+    if getattr(cur, "data", None) == "path_part":
+        while hasattr(cur, "children") and len(cur.children) == 1:
+            cur = cur.children[0]
+        text = str(cur).strip().strip('"')
+        return not bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", text))
+
+    return getattr(cur, "type", None) == "STRING"
 
 
 def _find_string_literal_add_sub_expressions(tree) -> list[str]:

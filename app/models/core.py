@@ -187,6 +187,15 @@ class DDStatus(str, Enum):
     PENDING_REVIEW = "PENDING_REVIEW"
 
 
+class ReviewState(str, Enum):
+    """Human/process review lifecycle — independent of platform Status."""
+
+    GENERATED = "GENERATED"
+    NEEDS_REVIEW = "NEEDS_REVIEW"
+    APPROVED = "APPROVED"
+    UNSUPPORTED = "UNSUPPORTED"
+
+
 class DDRow(BaseModel):
     """One row of the Derivation Dictionary output — matches the platform's
     Derivations export schema exactly (Entity Name, Column Name, ...)."""
@@ -198,6 +207,7 @@ class DDRow(BaseModel):
     display_derivation_expression: str = ""
     effective_start_date: date
     status: DDStatus = DDStatus.PENDING_REVIEW
+    review_state: ReviewState = ReviewState.GENERATED
     data_type: str
     decision_table_json: Optional[str] = None
     conditional_json: Optional[str] = None

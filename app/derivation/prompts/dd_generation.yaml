@@ -7,9 +7,18 @@ system: |
   reference material retrieved specifically for this column, (5) the full
   source SQL for broader context, and (6) the platform's full
   function/operator reference. Output ONLY a single valid Formula
-  Expression string using that grammar — functions like
-  IF/THEN/ELSEIF/ELSE, ISNOTEMPTY, DATEDIFF, AND, OR, BETWEEN, etc. Use the
-  exact 4X syntax: `IF(condition)THEN(true_expr)ELSE(false_expr)`. Do not
+  Expression string using that grammar. Use the full platform inventory when
+  the source SQL's meaning calls for it — not only IF/THEN/ELSE. Prefer the
+  matching 4X construct for the semantics in front of you, for example:
+  COALESCE for null/default fallbacks, ISEMPTY/ISNOTEMPTY for null checks,
+  BETWEEN for inclusive ranges, DATEDIFF/ADDDAY/PERIOD/TODATE/DATEPART/SOM/EOM
+  for date math, LOWER/UPPER/TRIM/LEN/SUBSTR/CONCAT/REPLACE/REGEX for text,
+  ROUND/ABS/FLOOR/CEIL/MAX/MIN/SUM/COUNT for math/aggregates, and membership
+  operators (IN/NOTIN/CONTAINS/BEGINSWITH/ENDSWITH/DOESNOTCONTAINS) for list
+  or pattern matches. Do not force IF/THEN/ELSE around a value that is already
+  a complete function/operator expression, and do not invent branches that
+  are not in the source. Use the exact 4X syntax:
+  `IF(condition)THEN(true_expr)ELSE(false_expr)`. Do not
   write comma-style `IF(condition, true_expr, false_expr)` syntax, and do
   not write a C/Java/JavaScript-style ternary
   `condition ? true_expr : false_expr` -- the platform's grammar has no
@@ -29,6 +38,11 @@ system: |
   `IF( (IF(A>=B)THEN(A)ELSE(B)) > threshold )THEN(...)ELSE(...)`
   -- every nested conditional value keeps its own IF and its own
   ELSE, with no bare comparison-then-THEN/ELSE fragment anywhere.
+
+  Never emit a bare `NULL`, `0`, or `1` as the entire expression unless the
+  source SQL's only assignment for that column is literally that constant
+  with no surrounding condition. If there is no real derivation logic for
+  the column, return an empty expression rather than inventing a placeholder.
 
   The "statements that assign this column" section is your primary source
   of truth — read it first. A single column is very often assigned in more
@@ -112,6 +126,9 @@ system: |
   Two reference forms are fixed platform conventions — use them exactly
   and consistently, the same way in every expression you write for this
   job, instead of guessing a different table qualification each time:
+  - Column references must use the platform entity name from the target
+    column (`"EntityName"."ColumnName"`), never a SQL alias (`"A"."Column"`)
+    and never a schema-qualified physical table (`"PRO"."AccountCal"."Column"`).
   - A local variable in the source that holds the current
     processing/business date for the period (commonly assigned from a
     day-matrix/calendar table lookup, e.g. a variable like
@@ -159,8 +176,11 @@ system: |
     shape is closer to `NVL` or `COALESCE`), keep it as
     `COALESCE(value, default)` instead of forcing it into an empty-check
     function name.
-  - If the SQL uses `EXISTS(...)`, rewrite it as the underlying boolean
-    predicate on the joined columns rather than emitting EXISTS itself.
+  - If the SQL uses a procedure-level `IF EXISTS(...)` branch, do NOT
+    flatten it into a per-row WHERE predicate — that changes meaning.
+    Emit the row-level UPDATE logic only when it is independently
+    expressible; otherwise leave the branch for manual/workflow coverage
+    rather than inventing a misleading row formula.
   - Every `THEN(...)` and `ELSE(...)` must be wrapped in its own single
     pair of parentheses spanning the entire value. A common mistake when
     translating SQL `CASE WHEN ... THEN x + 1 ELSE y END` is keeping only
@@ -198,10 +218,23 @@ system: |
     customer/process scoping filter, preserve that guard in the output
     rather than dropping it to a bare column name.
 
+  If the logic is a categorical/range-based classification rather than a
+  single arithmetic/date formula, prefer the Decision Table approach and
+  output a JSON object with BOTH:
+  - "expression": the Display Derivation Expression as a valid 4X
+    IF/THEN/ELSEIF/ELSE string (required — the platform export always keeps
+    this field populated even for Decision Table rows; use "id#@@#label"
+    literals when the source maps codes to labels), and
+  - "decision_table": an object with "decisionTableDetails" describing each
+    bucket/rule in source order.
+  Choose Formula Expression (raw expression string only) when the logic is
+  a calculation, date derivation, copy/coalesce, or a simple binary flag.
+  Do not force every column into the same approach — pick the option that
+  best matches the source business rule and the platform reference.
+
   Do not include any explanation, markdown formatting, or code fences —
-  output the raw expression only. If the logic is a categorical/range-based
-  classification rather than a single formula, instead output a JSON object
-  with a "decision_table" key describing the buckets.
+  output the raw expression only, or the Decision Table JSON object
+  described above when that approach is the better fit.
 
 user: |
   You are producing the Formula Expression for exactly ONE column. Do not

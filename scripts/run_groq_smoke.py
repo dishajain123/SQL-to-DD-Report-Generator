@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the Groq-backed reasoning steps end to end and print each output.
+"""Run the configured LLM reasoning steps end to end and print each output.
 
 This is a lightweight verification script for:
 1. Environment setup
@@ -18,7 +18,6 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.derivation.llm_client import LLMClient
-from app.utils.config import settings
 
 
 DEFAULT_SQL_FILES = [
@@ -45,7 +44,7 @@ def _print_section(title: str, content: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Run the Groq-backed reasoning steps and print each output."
+        description="Run the configured LLM reasoning steps and print each output."
     )
     parser.add_argument(
         "--sql",
@@ -66,19 +65,18 @@ def main() -> int:
     sql_snippets = [_read_text(path) for path in sql_files]
     function_reference = _read_text(args.function_reference)
 
-    print("Groq smoke test configuration")
-    print(f"- GROQ_API_KEY set: {'yes' if settings.groq_api_key else 'no'}")
-    print(f"- GROQ_MODEL: {settings.groq_model}")
+    client = LLMClient()
+    print("LLM smoke test configuration")
+    print(f"- Provider: {client.provider}")
+    print(f"- Model: {client.model}")
     print(f"- SQL files: {', '.join(str(path) for path in sql_files)}")
     print(f"- Function reference: {args.function_reference}")
 
-    if not settings.groq_api_key:
+    if client.provider != "bedrock" and not client.api_key:
         print(
-            "\nGROQ_API_KEY is missing. Add it to your .env file, then rerun this script."
+            "\nLLM_API_KEY is missing. Add it to your .env file, then rerun this script."
         )
         return 1
-
-    client = LLMClient()
 
     try:
         technical = client.technical_reasoning(sql_snippets)
@@ -95,14 +93,14 @@ def main() -> int:
         )
         _print_section("STEP 3: DD formula expression", formula)
     except RuntimeError as exc:
-        print(f"\nGroq request failed: {exc}")
+        print(f"\nLLM request failed: {exc}")
         print(
             "If you are running inside a restricted environment, the network may be blocked. "
-            "Run this on your local machine with internet access to see the live Groq output."
+            "Run this on your local machine with internet access to see the live output."
         )
         return 1
 
-    print("Groq smoke test completed successfully.")
+    print("LLM smoke test completed successfully.")
     return 0
 
 

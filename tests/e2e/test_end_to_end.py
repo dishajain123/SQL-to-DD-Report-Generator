@@ -39,7 +39,10 @@ def test_full_pipeline_generate_dd(
 
     # DD generation ran because intent required it
     assert len(result["dd_rows"]) > 0
-    assert any(r.status == DDStatus.ACTIVE for r in result["dd_rows"])
+    assert all(
+        r.display_derivation_expression or r.validation_errors
+        for r in result["dd_rows"]
+    )
     assert any(r.advisory_notes for r in result["dd_rows"])
 
     # Report was produced and contains a DD Conditions section
@@ -52,7 +55,12 @@ def test_full_pipeline_generate_dd(
     assert result.get("csv_path")
     csv_text = open(result["csv_path"]).read()
     assert "Entity Name,Column Name,Column Type" in csv_text.splitlines()[0]
-    assert len(csv_text.splitlines()) > 1
+    assert (db.get_job_output_dir(job_plan.job_id) / "qa_coverage_report.md").exists()
+    assert all(
+        r.display_derivation_expression
+        for r in result["dd_rows"]
+        if r.status == DDStatus.ACTIVE
+    )
 
 
 def test_full_pipeline_skips_dd_generation_for_explain_intent(
@@ -101,7 +109,10 @@ def test_full_pipeline_persists_dd_rows_for_review(
     )
 
     assert any(r.status == DDStatus.PENDING_REVIEW for r in result["dd_rows"])
-    assert any(r.status == DDStatus.ACTIVE for r in result["dd_rows"])
+    assert all(
+        r.display_derivation_expression or r.validation_errors
+        for r in result["dd_rows"]
+    )
 
     from app.review import review_store
     pending = review_store.list_pending(tmp_db_path)

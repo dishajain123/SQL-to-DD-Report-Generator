@@ -250,13 +250,27 @@ def record_review_decision(
             (dd_row_id, action, edited_expression, reviewer, comment),
         )
         new_status = "ACTIVE" if action in ("APPROVE", "EDIT", "OVERRIDE") else "INACTIVE"
+        # Keep row_json metadata in sync for reviewed exports.
+        row = conn.execute("SELECT row_json FROM dd_rows WHERE id = ?", (dd_row_id,)).fetchone()
+        row_json = {}
+        if row and row["row_json"]:
+            try:
+                row_json = json.loads(row["row_json"])
+            except json.JSONDecodeError:
+                row_json = {}
+        row_json["status"] = new_status
+        row_json["review_state"] = "APPROVED" if action in ("APPROVE", "EDIT", "OVERRIDE") else "NEEDS_REVIEW"
         if action == "EDIT" and edited_expression:
+            row_json["display_derivation_expression"] = edited_expression
             conn.execute(
-                "UPDATE dd_rows SET status = ?, expression = ? WHERE id = ?",
-                (new_status, edited_expression, dd_row_id),
+                "UPDATE dd_rows SET status = ?, expression = ?, row_json = ? WHERE id = ?",
+                (new_status, edited_expression, json.dumps(row_json, default=str), dd_row_id),
             )
         else:
-            conn.execute("UPDATE dd_rows SET status = ? WHERE id = ?", (new_status, dd_row_id))
+            conn.execute(
+                "UPDATE dd_rows SET status = ?, row_json = ? WHERE id = ?",
+                (new_status, json.dumps(row_json, default=str), dd_row_id),
+            )
 
 
 def log_audit(job_id: str, stage: str, detail: str, db_path: str | None = None) -> None:

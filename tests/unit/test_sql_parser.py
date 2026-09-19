@@ -56,8 +56,39 @@ def test_parse_statement_extracts_select_into_target_and_projection_columns():
     stmt = "SELECT a.AccountEntityID, CASE WHEN ISNULL(a.DPD_Overdrawn,0)>30 THEN 1 ELSE 0 END AS DPD_FLAG INTO #DPD FROM PRO.AccountCal a WHERE ISNULL(a.DPD_Overdrawn,0)>30"
     info = parse_statement(stmt, 0, Dialect.SQLSERVER)
     assert info.parsed_ok
-    assert "DPD" in info.tables_written
+    assert any(t.lstrip("#").upper() == "DPD" for t in info.tables_written)
+    assert any(t.startswith("#") for t in info.tables_written) or "DPD" in info.tables_written
     assert any("DPD_FLAG" in cols for cols in info.set_columns_by_table.values())
+
+
+def test_parse_statement_insert_records_target_including_temp():
+    stmt = (
+        "INSERT INTO #DpdStaging (AccountId, DpdBucket, FacilityType, AdjustedPenalty)\n"
+        "SELECT A.AccountId, A.DpdBucket, A.FacilityType, A.PenalInterestAmount\n"
+        "FROM PRO.LoanAccountCal A WHERE A.BucketWorsened = 'Y'"
+    )
+    info = parse_statement(stmt, 0, Dialect.SQLSERVER)
+    assert info.tables_written
+    assert any(t.upper().endswith("DPDSTAGING") for t in info.tables_written)
+    assert any(t.startswith("#") for t in info.tables_written)
+
+
+def test_parse_statement_keeps_merge_intact_with_when_clauses():
+    stmt = (
+        "MERGE PRO.DpdBucketHistory AS Target\n"
+        "USING #DpdStaging AS Source\n"
+        "ON Target.AccountId = Source.AccountId\n"
+        "WHEN MATCHED THEN\n"
+        "    UPDATE SET Target.DpdBucket = Source.DpdBucket\n"
+        "WHEN NOT MATCHED BY TARGET THEN\n"
+        "    INSERT (AccountId, DpdBucket) VALUES (Source.AccountId, Source.DpdBucket);"
+    )
+    stmts = split_statements(stmt, Dialect.SQLSERVER)
+    assert len(stmts) == 1
+    info = parse_statement(stmts[0], 0, Dialect.SQLSERVER)
+    assert info.statement_type == "MERGE"
+    assert info.parsed_ok
+    assert any("DPDBUCKETHISTORY" in t.upper() for t in info.tables_written)
 
 
 def test_parse_statement_handles_cte_wrapped_update():
@@ -65,6 +96,16 @@ def test_parse_statement_handles_cte_wrapped_update():
     info = parse_statement(stmt, 0, Dialect.SQLSERVER)
     assert info.parsed_ok
     assert "t" in info.tables_written or "T" in info.tables_written
+
+
+def test_parse_statement_resolves_update_alias_from_real_table():
+    stmt = (
+        "UPDATE A SET A.RestructureEligible = 'Y'\n"
+        "FROM PRO.LoanAccountCal A WHERE A.OutstandingBalance IS NOT NULL"
+    )
+    info = parse_statement(stmt, 0, Dialect.SQLSERVER)
+    assert any("LOANACCOUNTCAL" in t.upper() for t in info.tables_written)
+    assert not any(t.upper() == "A" for t in info.tables_written)
 
 
 def test_parse_statement_merge_extracts_target_as_written():

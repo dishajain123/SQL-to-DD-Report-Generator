@@ -1,0 +1,100 @@
+[
+  {
+    "operation": "UPDATE",
+    "target_table": "AccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "ProvisionPct"
+    ],
+    "source_line": 23,
+    "excerpt": "UPDATE A         SET A.ProvisionPct = (                 CASE A.AssetClass                     WHEN 'STANDARD'    THEN 0.40                     WHEN 'SUBSTANDARD",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "AccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "ProvisionPct"
+    ],
+    "source_line": 36,
+    "excerpt": "UPDATE A         SET A.ProvisionPct = A.ProvisionPct + 10.00         FROM PRO.AccountCal A         WHERE A.SecuredFlag = 'N'           AND A.AssetClass <> 'STAN",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "AccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "ProvisionAmount"
+    ],
+    "source_line": 45,
+    "excerpt": "UPDATE A         SET A.ProvisionAmount = (A.OutstandingBalance * A.ProvisionPct) / 100         FROM PRO.AccountCal A         WHERE A.OutstandingBalance > 0",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "AccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "ProvisionAmount"
+    ],
+    "source_line": 51,
+    "excerpt": "UPDATE A         SET A.ProvisionAmount = A.OutstandingBalance         FROM PRO.AccountCal A         WHERE A.ProvisionAmount > A.OutstandingBalance          -- R",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "AccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "SeniorReviewFlag"
+    ],
+    "source_line": 57,
+    "excerpt": "UPDATE A         SET A.SeniorReviewFlag = 'Y'         FROM PRO.AccountCal A         WHERE A.ProvisionAmount > 1000000          UPDATE PRO.RunStatus         SET",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "RunStatus",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 62,
+    "excerpt": "UPDATE PRO.RunStatus         SET COMPLETED = 'Y', ErrorDate = NULL, ErrorDescription = NULL, RunCount = ISNULL(RunCount, 0) + 1         WHERE ProcessName = 'Pro",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "RunStatus",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 69,
+    "excerpt": "UPDATE PRO.RunStatus         SET COMPLETED = 'N', ErrorDate = GETDATE(), ErrorDescription = ERROR_MESSAGE(), RunCount = ISNULL(RunCount, 0) + 1         WHERE Pr",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  }
+]

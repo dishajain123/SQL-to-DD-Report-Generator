@@ -26,7 +26,7 @@ from sqlglot import exp
 
 from app.models.core import Dialect, StatementInfo
 
-_DML_KEYWORDS = ("SELECT", "UPDATE", "MERGE", "INSERT", "DELETE")
+_DML_KEYWORDS = ("SELECT", "UPDATE", "MERGE", "INSERT", "DELETE", "TRUNCATE")
 _CONTROL_KEYWORDS = ("IF", "BEGIN", "EXCEPTION", "DECLARE", "END", "CASE", "LOOP", "WHEN")
 
 _SQLGLOT_DIALECT = {
@@ -154,8 +154,16 @@ def _split_tsql_statement(stmt: str) -> list[str]:
     in_single = False
     in_double = False
     in_block_comment = False
+    # CASE ... END is an expression inside the current statement. A line
+    # beginning with END must not terminate an UPDATE while that CASE is open.
+    # Mask comments and literals before counting keywords so quoted values
+    # and prose cannot change statement boundaries.
+    from app.parsing.write_inventory_scan import _strip_strings_and_comments
 
-    for line in lines:
+    masked_lines = _strip_strings_and_comments(stmt).splitlines(keepends=True)
+    case_depth = 0
+
+    for line, masked_line in zip(lines, masked_lines):
         stripped = _strip_leading_comments(line)
         lead = re.match(r"[A-Za-z]+", stripped).group(0).upper() if re.match(r"[A-Za-z]+", stripped) else ""
         is_go = bool(re.match(r"^\s*GO(?:\s+\d+)?\s*(?:--.*)?$", stripped, re.IGNORECASE))
@@ -174,6 +182,7 @@ def _split_tsql_statement(stmt: str) -> list[str]:
             and not in_single
             and not in_double
             and not in_block_comment
+            and case_depth == 0
             and lead in _TSQL_STATEMENT_START_KEYWORDS
         )
         # An UPDATE ... SET col1=x, col2=y FROM ... WHERE ... statement
@@ -185,11 +194,37 @@ def _split_tsql_statement(stmt: str) -> list[str]:
         # and "SET ... FROM ... WHERE ...". Mirrors the WITH->SELECT
         # carve-out immediately below for the same reason.
         is_update_awaiting_set = buffer_lead == "UPDATE" and lead == "SET"
-        if should_split and not (buffer_lead == "WITH" and lead == "SELECT") and not is_update_awaiting_set:
+        # INSERT ... SELECT / INSERT ... VALUES often puts the SELECT/VALUES
+        # clause on a following line; SELECT is a statement-start keyword.
+        is_insert_awaiting_source = buffer_lead == "INSERT" and lead in {"SELECT", "VALUES", "WITH", "EXEC", "EXECUTE"}
+        # MERGE WHEN MATCHED/NOT MATCHED bodies start with UPDATE/INSERT on
+        # their own lines; those are clauses of the MERGE, not new statements.
+        is_merge_clause = buffer_lead == "MERGE" and lead in {
+            "UPDATE",
+            "INSERT",
+            "DELETE",
+            "USING",
+            "WHEN",
+            "SET",
+            "SELECT",
+            "WITH",
+        }
+        if (
+            should_split
+            and not (buffer_lead == "WITH" and lead == "SELECT")
+            and not is_update_awaiting_set
+            and not is_insert_awaiting_source
+            and not is_merge_clause
+        ):
             result.append(buffer_text)
             buf = []
 
         buf.append(line)
+        for token in re.findall(r"\b(?:CASE|END)\b", masked_line, re.IGNORECASE):
+            if token.upper() == "CASE":
+                case_depth += 1
+            elif case_depth:
+                case_depth -= 1
         paren_depth, in_single, in_double, in_block_comment = _scan_text_state(
             line, paren_depth, in_single, in_double, in_block_comment
         )
@@ -430,6 +465,123 @@ def _strip_leading_comments(text: str) -> str:
     return text[pos:]
 
 
+_INSERT_TARGET_RE = re.compile(
+    r"(?is)\bINSERT\s+(?:INTO\s+)?((?:#{1,2})?(?:\[[^\]]+\]|[A-Za-z_][\w$]*)(?:\s*\.\s*(?:#{1,2})?(?:\[[^\]]+\]|[A-Za-z_][\w$]*))*)"
+)
+_UPDATE_TARGET_RE = re.compile(
+    r"(?is)\bUPDATE\s+((?:#{1,2})?(?:\[[^\]]+\]|[A-Za-z_][\w$]*)(?:\s*\.\s*(?:#{1,2})?(?:\[[^\]]+\]|[A-Za-z_][\w$]*))*)"
+)
+_UPDATE_FROM_ALIAS_RE = re.compile(
+    r"(?is)\bUPDATE\s+(?P<alias>[A-Za-z_][\w$]*)\b"
+    r".*?\bFROM\s+(?P<table>(?:#{1,2})?(?:\[[^\]]+\]|[A-Za-z_][\w$]*)"
+    r"(?:\s*\.\s*(?:#{1,2})?(?:\[[^\]]+\]|[A-Za-z_][\w$]*))*)"
+    r"(?:\s+(?:AS\s+)?(?P=alias)\b)"
+)
+_MERGE_TARGET_RE = re.compile(
+    r"(?is)\bMERGE\s+(?:INTO\s+)?((?:#{1,2})?(?:\[[^\]]+\]|[A-Za-z_][\w$]*)(?:\s*\.\s*(?:#{1,2})?(?:\[[^\]]+\]|[A-Za-z_][\w$]*))*)"
+)
+_DELETE_TARGET_RE = re.compile(
+    r"(?is)\bDELETE\s+(?:FROM\s+)?((?:#{1,2})?(?:\[[^\]]+\]|[A-Za-z_][\w$]*)(?:\s*\.\s*(?:#{1,2})?(?:\[[^\]]+\]|[A-Za-z_][\w$]*))*)"
+)
+_TRUNCATE_TARGET_RE = re.compile(
+    r"(?is)\bTRUNCATE\s+TABLE\s+((?:#{1,2})?(?:\[[^\]]+\]|[A-Za-z_][\w$]*)(?:\s*\.\s*(?:#{1,2})?(?:\[[^\]]+\]|[A-Za-z_][\w$]*))*)"
+)
+_SELECT_INTO_TARGET_RE = re.compile(
+    r"(?is)\bINTO\s+((?:#{1,2})?(?:\[[^\]]+\]|[A-Za-z_][\w$]*)(?:\s*\.\s*(?:#{1,2})?(?:\[[^\]]+\]|[A-Za-z_][\w$]*))*)"
+)
+_SET_COLUMN_RE = re.compile(
+    r"(?is)\bSET\s+((?:[A-Za-z_][\w$]*\s*\.\s*)?[A-Za-z_][\w$]*)\s*="
+)
+
+
+def _clean_regex_table_name(raw: str) -> str:
+    parts = [p.strip().strip("[]").strip('"') for p in re.split(r"\s*\.\s*", raw or "") if p.strip()]
+    if not parts:
+        return ""
+    name = parts[-1]
+    # Preserve # / ## even when schema-qualified (tempdb..#T / ##Global).
+    hash_prefix = ""
+    for p in parts:
+        if p.startswith("##"):
+            hash_prefix = "##"
+            break
+        if p.startswith("#"):
+            hash_prefix = "#"
+            break
+    bare = name.lstrip("#")
+    return f"{hash_prefix}{bare}" if hash_prefix else name
+
+
+def _apply_regex_write_fallback(info: StatementInfo) -> None:
+    """Best-effort target recovery when sqlglot fails or returns no write target.
+
+    Generation must never silently omit an unparsed write: record the target
+    (and mark parse failure) so the coverage ledger can surface it.
+    """
+    text = _strip_leading_comments(info.raw_text or "")
+    target = ""
+    if info.statement_type == "INSERT" or re.match(r"(?is)^\s*INSERT\b", text):
+        match = _INSERT_TARGET_RE.search(text)
+        target = _clean_regex_table_name(match.group(1)) if match else ""
+        info.statement_type = "INSERT"
+    elif info.statement_type == "MERGE" or re.match(r"(?is)^\s*MERGE\b", text):
+        match = _MERGE_TARGET_RE.search(text)
+        target = _clean_regex_table_name(match.group(1)) if match else ""
+        info.statement_type = "MERGE"
+    elif info.statement_type == "TRUNCATE" or re.match(r"(?is)^\s*TRUNCATE\b", text):
+        match = _TRUNCATE_TARGET_RE.search(text)
+        target = _clean_regex_table_name(match.group(1)) if match else ""
+        info.statement_type = "TRUNCATE"
+    elif info.statement_type == "DELETE" or re.match(r"(?is)^\s*DELETE\b", text):
+        match = _DELETE_TARGET_RE.search(text)
+        target = _clean_regex_table_name(match.group(1)) if match else ""
+        info.statement_type = "DELETE"
+    elif info.statement_type == "SELECT" or re.match(r"(?is)^\s*(?:WITH\b|SELECT\b)", text):
+        match = _SELECT_INTO_TARGET_RE.search(text)
+        if match:
+            target = _clean_regex_table_name(match.group(1))
+            info.statement_type = "SELECT"
+    elif info.statement_type == "UPDATE" or re.match(r"(?is)^\s*UPDATE\b", text):
+        # Prefer UPDATE alias … FROM real_table alias over bare UPDATE alias.
+        from_match = _UPDATE_FROM_ALIAS_RE.search(text)
+        if from_match:
+            target = _clean_regex_table_name(from_match.group("table"))
+        else:
+            match = _UPDATE_TARGET_RE.search(text)
+            target = _clean_regex_table_name(match.group(1)) if match else ""
+        info.statement_type = "UPDATE"
+
+    if target and target not in info.tables_written:
+        info.tables_written = sorted({*info.tables_written, target})
+
+    # Recover SET columns when sqlglot failed on nested CASE etc.
+    if info.statement_type == "UPDATE" and target and not info.set_columns_by_table.get(target):
+        cols: list[str] = []
+        for col_match in _SET_COLUMN_RE.finditer(text):
+            col = col_match.group(1)
+            if "." in col:
+                col = col.split(".")[-1].strip()
+            if col and col.upper() not in {c.upper() for c in cols}:
+                cols.append(col)
+        if cols:
+            info.set_columns_by_table = {**(info.set_columns_by_table or {}), target: cols}
+
+    if not info.tables_written and info.statement_type in (
+        "INSERT", "UPDATE", "MERGE", "DELETE", "TRUNCATE"
+    ):
+        info.parsed_ok = False
+        info.parse_error = info.parse_error or "unable to resolve write target"
+    # Alias-only targets after recovery are incomplete coverage.
+    if info.tables_written and all(len(t) <= 2 and not t.startswith("#") for t in info.tables_written):
+        from_match = _UPDATE_FROM_ALIAS_RE.search(text)
+        if from_match:
+            resolved = _clean_regex_table_name(from_match.group("table"))
+            if resolved:
+                info.tables_written = [resolved]
+                info.parsed_ok = False
+                info.parse_error = info.parse_error or "resolved alias target via FROM clause after parse failure"
+
+
 def parse_statement(stmt_text: str, index: int, dialect: Dialect) -> StatementInfo:
     stmt_type = classify_statement(stmt_text)
 
@@ -449,20 +601,78 @@ def parse_statement(stmt_text: str, index: int, dialect: Dialect) -> StatementIn
         info.parsed_ok = False
         info.parse_error = str(exc)
         info.conditions = _extract_conditions(stmt_text)
+        _apply_regex_write_fallback(info)
         return info
 
     if tree is None:
         info.parsed_ok = False
         info.parse_error = "sqlglot returned no expression tree"
+        _apply_regex_write_fallback(info)
         return info
 
     stmt_type = _statement_type_from_tree(tree, stmt_type)
+    info.statement_type = stmt_type
     info.tables_read, info.tables_written = _tables_from_tree(tree, stmt_type)
     info.columns = sorted({c.name for c in tree.find_all(exp.Column) if c.name})
     info.set_columns_by_table = _set_columns_by_table(tree, stmt_type, info.tables_written)
     info.join_tables, info.join_conditions = _join_info_from_tree(tree)
     info.conditions = _extract_conditions(stmt_text)
+    needs_target = stmt_type in ("INSERT", "UPDATE", "MERGE", "DELETE", "TRUNCATE") or (
+        stmt_type == "SELECT" and bool(re.search(r"(?is)\bINTO\s+#", stmt_text))
+    )
+    if needs_target and not info.tables_written:
+        info.parsed_ok = False
+        info.parse_error = info.parse_error or "write statement produced no target table"
+        _apply_regex_write_fallback(info)
+    elif stmt_type == "UPDATE" and info.tables_written:
+        # If sqlglot left the alias as the write target but FROM binds that
+        # alias to a real table, resolve it (UPDATE A ... FROM PRO.T A).
+        from_match = _UPDATE_FROM_ALIAS_RE.search(_strip_leading_comments(stmt_text))
+        if from_match:
+            alias = from_match.group("alias")
+            resolved = _clean_regex_table_name(from_match.group("table"))
+            if (
+                resolved
+                and any(_normalize_table_token(t) == alias.upper() for t in info.tables_written)
+                and _normalize_table_token(resolved) != alias.upper()
+            ):
+                info.tables_written = [resolved]
+                info.parsed_ok = info.parsed_ok  # keep prior status; target is now correct
+    _restore_temp_hash_prefixes(info)
     return info
+
+
+def _restore_temp_hash_prefixes(info: StatementInfo) -> None:
+    """Re-attach `#` / `##` when sqlglot stripped them from temporary tables."""
+    raw = info.raw_text or ""
+    if "#" not in raw or not info.tables_written:
+        return
+    restored: list[str] = []
+    for table in info.tables_written:
+        bare = table.lstrip("#")
+        if re.search(rf"(?i)##{re.escape(bare)}\b", raw):
+            restored.append(f"##{bare}")
+        elif re.search(rf"(?i)(?<!#)#{re.escape(bare)}\b", raw) and not table.startswith("#"):
+            restored.append(f"#{bare}")
+        else:
+            restored.append(table)
+    if restored != info.tables_written:
+        mapping = dict(zip(info.tables_written, restored))
+        info.tables_written = restored
+        if info.set_columns_by_table:
+            info.set_columns_by_table = {
+                mapping.get(k, k): v for k, v in info.set_columns_by_table.items()
+            }
+    read_restored: list[str] = []
+    for table in info.tables_read:
+        bare = table.lstrip("#")
+        if re.search(rf"(?i)##{re.escape(bare)}\b", raw):
+            read_restored.append(f"##{bare}")
+        elif re.search(rf"(?i)(?<!#)#{re.escape(bare)}\b", raw) and not table.startswith("#"):
+            read_restored.append(f"#{bare}")
+        else:
+            read_restored.append(table)
+    info.tables_read = read_restored
 
 
 def _statement_type_from_tree(tree: exp.Expression, fallback: str) -> str:
@@ -476,35 +686,98 @@ def _statement_type_from_tree(tree: exp.Expression, fallback: str) -> str:
         return "MERGE"
     if isinstance(tree, exp.Select):
         return "SELECT"
+    if type(tree).__name__ == "Truncate" or tree.__class__.__name__ == "TruncateTable":
+        return "TRUNCATE"
     return fallback
+
+
+def _table_display_name(table: exp.Table | None) -> str | None:
+    """Return a stable table name, preserving `#` / `##` for T-SQL temps."""
+    if table is None or not table.name:
+        return None
+    name = table.name
+    ident = table.this
+    if isinstance(ident, exp.Identifier) and isinstance(ident.this, str) and ident.this.startswith("#"):
+        return ident.this
+    if isinstance(ident, exp.Identifier) and ident.args.get("temporary") and not name.startswith("#"):
+        # Global temps often appear as Temporary without the hash in .name.
+        return f"#{name}"
+    # sqlglot may strip ## to a bare name; recover from original SQL when possible
+    # via the Identifier temporary flag + catalog/db clues is imperfect, so callers
+    # that need ## should also check raw text.
+    return name
 
 
 def _tables_from_tree(tree: exp.Expression, stmt_type: str) -> tuple[list[str], list[str]]:
     table_nodes = [t for t in tree.find_all(exp.Table) if t.name]
-    all_tables = sorted({t.name for t in table_nodes})
+    all_tables = sorted({_table_display_name(t) or t.name for t in table_nodes})
 
     written: set[str] = set()
-    if stmt_type in ("UPDATE", "INSERT", "DELETE"):
+    if stmt_type in ("UPDATE", "INSERT", "DELETE", "TRUNCATE"):
         target_name, target_alias, exclude_names = _resolve_target_table_name(tree, stmt_type)
         if target_name:
             written.add(target_name)
         if exclude_names:
-            all_tables = sorted({t for t in all_tables if t not in exclude_names})
+            exclude_norm = {_normalize_table_token(x) for x in exclude_names}
+            all_tables = sorted(
+                {t for t in all_tables if _normalize_table_token(t) not in exclude_norm}
+            )
     elif stmt_type == "MERGE":
         merge_target = tree.this
-        if isinstance(merge_target, exp.Table) and merge_target.name:
-            written.add(merge_target.name)
+        if isinstance(merge_target, exp.Table):
+            name = _table_display_name(merge_target)
+            if name:
+                written.add(name)
     elif stmt_type == "SELECT":
         into = tree.args.get("into") if isinstance(tree, exp.Select) else None
         into_table = into.this if into is not None else None
-        if isinstance(into_table, exp.Table) and into_table.name:
-            written.add(into_table.name)
+        if isinstance(into_table, exp.Table):
+            name = _table_display_name(into_table)
+            if name:
+                written.add(name)
 
-    read = sorted(set(all_tables) - written)
+    written_norm = {_normalize_table_token(t) for t in written}
+    read = sorted({t for t in all_tables if _normalize_table_token(t) not in written_norm})
     return read, sorted(written)
 
 
+def _normalize_table_token(name: str) -> str:
+    text = (name or "").strip().strip('"').strip("[]")
+    while text.startswith("#"):
+        text = text[1:]
+    if "." in text:
+        text = text.split(".")[-1]
+    return text.upper()
+
+
 def _resolve_target_table_name(tree: exp.Expression, stmt_type: str) -> tuple[str | None, str | None, set[str]]:
+    if stmt_type == "TRUNCATE":
+        # sqlglot Truncate / TruncateTable shapes vary by version.
+        for node in tree.walk():
+            if isinstance(node, exp.Table) and node.name:
+                return _table_display_name(node), node.alias_or_name or None, set()
+        return None, None, set()
+
+    if stmt_type == "INSERT":
+        insert_node = tree if isinstance(tree, exp.Insert) else tree.find(exp.Insert)
+        if insert_node is None:
+            return None, None, set()
+        schema = insert_node.this
+        if isinstance(schema, exp.Schema) and isinstance(schema.this, exp.Table):
+            return _table_display_name(schema.this), schema.this.alias_or_name or None, set()
+        if isinstance(schema, exp.Table):
+            return _table_display_name(schema), schema.alias_or_name or None, set()
+        return None, None, set()
+
+    if stmt_type == "DELETE":
+        delete_node = tree if isinstance(tree, exp.Delete) else tree.find(exp.Delete)
+        if delete_node is None:
+            return None, None, set()
+        target = delete_node.this
+        if isinstance(target, exp.Table):
+            return _table_display_name(target), target.alias_or_name or None, set()
+        return None, None, set()
+
     if stmt_type != "UPDATE":
         return None, None, set()
 
@@ -516,19 +789,20 @@ def _resolve_target_table_name(tree: exp.Expression, stmt_type: str) -> tuple[st
     if not isinstance(target, exp.Table):
         return None, None, set()
 
-    target_name = target.name or None
+    target_name = _table_display_name(target)
     target_alias = target.alias_or_name or None
     exclude_names: set[str] = set()
 
-    if target_name and target_alias and target_name == target_alias:
+    if target_name and target_alias and _normalize_table_token(target_name) == _normalize_table_token(target_alias):
         from_clause = update_node.args.get("from_")
         if from_clause is not None:
             for candidate in from_clause.find_all(exp.Table):
                 if candidate is target:
                     continue
                 if candidate.alias_or_name and candidate.alias_or_name.upper() == target_alias.upper():
-                    if candidate.name:
-                        target_name = candidate.name
+                    resolved = _table_display_name(candidate)
+                    if resolved:
+                        target_name = resolved
                         exclude_names.add(target_alias)
                         break
 

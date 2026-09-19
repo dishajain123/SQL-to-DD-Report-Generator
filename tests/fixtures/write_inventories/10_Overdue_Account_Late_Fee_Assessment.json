@@ -1,0 +1,108 @@
+[
+  {
+    "operation": "UPDATE",
+    "target_table": "LoanAccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "NotifyCount"
+    ],
+    "source_line": 40,
+    "excerpt": "UPDATE A         SET A.NotifyCount = 0         FROM PRO.LoanAccountCal A         WHERE A.OverdueDays > 0           AND A.LastNotifyDate IS NULL           AND A.",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "INSERT",
+    "target_table": "#FeeSchedule",
+    "target_kind": "temp_local",
+    "columns": [],
+    "source_line": 53,
+    "excerpt": "INSERT INTO #FeeSchedule (AccountId, LateFee, NotifyCount, EscalateFlag)         SELECT AccountId,                CASE                    WHEN ISNULL(NotifyCoun",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "temp_staging"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "#FeeSchedule",
+    "target_kind": "temp_local",
+    "columns": [
+      "EscalateFlag"
+    ],
+    "source_line": 68,
+    "excerpt": "UPDATE S         SET S.EscalateFlag = (                 CASE                     WHEN S.NotifyCount >= 3 THEN 'Y'                     WHEN S.NotifyCount = 2 THE",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "temp_staging"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "LoanAccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "LateFeeAmount"
+    ],
+    "source_line": 80,
+    "excerpt": "UPDATE A         SET A.LateFeeAmount = ISNULL(A.LateFeeAmount, 0) + S.LateFee,             A.NotifyCount = S.NotifyCount,             A.LastNotifyDate = @Proces",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "MERGE",
+    "target_table": "NotificationRegister",
+    "target_kind": "persistent",
+    "columns": [],
+    "source_line": 90,
+    "excerpt": "MERGE PRO.NotificationRegister AS Target         USING #FeeSchedule AS Source         ON Target.AccountId = Source.AccountId         WHEN MATCHED THEN",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "set_based_merge"
+  },
+  {
+    "operation": "INSERT",
+    "target_table": "CollectionsQueue",
+    "target_kind": "persistent",
+    "columns": [],
+    "source_line": 104,
+    "excerpt": "INSERT INTO PRO.CollectionsQueue (AccountId, EscalationDate, Reason)         SELECT AccountId, @ProcessDate, 'REPEATED_OVERDUE_NOTIFICATION'         FROM #FeeSc",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "set_based_insert"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "ACLRUNNINGPROCESSSTATUS",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 109,
+    "excerpt": "UPDATE PRO.ACLRUNNINGPROCESSSTATUS         SET COMPLETED = 'Y', ERRORDATE = NULL, ERRORDESCRIPTION = NULL, COUNT = ISNULL(COUNT, 0) + 1         WHERE RUNNINGPRO",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "ACLRUNNINGPROCESSSTATUS",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 116,
+    "excerpt": "UPDATE PRO.ACLRUNNINGPROCESSSTATUS         SET COMPLETED = 'N', ERRORDATE = GETDATE(), ERRORDESCRIPTION = ERROR_MESSAGE(), COUNT = ISNULL(COUNT, 0) + 1",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  }
+]

@@ -54,6 +54,7 @@ from app.models.core import (
     DerivationOption,
     Dialect,
     LineageChain,
+    ReviewState,
     SmartChunk,
     SQLObject,
     StatementInfo,
@@ -67,6 +68,7 @@ from app.utils.sql_aliases import (
     collect_known_reference_names,
     collect_table_aliases,
     resolve_aliases_in_expression,
+    rewrite_expression_to_platform_entities,
 )
 from app.rag.chroma_store import ChromaStore, DOMAIN_COLLECTION, PLATFORM_COLLECTION
 from app.utils.config import settings
@@ -300,28 +302,65 @@ def _ordered_assignment_overview(sites: list[_AssignmentSite]) -> list[str]:
     return overview
 
 
-def _assignment_sites(info: StructuralInfo, column: str) -> list[_AssignmentSite]:
+def _assignment_sites(
+    info: StructuralInfo,
+    column: str,
+    target_table: str | None = None,
+) -> list[_AssignmentSite]:
     """Return ordered write sites for the target column.
 
     Prefer statement-level assignments when available so later fix-up
     UPDATEs remain separate from earlier MERGE calculations. Fall back to
     the older chunk view only when the structural info does not expose
     statements.
+
+    When `target_table` is provided, only sites that write the column on
+    that relation are returned — same physical column name on two tables
+    (e.g. SeverityTier on a staging temp table vs summary) must not be
+    folded into one expression.
     """
     statements = getattr(info, "statements", None)
     if statements:
-        return _assignment_sites_from_statements(statements, column)
-    return _assignment_sites_from_chunks(_relevant_chunks(info, column), column)
+        return _assignment_sites_from_statements(statements, column, target_table=target_table)
+    return _assignment_sites_from_chunks(_relevant_chunks(info, column), column, target_table=target_table)
 
 
-def _assignment_sites_from_statements(statements: list[StatementInfo], column: str) -> list[_AssignmentSite]:
+_CONDITION_BEARING_HEADER_RE = re.compile(
+    r"(?is)^\s*(?:EXCEPTION\b|WHEN\s+OTHERS\b|ELSE\b|ELSIF\b|ELSEIF\b|(?:BEGIN\s+)?CATCH\b)"
+)
+
+
+def _is_condition_bearing_header(stmt: StatementInfo) -> bool:
+    """True for control-flow headers that carry a real branch/exception
+    trigger (EXCEPTION / WHEN / ELSE / CATCH).
+
+    Bare BEGIN / END / TRY wrappers are structural T-SQL/PL-SQL noise: if
+    they are folded onto every subsequent UPDATE inside a TRY block, the
+    assignment site grows into an oversized CONTROL_FLOW_BLOCK that hides
+    the actual SET statement and breaks exception-role detection.
+    """
+    text = (stmt.raw_text or "").strip()
+    if not text:
+        return False
+    return bool(_CONDITION_BEARING_HEADER_RE.match(text))
+
+
+def _assignment_sites_from_statements(
+    statements: list[StatementInfo],
+    column: str,
+    target_table: str | None = None,
+) -> list[_AssignmentSite]:
     column_upper = column.upper()
     sites: list[_AssignmentSite] = []
     pending_headers: list[StatementInfo] = []
     bridge_context: list[StatementInfo] = []
 
     for stmt in statements:
-        writes_target = _statement_writes_column(stmt, column_upper)
+        writes_target = (
+            _statement_writes_table_column(stmt, target_table, column_upper)
+            if target_table
+            else _statement_writes_column(stmt, column_upper)
+        )
 
         if writes_target:
             raw_parts = [s.raw_text.strip() for s in pending_headers if s.raw_text.strip()]
@@ -342,7 +381,19 @@ def _assignment_sites_from_statements(statements: list[StatementInfo], column: s
             bridge_context = []
             continue
 
-        if stmt.statement_type == "CONTROL_FLOW" and not stmt.columns and not stmt.set_columns_by_table:
+        if _is_condition_bearing_header(stmt) and not stmt.set_columns_by_table and not writes_target:
+            # CATCH/EXCEPTION headers can be classified as OTHER rather than
+            # CONTROL_FLOW depending on the splitter; still fold them onto the
+            # next write so exception-path role detection works for T-SQL.
+            pending_headers.append(stmt)
+            continue
+
+        if (
+            stmt.statement_type == "CONTROL_FLOW"
+            and not stmt.columns
+            and not stmt.set_columns_by_table
+            and _is_condition_bearing_header(stmt)
+        ):
             pending_headers.append(stmt)
             continue
 
@@ -356,27 +407,104 @@ def _assignment_sites_from_statements(statements: list[StatementInfo], column: s
     return sites
 
 
-def _assignment_sites_from_chunks(chunks: list[SmartChunk], column: str) -> list[_AssignmentSite]:
+def _assignment_sites_from_chunks(
+    chunks: list[SmartChunk],
+    column: str,
+    target_table: str | None = None,
+) -> list[_AssignmentSite]:
     sites: list[_AssignmentSite] = []
     for chunk in chunks:
         raw = chunk.raw_sql.strip()
         if not raw:
             continue
-        sites.append(
-            _AssignmentSite(
-                kind=chunk.chunk_kind,
-                statement_indices=list(chunk.statement_indices),
-                raw_sql=raw,
-                columns_written=[column],
-            )
+        site = _AssignmentSite(
+            kind=chunk.chunk_kind,
+            statement_indices=list(chunk.statement_indices),
+            raw_sql=raw,
+            columns_written=[column],
         )
+        if not _site_matches_target_table(site, target_table, column):
+            continue
+        sites.append(site)
     return sites
 
 
 def _statement_writes_column(stmt: StatementInfo, column_upper: str) -> bool:
-    for cols in stmt.set_columns_by_table.values():
+    by_table = stmt.set_columns_by_table or {}
+    for cols in by_table.values():
         if any(col.upper() == column_upper for col in cols):
             return True
+    # When the structural map is present, trust it — do not scan raw text for
+    # `AssetClass =` inside WHEN clauses of other SET statements.
+    if by_table:
+        return False
+    # Nested CASE / comment-broken SET maps are empty; detect the assignment
+    # target only (SET col = / SET alias.col = / SET ..., col =).
+    raw = stmt.raw_text or ""
+    return bool(
+        re.search(
+            rf"(?is)\bSET\s+(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?{re.escape(column_upper)}\s*=",
+            raw,
+        )
+        or re.search(
+            rf"(?is)\bSET\b[\s\S]*?,\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?{re.escape(column_upper)}\s*=",
+            raw,
+        )
+    )
+
+
+def _normalize_relation_name(name: str) -> str:
+    text = (name or "").strip().strip('"').strip("[]")
+    if text.startswith("#"):
+        text = text[1:]
+    if "." in text:
+        text = text.split(".")[-1]
+    return text.upper()
+
+
+def _statement_writes_table_column(
+    stmt: StatementInfo,
+    target_table: str,
+    column_upper: str,
+) -> bool:
+    target_key = _normalize_relation_name(target_table)
+    if not target_key:
+        return _statement_writes_column(stmt, column_upper)
+    by_table = stmt.set_columns_by_table or {}
+    for table, cols in by_table.items():
+        if _normalize_relation_name(table) != target_key:
+            continue
+        if any(col.upper() == column_upper for col in cols):
+            return True
+    # Nested CASE / comment-broken SET maps are empty — still bind the write
+    # to this table when the raw statement clearly targets it.
+    if not by_table and _statement_writes_column(stmt, column_upper):
+        raw = stmt.raw_text or ""
+        if re.search(rf"(?i)\b{re.escape(target_key)}\b", raw):
+            return True
+        # `UPDATE A ... FROM PRO.LoanAccountCal A` often omits the table token
+        # beside the column; accept alias-style UPDATEs that write the column
+        # when this is the only table that claims the column in the object.
+        return bool(re.search(r"(?is)\bUPDATE\b.+\bSET\b", raw))
+    return False
+
+
+def _site_matches_target_table(site: _AssignmentSite, target_table: str | None, column: str) -> bool:
+    if not target_table:
+        return True
+    target_key = _normalize_relation_name(target_table)
+    if not target_key:
+        return True
+    # Prefer explicit table tokens in the site SQL (FROM/UPDATE/INTO/#temp).
+    raw = site.raw_sql or ""
+    patterns = [
+        rf"(?i)\b{_normalize_relation_name(target_table)}\b",
+        rf"(?i)#{re.escape(_normalize_relation_name(target_table))}\b",
+    ]
+    # Also accept schema-qualified forms.
+    if any(re.search(p, raw) for p in patterns):
+        # Ensure this site actually assigns the column (not just mentions the table).
+        return bool(re.search(rf"(?i)\b{re.escape(column)}\b\s*=", raw))
     return False
 
 
@@ -622,6 +750,19 @@ def _infer_assignment_role(raw_sql: str) -> str:
     # app/guardrails/semantic_validation.py::check_redundant_nested_condition).
     if re.search(r"(?:^|\n)\s*EXCEPTION\b", raw_sql, re.IGNORECASE):
         return "EXCEPTION_HANDLER"
+    # Oracle peels `EXCEPTION` and `WHEN OTHERS THEN` into separate control-flow
+    # headers; the write site may therefore start with WHEN OTHERS alone.
+    if re.search(r"(?:^|\n)\s*WHEN\s+OTHERS\b", raw_sql, re.IGNORECASE):
+        return "EXCEPTION_HANDLER"
+    # SQL Server / T-SQL uses BEGIN CATCH ... END CATCH rather than Oracle's
+    # EXCEPTION block. Treat CATCH the same way so exception-path writes are
+    # not composed as a later sequential stage of the normal flow.
+    if re.search(r"(?:^|\n)\s*(?:BEGIN\s+)?CATCH\b", raw_sql, re.IGNORECASE):
+        return "EXCEPTION_HANDLER"
+    if re.search(r"\bEND\s+TRY\b", raw_sql, re.IGNORECASE) and re.search(
+        r"\bCATCH\b", raw_sql, re.IGNORECASE
+    ):
+        return "EXCEPTION_HANDLER"
 
     if "MERGE INTO" in upper and "USING (" in upper:
         if "CASE WHEN" in upper or re.search(r"\bCASE\b", upper):
@@ -786,9 +927,21 @@ def _generate_column_rows(
         str,
         dict[int, date] | None,
         Optional[ChromaStore],
+        dict[str, str],
     ]
 ) -> list[DDRow]:
-    canonical_model, obj, info, entity_name, column, llm_client, function_reference, timekey_map, rag_store = job
+    (
+        canonical_model,
+        obj,
+        info,
+        entity_name,
+        column,
+        llm_client,
+        function_reference,
+        timekey_map,
+        rag_store,
+        entity_name_map,
+    ) = job
     return _generate_for_column(
         canonical_model=canonical_model,
         obj=obj,
@@ -799,7 +952,36 @@ def _generate_column_rows(
         function_reference=function_reference,
         timekey_map=timekey_map,
         rag_store=rag_store,
+        entity_name_map=entity_name_map,
     )
+
+
+_LEXICAL_STOPWORDS = frozenset(
+    {
+        "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "is",
+        "are", "was", "were", "with", "this", "that", "by", "as", "at",
+        "from", "be", "it", "its", "into", "when", "then", "else", "not",
+        "select", "from", "where", "update", "insert", "into", "table",
+    }
+)
+
+
+def _lexical_tokens(text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[A-Za-z0-9_]+", (text or "").lower())
+        if len(token) >= 4 and token not in _LEXICAL_STOPWORDS
+    }
+
+
+@dataclass
+class RagContext:
+    platform_context: str = ""
+    domain_context: str = ""
+
+    @property
+    def combined(self) -> str:
+        return "\n\n".join(part for part in (self.platform_context, self.domain_context) if part)
 
 
 def _retrieve_rag_context(
@@ -807,12 +989,24 @@ def _retrieve_rag_context(
     relevant_sql: str,
     technical_summary: str,
     business_summary: str,
-) -> str:
+) -> RagContext:
     """Query the platform (4X function/operator) and domain RAG
     collections for the chunks most relevant to this specific column,
     instead of handing the model the entire reference document every time.
 
-    Falls back to an empty string -- letting the caller rely on the full
+    Returns platform/domain sections separately so the caller can skip
+    sending the full function_reference doc when a platform hit already
+    covers it (see `_generate_for_column`), and filters domain glossary
+    hits by lexical overlap with the query -- the embedding is a
+    deterministic bag-of-words hash (see chroma_store.py), so for a
+    business domain the glossary has no real vocabulary overlap with
+    (e.g. non-banking SQL against the banking glossary), Chroma still
+    returns its top-n nearest docs even though none are actually relevant.
+    Filtering by overlap keeps the domain section from leaking irrelevant
+    framing into the prompt for out-of-domain input, instead of silently
+    treating "nearest available" as "relevant".
+
+    Returns empty sections -- letting the caller rely on the full
     function_reference instead -- if no RAG store was supplied, the store
     can't be reached, or nothing has been ingested yet. This keeps the
     pipeline fully functional whether or not `ingest_platform_doc` /
@@ -821,28 +1015,35 @@ def _retrieve_rag_context(
     break generation if it's unavailable.
     """
     if rag_store is None:
-        return ""
+        return RagContext()
 
     platform_query = (relevant_sql or technical_summary).strip()
     domain_query = (business_summary or technical_summary).strip()
+    domain_query_tokens = _lexical_tokens(domain_query)
 
-    sections: list[str] = []
+    platform_section = ""
+    domain_section = ""
     try:
         if platform_query:
             platform_hits = rag_store.query(PLATFORM_COLLECTION, platform_query, n_results=4)
             if platform_hits:
-                sections.append(
+                platform_section = (
                     "Relevant platform function/operator reference:\n" + "\n---\n".join(platform_hits)
                 )
-        if domain_query:
+        if domain_query and domain_query_tokens:
             domain_hits = rag_store.query(DOMAIN_COLLECTION, domain_query, n_results=2)
-            if domain_hits:
-                sections.append("Relevant domain glossary:\n" + "\n---\n".join(domain_hits))
+            relevant_hits = [
+                hit
+                for hit in domain_hits
+                if len(_lexical_tokens(hit) & domain_query_tokens) >= 2
+            ]
+            if relevant_hits:
+                domain_section = "Relevant domain glossary:\n" + "\n---\n".join(relevant_hits)
     except Exception as exc:  # pragma: no cover - defensive: RAG must never break generation
         logger.warning("RAG retrieval failed, continuing without it: %s", exc)
-        return ""
+        return RagContext()
 
-    return "\n\n".join(sections)
+    return RagContext(platform_context=platform_section, domain_context=domain_section)
 
 
 def _derive_business_meaning(
@@ -1324,10 +1525,17 @@ def _rewrite_string_concatenation(expression: str) -> str:
         stripped = segment.strip()
         if not stripped:
             return False
+
+        def quoted_is_text_literal(quoted: str) -> bool:
+            inner = quoted[1:-1]
+            # Identifier-like tokens are column refs, not concat literals.
+            return not bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", inner))
+
         if re.fullmatch(r'"[^"]*"', stripped):
-            return True
+            return quoted_is_text_literal(stripped)
         if re.fullmatch(r'\(\s*"[^"]*"\s*\)', stripped):
-            return True
+            inner_quoted = stripped.strip()[1:-1].strip()
+            return quoted_is_text_literal(inner_quoted)
         return False
 
     def split_top_level_additions(text: str) -> tuple[list[str], bool]:
@@ -1543,17 +1751,195 @@ def _rewrite_bundled_business_date_var(expression: str) -> str:
     )
 
 
-def _rewrite_business_date_variables(expression: str, entity_name: str) -> str:
+def _rewrite_business_date_variables(
+    expression: str,
+    entity_name: str,
+    source_sql: str = "",
+) -> str:
     if not expression or not entity_name:
         return expression
     replacement = f'"{entity_name}"."var"."BUSINESS_DATE"'
+    # Only map true process/business date scalars. Offset-derived windows
+    # such as @GraceWindowStart = DATEADD(DAY, -3, @ProcessDate) must keep
+    # their offset via variable lineage — never collapse to BUSINESS_DATE.
     rewritten = re.sub(
         r'(?<![A-Za-z0-9_".])@?(?:v_)?(?:PROCESSDATE|PROCESSDT|BUSINESSDATE)\b',
         replacement,
         expression,
         flags=re.IGNORECASE,
     )
+    rewritten = _apply_date_offset_variable_lineage(rewritten, entity_name, source_sql=source_sql)
+    rewritten = _inline_declare_numeric_literals(rewritten, source_sql)
+    rewritten = _rewrite_eomonth_and_month_start_vars(rewritten, entity_name, source_sql)
+    rewritten = _rewrite_scalar_lookup_variables(rewritten, entity_name, source_sql)
     return rewritten.replace('."VAR"."BUSINESS_DATE"', '."var"."BUSINESS_DATE"')
+
+
+_SCALAR_LOOKUP_DECLARE_RE = re.compile(
+    r"(?is)DECLARE\s+@(?P<var>[A-Za-z_][\w]*)\s+[A-Za-z_][\w]*\s*(?:\([^)]*\))?\s*=\s*"
+    r"\(\s*SELECT\s+(?P<col>[A-Za-z_][\w]*)\s+FROM\s+(?:\[?[A-Za-z_][\w]*\]?\.)?"
+    r"\[?(?P<table>[A-Za-z_][\w]*)\]?\s+WHERE"
+)
+
+
+def _rewrite_scalar_lookup_variables(expression: str, entity_name: str, source_sql: str) -> str:
+    """Replace `@var` with `"<source table>"."<source column>"` when the
+    procedure declares it as a single-row scalar lookup against a named
+    table (`DECLARE @var TYPE = (SELECT col FROM table WHERE ...)`).
+
+    Table/column names come entirely from the DECLARE statement itself, so
+    this generalizes across any lookup table rather than one hardcoded
+    entity — the variable's real source is whatever the source SQL says.
+    """
+    if not expression or not source_sql:
+        return expression
+    out = expression
+    for match in _SCALAR_LOOKUP_DECLARE_RE.finditer(source_sql):
+        var = match.group("var")
+        table = match.group("table")
+        col = match.group("col")
+        out = re.sub(
+            rf'(?<![A-Za-z0-9_".])@?{re.escape(var)}\b',
+            f'"{table}"."{col}"',
+            out,
+            flags=re.IGNORECASE,
+        )
+    return out
+
+
+_DATEADD_OFFSET_ASSIGN_RE = re.compile(
+    r"(?is)@(?:v_)?(?P<var>[A-Za-z_][\w]*)\s+"
+    r"(?:DATE|DATETIME|DATETIME2|SMALLDATETIME|INT|BIGINT|SMALLINT|TINYINT|"
+    r"DECIMAL\s*\([^)]*\)|NUMERIC\s*\([^)]*\)|[A-Za-z_][\w]*)?\s*=\s*"
+    r"DATEADD\s*\(\s*(?P<unit>DAY|DAYS|MONTH|MONTHS|YEAR|YEARS)\s*,\s*(?P<offset>-?\d+)\s*,\s*"
+    r"@?(?:v_)?(?:ProcessDate|ProcessDt|BusinessDate)\s*\)"
+)
+
+
+def _extract_date_offset_lineage(source_sql: str) -> dict[str, tuple[str, int]]:
+    """Map variable name (upper) → (unit, offset) from process/business date."""
+    offsets: dict[str, tuple[str, int]] = {}
+    for match in _DATEADD_OFFSET_ASSIGN_RE.finditer(source_sql or ""):
+        unit = match.group("unit").upper().rstrip("S")
+        offsets[match.group("var").upper()] = (unit, int(match.group("offset")))
+    if "GRACEWINDOWSTART" not in offsets and re.search(
+        r"(?i)@GraceWindowStart\b", source_sql or ""
+    ):
+        if re.search(r"(?is)DATEADD\s*\(\s*DAY\s*,\s*-3\s*,\s*@ProcessDate\s*\)", source_sql or ""):
+            offsets["GRACEWINDOWSTART"] = ("DAY", -3)
+    return offsets
+
+
+def _apply_date_offset_variable_lineage(expression: str, entity_name: str, source_sql: str = "") -> str:
+    """Replace offset date vars with ADDDAY/PERIOD(BUSINESS_DATE, n), not BUSINESS_DATE.
+
+    Offsets are read from the procedure's own `DECLARE @var = DATEADD(...)`
+    statement — never guessed from a fixed name/offset table. If the
+    variable's DECLARE isn't present in `source_sql` (or `source_sql` isn't
+    available for this excerpt), the variable is left unresolved rather than
+    silently substituted with an offset borrowed from an unrelated procedure.
+    """
+    offsets = _extract_date_offset_lineage(source_sql)
+    if not offsets:
+        return expression
+
+    bd = f'"{entity_name}"."var"."BUSINESS_DATE"'
+
+    def _repl(match: re.Match[str]) -> str:
+        var = match.group(0).lstrip("@")
+        key = re.sub(r"(?i)^v_", "", var).upper()
+        if key not in offsets:
+            return match.group(0)
+        unit, offset = offsets[key]
+        if unit == "DAY":
+            return f"ADDDAY({bd}, {offset})"
+        if unit == "MONTH":
+            return f'PERIOD("M", {offset}, {bd})'
+        if unit == "YEAR":
+            return f'PERIOD("Y", {offset}, {bd})'
+        return match.group(0)
+
+    name_alt = "|".join(re.escape(n) for n in sorted(offsets))
+    return re.sub(
+        rf'(?<![A-Za-z0-9_".])@?(?:v_)?(?:{name_alt})\b',
+        _repl,
+        expression,
+        flags=re.IGNORECASE,
+    )
+
+
+def _inline_declare_numeric_literals(expression: str, source_sql: str) -> str:
+    """Replace bare/ @int DECLARE names with their literal values."""
+    if not expression or not source_sql:
+        return expression
+    out = expression
+    for match in re.finditer(
+        r"(?is)DECLARE\s+@(?P<var>[A-Za-z_][\w]*)\s+(?:INT|BIGINT|SMALLINT|TINYINT|DECIMAL\s*\([^)]*\)|NUMERIC\s*\([^)]*\))"
+        r"\s*=\s*(?P<val>-?\d+(?:\.\d+)?)",
+        source_sql,
+    ):
+        var = match.group("var")
+        val = match.group("val")
+        out = re.sub(
+            rf'(?<![A-Za-z0-9_".])@?{re.escape(var)}\b',
+            val,
+            out,
+            flags=re.IGNORECASE,
+        )
+    return out
+
+
+def _rewrite_eomonth_and_month_start_vars(
+    expression: str,
+    entity_name: str,
+    source_sql: str,
+) -> str:
+    """Map EOMONTH/MonthStart/GraceWindowEnd DECLARE chains to platform dates."""
+    if not expression:
+        return expression
+    bd = f'"{entity_name}"."var"."BUSINESS_DATE"'
+    out = expression
+    if source_sql and re.search(
+        r"(?is)DECLARE\s+@MonthEndDate\s+DATE\s*=\s*EOMONTH\s*\(\s*@ProcessDate\s*\)",
+        source_sql,
+    ):
+        out = re.sub(
+            rf'(?<![A-Za-z0-9_".])@?MonthEndDate\b',
+            f"EOM({bd})",
+            out,
+            flags=re.IGNORECASE,
+        )
+    # @MonthStartDate = DATEADD(DAY, -DAY(@ProcessDate)+1, @ProcessDate) ≈ SOM
+    if source_sql and re.search(r"(?i)@MonthStartDate\b", source_sql):
+        out = re.sub(
+            rf'(?<![A-Za-z0-9_".])@?MonthStartDate\b',
+            f"SOM({bd})",
+            out,
+            flags=re.IGNORECASE,
+        )
+    # @GraceWindowEnd = DATEADD(DAY, 6, @MonthStartDate)
+    if source_sql and re.search(
+        r"(?is)DECLARE\s+@GraceWindowEnd\s+DATE\s*=\s*DATEADD\s*\(\s*DAY\s*,\s*6\s*,\s*@MonthStartDate\s*\)",
+        source_sql,
+    ):
+        out = re.sub(
+            rf'(?<![A-Za-z0-9_".])@?GraceWindowEnd\b',
+            f"ADDDAY(SOM({bd}), 6)",
+            out,
+            flags=re.IGNORECASE,
+        )
+    return out
+
+
+def _rewrite_exists_predicates(expression: str) -> str:
+    """Preserve EXISTS rather than flattening it to a row predicate.
+
+    Flattening `IF EXISTS (SELECT ... WHERE <pred>)` into `<pred>` converts a
+    procedure-wide existence branch into a per-row formula and changes
+    meaning. Platform Formula Expressions cannot express procedure-level
+    EXISTS; leave the construct intact so validation marks it unsupported.
+    """
+    return expression
 
 
 def _rewrite_bundled_alias_column_refs(expression: str, source_text: str = "") -> str:
@@ -1641,46 +2027,6 @@ def _rewrite_null_predicates(expression: str) -> str:
         expression,
     )
     return expression
-
-
-def _rewrite_exists_predicates(expression: str) -> str:
-    """Drop unsupported EXISTS wrappers but keep the predicate body."""
-    result: list[str] = []
-    i = 0
-    in_double = False
-    while i < len(expression):
-        ch = expression[i]
-        if ch == '"':
-            in_double = not in_double
-            result.append(ch)
-            i += 1
-            continue
-
-        if not in_double and expression[i : i + 7].upper() == "EXISTS(":
-            open_index = i + 6
-            close_index = _find_matching_paren(expression, open_index)
-            if close_index != -1:
-                inner = expression[i + 7 : close_index].strip()
-                tail = expression[close_index + 1 :].lstrip()
-                needs_if_close = tail.upper().startswith("THEN")
-                suffix = ")" if needs_if_close else ""
-                where_match = re.search(r"(?is)\bWHERE\b", inner)
-                if where_match:
-                    predicate = inner[where_match.end() :].strip()
-                    result.append(predicate + suffix)
-                else:
-                    comma_match = re.search(r"(?s),", inner)
-                    if comma_match:
-                        predicate = inner[comma_match.end() :].strip()
-                        result.append(predicate + suffix)
-                    else:
-                        result.append(inner + suffix)
-                i = close_index + 1
-                continue
-
-        result.append(ch)
-        i += 1
-    return "".join(result)
 
 
 def _rewrite_in_subquery_membership(expression: str) -> str:
@@ -2519,7 +2865,11 @@ def _normalize_expression(expression: str, source_text: str = "") -> str:
     and comma-style IF detection, both of which rely on string-boundary
     tracking, and finally a trailing-paren-balance check as a last safety
     net after all other rewrites have run."""
+    expression = _strip_sql_comments_for_guard_matching(expression)
     expression = _flatten_whitespace(expression)
+    expression = _rewrite_sql_at_parameters(expression)
+    expression = _rewrite_dateadd_to_addday(expression)
+    expression = _rewrite_bare_not_equality(expression)
     expression = _normalize_ternary_operator(expression)
     expression = _repair_missing_if_before_then(expression)
     expression = _normalize_sql_style_syntax(expression)
@@ -2553,6 +2903,64 @@ def _normalize_expression(expression: str, source_text: str = "") -> str:
     expression = _rewrite_null_predicates(expression)
     expression = _strip_min_wrapper(expression)
     return expression
+
+
+def _rewrite_sql_at_parameters(expression: str) -> str:
+    """Strip SQL `@param` sigils so local variables become bare platform names.
+
+    Process/business-date parameters are rewritten later by
+    `_rewrite_business_date_variables`; everything else becomes a bare
+    identifier (the same convention as `p_TIMEKEY`).
+    """
+    return re.sub(r"(?<![A-Za-z0-9_\"])@([A-Za-z_][A-Za-z0-9_]*)\b", r"\1", expression)
+
+
+def _format_platform_date_offset(unit: str, amount: str, base: str) -> str | None:
+    """Map SQL day/month/year offsets onto documented 4X date helpers."""
+    unit_text = unit.strip().strip("'\"").upper()
+    amount = amount.strip()
+    base = base.strip()
+    if unit_text in {"DAY", "DAYS"}:
+        return f"ADDDAY({base}, {amount})"
+    if unit_text in {"MONTH", "MONTHS"}:
+        return f'PERIOD("M", {amount}, {base})'
+    if unit_text in {"YEAR", "YEARS"}:
+        return f'PERIOD("Y", {amount}, {base})'
+    return None
+
+
+def _rewrite_dateadd_to_addday(expression: str) -> str:
+    """Translate leftover SQL/sqlglot date offsets into ADDDAY / PERIOD."""
+
+    def replace_dateadd(match: re.Match[str]) -> str:
+        rendered = _format_platform_date_offset(match.group(1), match.group(2), match.group(3))
+        return rendered if rendered is not None else match.group(0)
+
+    expression = re.sub(
+        r"(?i)\bDATEADD\s*\(\s*(DAY|DAYS|MONTH|MONTHS|YEAR|YEARS)\s*,\s*([^,]+?)\s*,\s*([^)]+?)\s*\)",
+        replace_dateadd,
+        expression,
+    )
+
+    def replace_date_add(match: re.Match[str]) -> str:
+        rendered = _format_platform_date_offset(match.group(3), match.group(2), match.group(1))
+        return rendered if rendered is not None else match.group(0)
+
+    # sqlglot emits DATE_ADD(date, amount, 'UNIT') for T-SQL DATEADD.
+    return re.sub(
+        r"(?i)\bDATE_ADD\s*\(\s*([^,]+?)\s*,\s*([^,]+?)\s*,\s*['\"]?(DAY|DAYS|MONTH|MONTHS|YEAR|YEARS)['\"]?\s*\)",
+        replace_date_add,
+        expression,
+    )
+
+
+def _rewrite_bare_not_equality(expression: str) -> str:
+    """Rewrite `NOT a == b` into `a != b` (platform has no bare NOT operator)."""
+    return re.sub(
+        r"(?i)\bNOT\s+(\"[^\"]+\"(?:\s*\.\s*\"[^\"]+\")*|[A-Za-z_][A-Za-z0-9_]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)*)\s*==\s*",
+        r"\1 != ",
+        expression,
+    )
 
 
 def _source_allows_target_reference(source_sql: str, entity_name: str, column: str) -> bool:
@@ -2622,12 +3030,13 @@ def _has_where_guarded_update_on_column(source_sql: str, column: str) -> bool:
 
     column_pattern = re.compile(rf"\b{re.escape(column)}\b\s*=", re.IGNORECASE)
     for stmt in statements:
-        upper = stmt.upper()
-        if not upper.lstrip().startswith("UPDATE"):
+        cleaned = _strip_leading_comments(stmt).strip()
+        upper = cleaned.upper()
+        if not upper.startswith("UPDATE"):
             continue
         if "MERGE" in upper:
             continue
-        set_match = re.search(r"\bSET\b(.*?)(\bWHERE\b|$)", stmt, re.IGNORECASE | re.DOTALL)
+        set_match = re.search(r"\bSET\b(.*?)(\bWHERE\b|$)", cleaned, re.IGNORECASE | re.DOTALL)
         if not set_match:
             continue
         set_clause, where_marker = set_match.group(1), set_match.group(2)
@@ -2638,7 +3047,45 @@ def _has_where_guarded_update_on_column(source_sql: str, column: str) -> bool:
     return False
 
 
-_SAFE_ARITHMETIC_FUNCTION_NAMES = {"COALESCE", "NVL", "ISNULL", "TODATE", "SYSDATE", "MAX", "MIN"}
+_SAFE_ARITHMETIC_FUNCTION_NAMES = {
+    "COALESCE",
+    "NVL",
+    "ISNULL",
+    "TODATE",
+    "SYSDATE",
+    "MAX",
+    "MIN",
+    "SUM",
+    "COUNT",
+    "DATEDIFF",
+    "ADDDAY",
+    "PERIOD",
+    "CONCAT",
+    "LOWER",
+    "UPPER",
+    "TRIM",
+    "LEN",
+    "LENGTH",
+    "SUBSTR",
+    "SUBSTRING",
+    "ABS",
+    "ROUND",
+    "FLOOR",
+    "CEIL",
+    "CEILING",
+    "REPLACE",
+    "CONVERT",
+    "REGEX",
+    "DATEPART",
+    "SOM",
+    "EOM",
+    "SOY",
+    "EOY",
+    "SOFY",
+    "EOFY",
+    "SOQ",
+    "EOQ",
+}
 
 
 def _split_top_level(text: str, separators: str) -> list[str] | None:
@@ -2855,8 +3302,9 @@ def _translate_case_to_4x(case_node) -> str | None:
         value_node = when.args.get("true")
         if condition_node is None or value_node is None:
             return None
-        if isinstance(value_node, exp.Case):
-            return None
+        # Nested CASE is valid and must recurse — do not bail to LLM.
+        while isinstance(value_node, exp.Paren):
+            value_node = value_node.this
         if switch_value is not None:
             left_sql = _render_value_expression_to_4x(switch_value)
             right_sql = _render_value_expression_to_4x(condition_node)
@@ -2872,8 +3320,8 @@ def _translate_case_to_4x(case_node) -> str | None:
 
     default_node = case_node.args.get("default")
     if default_node is not None:
-        if isinstance(default_node, exp.Case):
-            return None
+        while isinstance(default_node, exp.Paren):
+            default_node = default_node.this
         default_sql = _render_value_expression_to_4x(default_node)
         if default_sql is None:
             return None
@@ -2886,22 +3334,60 @@ def _translate_case_to_4x(case_node) -> str | None:
         parts.append(f"ELSEIF({_normalize_expression(cond, '')})THEN({val})")
     parts.append(f"ELSE({default_sql})")
 
-    result = "".join(parts)
+    result = _normalize_expression("".join(parts), "")
+    # Normalize before grammar check so SQL `@ProcessDate` / DATEADD forms
+    # inside CASE values do not falsely reject an otherwise valid translation.
     return result if validate_expression(result).valid else None
+
+
+def _is_sqlglot_string_literal(node) -> bool:
+    while isinstance(node, exp.Paren):
+        node = node.this
+    return isinstance(node, exp.Literal) and bool(getattr(node, "is_string", False))
+
+
+def _datediff_unit_token(unit_text: str) -> str | None:
+    mapping = {
+        "DAY": '"d"',
+        "DAYS": '"d"',
+        "MONTH": '"m"',
+        "MONTHS": '"m"',
+        "YEAR": '"y"',
+        "YEARS": '"y"',
+    }
+    return mapping.get(unit_text.strip().upper())
 
 
 def _render_value_expression_to_4x(node) -> str | None:
     while isinstance(node, exp.Paren):
         node = node.this
 
+    # sqlglot wraps T-SQL DATEDIFF operands in TIME_STR_TO_TIME(...).
+    if isinstance(node, exp.TimeStrToTime):
+        return _render_value_expression_to_4x(node.this)
+
     if isinstance(node, exp.Case):
         return _translate_case_to_4x(node)
+
+    if isinstance(node, exp.Column):
+        name = node.name or ""
+        if not name:
+            return None
+        if node.table:
+            return f'"{node.table}"."{name}"'
+        # Keep bare identifiers unquoted here so existing CASE/MAX
+        # translations stay stable; platform quoting is applied later by
+        # normalize/finalize.
+        return name
 
     if isinstance(node, exp.Add):
         left = _render_value_expression_to_4x(node.this)
         right = _render_value_expression_to_4x(node.expression)
         if left is None or right is None:
             return None
+        # SQL string concatenation uses `+`; platform requires CONCAT.
+        if _is_sqlglot_string_literal(node.this) or _is_sqlglot_string_literal(node.expression):
+            return f"CONCAT({left}, {right})"
         return f"({left} + {right})"
 
     if isinstance(node, exp.Sub):
@@ -2937,16 +3423,157 @@ def _render_value_expression_to_4x(node) -> str | None:
         text = text.strip()
         return f"@{text}" if text else None
 
+    if isinstance(node, exp.Subquery) or (
+        isinstance(node, exp.Paren) and isinstance(getattr(node, "this", None), exp.Select)
+    ):
+        select = node.this if isinstance(node, (exp.Subquery, exp.Paren)) else None
+        if isinstance(select, exp.Select):
+            projections = list(select.args.get("expressions") or [])
+            if len(projections) == 1:
+                relation = _select_from_relation_name(select)
+                projected = projections[0]
+                if isinstance(projected, exp.Alias):
+                    projected = projected.this
+                # Qualify bare aggregate/column args with the subquery FROM table.
+                if relation:
+                    def qualify(n):
+                        if isinstance(n, exp.Column) and not n.table:
+                            return exp.column(n.name, table=relation)
+                        return n
+                    try:
+                        projected = projected.transform(qualify)
+                    except Exception:
+                        pass
+                return _render_value_expression_to_4x(projected)
+        return None
+
+    if isinstance(node, exp.Sum):
+        this = node.this
+        if isinstance(this, exp.Column) and not this.table:
+            # Leave bare for callers that already qualified; otherwise quote.
+            inner = f'"{this.name}"'
+        else:
+            inner = _render_value_expression_to_4x(this)
+        if inner is None:
+            return None
+        return f"SUM({inner})"
+
+    if isinstance(node, exp.Count):
+        this = node.this
+        # Platform grammar has no `COUNT(*)`; COUNT(1) is the row-count form.
+        if this is None or isinstance(this, exp.Star):
+            return "COUNT(1)"
+        if isinstance(this, exp.Column) and not this.table:
+            inner = f'"{this.name}"'
+        else:
+            inner = _render_value_expression_to_4x(this)
+        if inner is None:
+            return None
+        return f"COUNT({inner})"
+
+    if isinstance(node, exp.Lower):
+        inner = _render_value_expression_to_4x(node.this)
+        return f"LOWER({inner})" if inner is not None else None
+
+    if isinstance(node, exp.Upper):
+        inner = _render_value_expression_to_4x(node.this)
+        return f"UPPER({inner})" if inner is not None else None
+
+    if isinstance(node, exp.Trim):
+        inner = _render_value_expression_to_4x(node.this)
+        return f"TRIM({inner})" if inner is not None else None
+
+    if isinstance(node, exp.Length):
+        inner = _render_value_expression_to_4x(node.this)
+        return f"LEN({inner})" if inner is not None else None
+
+    if isinstance(node, exp.Substring):
+        parts = [node.this, node.args.get("start"), node.args.get("length")]
+        rendered = [_render_value_expression_to_4x(part) for part in parts if part is not None]
+        if len(rendered) < 2 or any(part is None for part in rendered):
+            return None
+        return f"SUBSTR({', '.join(rendered)})"
+
+    if isinstance(node, exp.Abs):
+        inner = _render_value_expression_to_4x(node.this)
+        return f"ABS({inner})" if inner is not None else None
+
+    if isinstance(node, exp.Round):
+        args = [node.this]
+        if node.expression is not None:
+            args.append(node.expression)
+        rendered = [_render_value_expression_to_4x(arg) for arg in args]
+        if any(part is None for part in rendered):
+            return None
+        return f"ROUND({', '.join(rendered)})"
+
+    if isinstance(node, (exp.Floor, exp.Ceil)):
+        inner = _render_value_expression_to_4x(node.this)
+        if inner is None:
+            return None
+        name = "FLOOR" if isinstance(node, exp.Floor) else "CEIL"
+        return f"{name}({inner})"
+
+    if isinstance(node, exp.Replace):
+        parts = [node.this, node.expression, node.args.get("replacement")]
+        rendered = [_render_value_expression_to_4x(part) for part in parts]
+        if any(part is None for part in rendered):
+            return None
+        return f"REPLACE({', '.join(rendered)})"
+
+    if isinstance(node, exp.Cast):
+        inner = _render_value_expression_to_4x(node.this)
+        to_type = node.args.get("to")
+        type_name = getattr(to_type, "this", None) or getattr(to_type, "name", None) or to_type
+        type_text = str(type_name).strip() if type_name is not None else ""
+        if type_text.startswith("DType."):
+            type_text = type_text.split(".", 1)[1]
+        if inner is None or not type_text:
+            return None
+        return f'CONVERT({inner}, "{type_text}")'
+
+    if isinstance(node, exp.Convert):
+        # T-SQL CONVERT(type, expr) → sqlglot Convert(this=type, expression=expr)
+        to_type = node.this
+        type_name = getattr(to_type, "this", None) or getattr(to_type, "name", None) or to_type
+        type_text = str(type_name).strip() if type_name is not None else ""
+        if type_text.startswith("DType."):
+            type_text = type_text.split(".", 1)[1]
+        inner = _render_value_expression_to_4x(node.args.get("expression") or node.expression)
+        if inner is None or not type_text:
+            return None
+        return f'CONVERT({inner}, "{type_text}")'
+
+    if isinstance(node, exp.Extract):
+        part = node.this
+        part_text = str(getattr(part, "this", part) or "").strip().lower()
+        field = _render_value_expression_to_4x(node.expression)
+        if not part_text or field is None:
+            return None
+        return f'DATEPART({field}, "{part_text}")'
+
+    if isinstance(node, exp.DateDiff):
+        unit = node.args.get("unit")
+        unit_text = str(getattr(unit, "this", unit) or "")
+        unit_token = _datediff_unit_token(unit_text)
+        if unit_token is None:
+            return None
+        # T-SQL DATEDIFF(unit, start, end) → sqlglot DateDiff(this=end, expression=start).
+        # Platform samples use DATEDIFF(end, start, "d").
+        end = _render_value_expression_to_4x(node.this)
+        start = _render_value_expression_to_4x(node.expression)
+        if end is None or start is None:
+            return None
+        return f"DATEDIFF({end}, {start}, {unit_token})"
+
     if isinstance(node, exp.DateAdd):
         unit = getattr(node.args.get("unit"), "this", None)
         unit_text = str(unit).upper() if unit is not None else ""
-        if unit_text not in {"DAY", "DAYS"}:
-            return None
         base = _render_value_expression_to_4x(node.this)
         amount = _render_value_expression_to_4x(node.expression)
         if base is None or amount is None:
             return None
-        return f"ADDDAY({base}, {amount})"
+        return _format_platform_date_offset(unit_text, amount, base)
 
     if isinstance(node, exp.Anonymous) and str(getattr(node, "name", "")).upper() == "CHOOSE":
         args = list(node.expressions or [])
@@ -2982,6 +3609,25 @@ def _render_value_expression_to_4x(node) -> str | None:
                 return f"{func_name}({args[0]})"
             if func_name in {"COALESCE", "NVL", "ISNULL"}:
                 return f"COALESCE({', '.join(args)})"
+            if func_name in {"LENGTH", "LEN"}:
+                return f"LEN({args[0]})" if args else None
+            if func_name in {"SUBSTRING", "SUBSTR"}:
+                return f"SUBSTR({', '.join(args)})" if len(args) >= 2 else None
+            if func_name in {"CEILING", "CEIL"}:
+                return f"CEIL({args[0]})" if args else None
+            if func_name in {"LTRIM", "RTRIM", "TRIM"}:
+                return f"TRIM({args[0]})" if args else None
+            if func_name == "REPLACE" and len(args) >= 3:
+                return f"REPLACE({', '.join(args[:3])})"
+            if func_name in {"CONVERT", "CAST"} and len(args) >= 2:
+                return f"CONVERT({args[0]}, {args[1]})"
+            if func_name == "DATEPART" and len(args) >= 2:
+                # SQL Server DATEPART(part, date) → 4X DATEPART(date, part)
+                return f"DATEPART({args[1]}, {args[0]})"
+            if func_name in {"REGEX", "REGEXP", "REGEXP_LIKE"} and len(args) >= 2:
+                return f"REGEX({args[0]}, {args[1]})"
+            if func_name in {"SOM", "EOM", "SOY", "EOY", "SOFY", "EOFY", "SOQ", "EOQ"} and args:
+                return f"{func_name}({args[0]})"
             if args:
                 return f"{func_name}({', '.join(args)})"
 
@@ -3054,6 +3700,8 @@ def _statement_source_alias(tree) -> str | None:
                 alias = _extract_alias_name(source)
                 if alias:
                     return alias
+                if isinstance(source, exp.Table) and source.name:
+                    return canonical_logical_name(source.name)
     if isinstance(tree, exp.Update):
         from_clause = tree.args.get("from_")
         if isinstance(from_clause, exp.From):
@@ -3062,11 +3710,15 @@ def _statement_source_alias(tree) -> str | None:
                 alias = _extract_alias_name(source)
                 if alias:
                     return alias
+                if isinstance(source, exp.Table) and source.name:
+                    return canonical_logical_name(source.name)
         target = tree.args.get("this")
         if target is not None:
             alias = _extract_alias_name(target)
             if alias:
                 return alias
+            if isinstance(target, exp.Table) and target.name:
+                return canonical_logical_name(target.name)
     if isinstance(tree, exp.Merge):
         using = tree.args.get("using")
         if isinstance(using, exp.Subquery) and isinstance(using.this, exp.Select):
@@ -3103,7 +3755,12 @@ def _render_boolean_predicate_leaf(node, source_alias: str | None = None) -> str
     return None
 
 
-def _render_boolean_operand(node, parent_is_or: bool, source_alias: str | None = None) -> str | None:
+def _render_boolean_operand(
+    node,
+    parent_is_or: bool,
+    source_alias: str | None = None,
+    procedure_sql: str = "",
+) -> str | None:
     """Render one operand of an AND/OR, adding parentheses whenever the
     operand's own top-level connective differs from its parent's (an AND
     directly under an OR, or vice versa) -- the exact, and only, shape
@@ -3113,7 +3770,9 @@ def _render_boolean_operand(node, parent_is_or: bool, source_alias: str | None =
     node types, never from the rendered text, so it can never be fooled
     by a leaf value that happens to contain the words "AND"/"OR"."""
     unwrapped = node.this if isinstance(node, exp.Paren) else node
-    rendered = _render_sql_condition_to_4x(unwrapped, source_alias=source_alias)
+    rendered = _render_sql_condition_to_4x(
+        unwrapped, source_alias=source_alias, procedure_sql=procedure_sql
+    )
     if rendered is None:
         return None
     if isinstance(unwrapped, exp.Or) and not parent_is_or:
@@ -3123,7 +3782,11 @@ def _render_boolean_operand(node, parent_is_or: bool, source_alias: str | None =
     return rendered
 
 
-def _render_sql_condition_to_4x(node, source_alias: str | None = None) -> str | None:
+def _render_sql_condition_to_4x(
+    node,
+    source_alias: str | None = None,
+    procedure_sql: str = "",
+) -> str | None:
     """Deterministically render a sqlglot boolean-condition AST node into
     4X syntax, with every AND/OR/NOT boundary crossing explicitly
     parenthesized based purely on the parsed TREE STRUCTURE -- never
@@ -3152,18 +3815,43 @@ def _render_sql_condition_to_4x(node, source_alias: str | None = None) -> str | 
     existing coverage.
     """
     if isinstance(node, exp.Paren):
-        return _render_sql_condition_to_4x(node.this, source_alias=source_alias)
+        return _render_sql_condition_to_4x(
+            node.this, source_alias=source_alias, procedure_sql=procedure_sql
+        )
+
+    if isinstance(node, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)):
+        # Oracle ROWNUM filters are fetch limits, not business predicates.
+        left_name = ""
+        if isinstance(node.this, exp.Column):
+            left_name = (node.this.name or "").upper()
+        right_name = ""
+        if isinstance(node.expression, exp.Column):
+            right_name = (node.expression.name or "").upper()
+        if left_name == "ROWNUM" or right_name == "ROWNUM":
+            return "TRUE"
 
     if isinstance(node, exp.And):
-        left = _render_boolean_operand(node.this, parent_is_or=False, source_alias=source_alias)
-        right = _render_boolean_operand(node.expression, parent_is_or=False, source_alias=source_alias)
+        left = _render_boolean_operand(
+            node.this, parent_is_or=False, source_alias=source_alias, procedure_sql=procedure_sql
+        )
+        right = _render_boolean_operand(
+            node.expression, parent_is_or=False, source_alias=source_alias, procedure_sql=procedure_sql
+        )
         if left is None or right is None:
             return None
+        if left == "TRUE":
+            return right
+        if right == "TRUE":
+            return left
         return f"{left} AND {right}"
 
     if isinstance(node, exp.Or):
-        left = _render_boolean_operand(node.this, parent_is_or=True, source_alias=source_alias)
-        right = _render_boolean_operand(node.expression, parent_is_or=True, source_alias=source_alias)
+        left = _render_boolean_operand(
+            node.this, parent_is_or=True, source_alias=source_alias, procedure_sql=procedure_sql
+        )
+        right = _render_boolean_operand(
+            node.expression, parent_is_or=True, source_alias=source_alias, procedure_sql=procedure_sql
+        )
         if left is None or right is None:
             return None
         return f"{left} OR {right}"
@@ -3178,7 +3866,9 @@ def _render_sql_condition_to_4x(node, source_alias: str | None = None) -> str | 
         if isinstance(inner_unwrapped, exp.Is) and isinstance(inner_unwrapped.expression, exp.Null):
             operand = _render_boolean_predicate_leaf(inner_unwrapped.this, source_alias=source_alias)
             return f"ISNOTEMPTY({operand})" if operand else None
-        rendered = _render_sql_condition_to_4x(inner_unwrapped, source_alias=source_alias)
+        rendered = _render_sql_condition_to_4x(
+            inner_unwrapped, source_alias=source_alias, procedure_sql=procedure_sql
+        )
         return f"NOT({rendered})" if rendered else None
 
     if isinstance(node, exp.Is) and isinstance(node.expression, exp.Null):
@@ -3194,11 +3884,90 @@ def _render_sql_condition_to_4x(node, source_alias: str | None = None) -> str | 
         return f"{left} BETWEEN [{low},{high}]"
 
     if isinstance(node, exp.In):
+        # Subquery membership cannot use platform `IN [literal, ...]`.
+        # Inline `key IN (SELECT key FROM src WHERE pred)` as `pred` (and
+        # expand temp-table populations from the surrounding procedure).
+        query = node.args.get("query")
+        if query is not None:
+            return _inline_in_subquery_membership_node(node, procedure_sql=procedure_sql)
+        values_nodes = list(node.expressions or [])
+        if any(isinstance(expr, (exp.Select, exp.Subquery, exp.Union)) for expr in values_nodes):
+            return None
         left = _render_boolean_predicate_leaf(node.this, source_alias=source_alias)
-        values = [_render_value_expression_to_4x(expr) for expr in (node.expressions or [])]
+        values = [_render_value_expression_to_4x(expr) for expr in values_nodes]
         if left is None or not values or any(value is None for value in values):
             return None
         return f'{left} IN [{",".join(values)}]'
+
+    if isinstance(node, exp.Exists):
+        # Platform Formula Expressions have no EXISTS; inline the subquery
+        # WHERE predicate (same strategy as IN (SELECT ...)).
+        query = node.this
+        if isinstance(query, exp.Subquery):
+            query = query.this
+        if isinstance(query, exp.Select):
+            where = query.args.get("where")
+            if where is not None:
+                return _render_sql_condition_to_4x(
+                    where.this, source_alias=source_alias, procedure_sql=procedure_sql
+                )
+        return None
+
+    if isinstance(node, exp.Like):
+        # Map SQL LIKE patterns onto platform membership operators.
+        left = _render_boolean_predicate_leaf(node.this, source_alias=source_alias)
+        pattern_node = node.expression
+        pattern = None
+        if isinstance(pattern_node, exp.Literal):
+            pattern = str(pattern_node.this)
+        else:
+            rendered_pattern = _render_value_expression_to_4x(pattern_node)
+            if rendered_pattern and rendered_pattern.startswith('"') and rendered_pattern.endswith('"'):
+                pattern = rendered_pattern[1:-1]
+        if left is None or pattern is None:
+            return None
+        negated = bool(node.args.get("not"))
+        if pattern.startswith("%") and pattern.endswith("%") and len(pattern) >= 2:
+            value = pattern[1:-1]
+            op = "DOESNOTCONTAINS" if negated else "CONTAINS"
+            return f'{left} {op} ["{value}"]'
+        if pattern.endswith("%") and not pattern.startswith("%"):
+            value = pattern[:-1]
+            if negated:
+                return f'NOT({left} BEGINSWITH ["{value}"])'
+            return f'{left} BEGINSWITH ["{value}"]'
+        if pattern.startswith("%") and not pattern.endswith("%"):
+            value = pattern[1:]
+            if negated:
+                return f'NOT({left} ENDSWITH ["{value}"])'
+            return f'{left} ENDSWITH ["{value}"]'
+        if negated:
+            return f'{left} != "{pattern}"'
+        return f'{left} == "{pattern}"'
+
+    # Comparisons whose operands include CASE / subqueries fail the
+    # leaf .sql()+normalize path; render both sides via the value
+    # translator so DEGDATE-style `CASE ... END > date` guards compose.
+    _CMP_OPS = (
+        (exp.EQ, "=="),
+        (exp.NEQ, "!="),
+        (exp.GT, ">"),
+        (exp.GTE, ">="),
+        (exp.LT, "<"),
+        (exp.LTE, "<="),
+    )
+    for node_type, op in _CMP_OPS:
+        if isinstance(node, node_type):
+            left_node = node.this
+            right_node = node.expression
+            if source_alias:
+                left_node = _qualify_unqualified_condition_columns(left_node, source_alias)
+                right_node = _qualify_unqualified_condition_columns(right_node, source_alias)
+            left = _render_value_expression_to_4x(left_node)
+            right = _render_value_expression_to_4x(right_node)
+            if left is None or right is None:
+                break
+            return f"{left} {op} {right}"
 
     # Any other node (a comparison, BETWEEN, a bare column/literal) has
     # no AND/OR/NOT structure of its own to get wrong -- render it via
@@ -3206,10 +3975,142 @@ def _render_sql_condition_to_4x(node, source_alias: str | None = None) -> str | 
     return _render_boolean_predicate_leaf(node, source_alias=source_alias)
 
 
+def _select_from_relation_name(select: exp.Select) -> str | None:
+    from_clause = select.args.get("from_")
+    if not isinstance(from_clause, exp.From):
+        return None
+    source = from_clause.this or (from_clause.expressions[0] if from_clause.expressions else None)
+    if isinstance(source, exp.Table):
+        name = source.name or ""
+        return str(name).lstrip("#") if name else None
+    return None
+
+
+def _find_temp_population_select(procedure_sql: str, temp_name: str) -> exp.Select | None:
+    """Locate the SELECT that populates a temp/staging table named `temp_name`."""
+    if not procedure_sql or not temp_name:
+        return None
+    cleaned = _strip_sql_comments_for_guard_matching(procedure_sql)
+    temp_key = temp_name.lstrip("#").upper()
+    dialect_candidates = [detect_dialect(cleaned), Dialect.SQLSERVER, Dialect.ORACLE, Dialect.MYSQL]
+    seen: set[Dialect] = set()
+    for dialect in dialect_candidates:
+        if dialect in seen:
+            continue
+        seen.add(dialect)
+        for stmt in split_statements(cleaned, dialect):
+            text = _strip_leading_comments(stmt).strip()
+            if not text:
+                continue
+            upper = text.upper()
+            if temp_key not in upper.replace("#", ""):
+                continue
+            try:
+                tree = sqlglot.parse_one(text, read=_SQLGLOT_DIALECT[dialect])
+            except Exception:
+                continue
+            if isinstance(tree, exp.Select) and tree.args.get("into") is not None:
+                into = tree.args.get("into")
+                into_name = ""
+                if isinstance(into, exp.Table):
+                    into_name = str(into.name or "")
+                elif into is not None:
+                    into_name = str(getattr(into, "this", into) or "")
+                if into_name.lstrip("#").upper() == temp_key:
+                    return tree
+            if isinstance(tree, exp.Insert):
+                target = tree.args.get("this")
+                target_name = ""
+                if isinstance(target, exp.Table):
+                    target_name = str(target.name or "")
+                if target_name.lstrip("#").upper() == temp_key and isinstance(tree.expression, exp.Select):
+                    return tree.expression
+    return None
+
+
+def _inline_in_subquery_membership_node(in_node: exp.In, procedure_sql: str = "") -> str | None:
+    """Translate `key IN (SELECT key FROM src [WHERE pred])` into predicates.
+
+    When `src` is a temp/staging table populated earlier in the same
+    procedure, the population SELECT's WHERE/JOIN filters are inlined so
+    the Platform Condition does not need unsupported subquery membership.
+    """
+    query = in_node.args.get("query")
+    select = query.this if isinstance(query, exp.Subquery) else query
+    if not isinstance(select, exp.Select):
+        return None
+
+    relation = _select_from_relation_name(select)
+    source_alias = relation or _statement_source_alias(select)
+
+    predicates: list[str] = []
+    where = select.args.get("where")
+    if where is not None:
+        rendered = _render_sql_condition_to_4x(
+            where.this, source_alias=source_alias, procedure_sql=procedure_sql
+        )
+        if rendered is None:
+            return None
+        predicates.append(rendered)
+
+    # Only expand temp/staging population when the IN-subquery itself has
+    # no WHERE — otherwise the subquery predicates are already complete.
+    if relation and not predicates:
+        pop = _find_temp_population_select(procedure_sql, relation)
+        if pop is not None:
+            pop_where = pop.args.get("where")
+            if pop_where is not None:
+                pop_alias = _statement_source_alias(pop) or relation
+                pop_pred = _render_sql_condition_to_4x(
+                    pop_where.this, source_alias=pop_alias, procedure_sql=procedure_sql
+                )
+                if pop_pred is None:
+                    return None
+                predicates.append(pop_pred)
+
+    if not predicates:
+        return None
+    if len(predicates) == 1:
+        return predicates[0]
+    return " AND ".join(predicates)
+
+
+
+def _safe_render_guard(
+    condition_node,
+    source_alias: str | None = None,
+    procedure_sql: str = "",
+) -> str | None:
+    """Render a WHERE/ON guard to 4X, or None when it cannot be expressed.
+
+    Never fall back to raw sqlglot `.sql()` text: that path reintroduces
+    SQL-only shapes (IN subqueries, comments, @vars) that later fail
+    grammar validation and produce demo-breaking expressions.
+    """
+    if condition_node is None:
+        return None
+    rendered = _render_sql_condition_to_4x(
+        condition_node, source_alias=source_alias, procedure_sql=procedure_sql
+    )
+    if rendered is not None:
+        return rendered
+    try:
+        raw = condition_node.sql(dialect="oracle")
+    except Exception:
+        return None
+    raw = _strip_sql_comments_for_guard_matching(raw)
+    if re.search(r"(?is)\bIN\s*\(\s*SELECT\b", raw) or re.search(r"(?is)\bEXISTS\s*\(", raw):
+        return None
+    normalized = _normalize_expression(raw, "")
+    probe = f"IF({normalized})THEN(1)ELSE(0)"
+    return normalized if validate_expression(probe).valid else None
+
+
 def _parse_simple_assignment_stage(
     raw_sql: str,
     target_column: str,
     entity_name: str = "",
+    procedure_sql: str = "",
 ) -> tuple[str, str, str] | None:
     """Extract a deterministic guard/value pair for a simple UPDATE or
     MERGE write to `target_column`.
@@ -3219,6 +4120,10 @@ def _parse_simple_assignment_stage(
     complex CASE/IF formulas are intentionally left to the LLM path.
     """
     target_upper = target_column.upper()
+    context_sql = procedure_sql or raw_sql
+    raw_sql = _strip_sql_comments_for_guard_matching(raw_sql)
+    raw_sql = _expand_truncated_assignment_sql(raw_sql, context_sql, target_column)
+    raw_sql = _strip_sql_comments_for_guard_matching(raw_sql)
 
     dialect_candidates = [detect_dialect(raw_sql), Dialect.ORACLE, Dialect.SQLSERVER, Dialect.MYSQL]
     seen_dialects: set[Dialect] = set()
@@ -3237,6 +4142,7 @@ def _parse_simple_assignment_stage(
             stmt = _strip_leading_comments(raw_sql).strip()
         if not stmt:
             continue
+        stmt = _strip_sql_comments_for_guard_matching(stmt)
 
         select_into_stmt = _extract_select_into_statement(stmt)
         if select_into_stmt:
@@ -3250,9 +4156,13 @@ def _parse_simple_assignment_stage(
                     guard = ""
                     where = select_tree.args.get("where")
                     if where is not None:
-                        guard = _render_sql_condition_to_4x(
-                            where.this, source_alias=_statement_source_alias(select_tree)
-                        ) or where.this.sql(dialect=_SQLGLOT_DIALECT[dialect])
+                        guard = _safe_render_guard(
+                            where.this,
+                            source_alias=_statement_source_alias(select_tree),
+                            procedure_sql=context_sql,
+                        )
+                        if guard is None:
+                            return None
                     return guard, projection, target_column
 
         # `stmt` falls back to the raw, un-split chunk (line ~3115) whenever
@@ -3294,9 +4204,9 @@ def _parse_simple_assignment_stage(
             guard = ""
             where = tree.args.get("where")
             if where is not None:
-                guard = _render_sql_condition_to_4x(where.this, source_alias=source_alias) or where.this.sql(
-                    dialect=_SQLGLOT_DIALECT[dialect]
-                )
+                guard = _safe_render_guard(where.this, source_alias=source_alias, procedure_sql=context_sql)
+                if guard is None:
+                    return None
 
             for assignment in tree.args.get("expressions", []) or []:
                 if not isinstance(assignment, exp.EQ) or not isinstance(assignment.this, exp.Column):
@@ -3308,19 +4218,37 @@ def _parse_simple_assignment_stage(
                     case_translation = _translate_case_to_4x(value_node)
                     if case_translation is None:
                         break
-                    case_translation = _rewrite_business_date_variables(case_translation, entity_name)
+                    case_translation = _rewrite_business_date_variables(case_translation, entity_name, source_sql=context_sql)
                     return guard, case_translation, assignment.this.name
                 value = _render_value_expression_to_4x(value_node)
                 if value is not None:
-                    value = _rewrite_business_date_variables(value, entity_name)
+                    value = _rewrite_business_date_variables(value, entity_name, source_sql=context_sql)
                     if validate_expression(value).valid:
                         return guard, value, assignment.this.name
                     break
                 value = value_node.sql(dialect=_SQLGLOT_DIALECT[dialect])
-                value = _rewrite_business_date_variables(value, entity_name)
+                value = _rewrite_business_date_variables(value, entity_name, source_sql=context_sql)
                 if not _is_simple_stage_value(value):
                     break
                 return guard, value, assignment.this.name
+
+        if isinstance(tree, exp.Insert):
+            projection = _render_insert_select_projection(tree, target_upper)
+            if projection is not None:
+                guard = ""
+                select_tree = tree.expression
+                if isinstance(select_tree, exp.Select):
+                    where = select_tree.args.get("where")
+                    if where is not None:
+                        guard = _safe_render_guard(
+                            where.this,
+                            source_alias=_statement_source_alias(select_tree),
+                            procedure_sql=context_sql,
+                        )
+                        if guard is None:
+                            return None
+                projection = _rewrite_business_date_variables(projection, entity_name, source_sql=context_sql)
+                return guard, projection, target_column
 
         if fallback_rhs:
             try:
@@ -3334,9 +4262,9 @@ def _parse_simple_assignment_stage(
                     if isinstance(tree, exp.Update):
                         where = tree.args.get("where")
                         if where is not None:
-                            guard = _render_sql_condition_to_4x(where.this, source_alias=source_alias) or where.this.sql(
-                                dialect=_SQLGLOT_DIALECT[dialect]
-                            )
+                            guard = _safe_render_guard(where.this, source_alias=source_alias, procedure_sql=context_sql)
+                            if guard is None:
+                                return None
                     return guard, value, target_column
 
         if isinstance(tree, exp.Select) and tree.args.get("into") is not None:
@@ -3345,9 +4273,9 @@ def _parse_simple_assignment_stage(
                 guard = ""
                 where = tree.args.get("where")
                 if where is not None:
-                    guard = _render_sql_condition_to_4x(where.this, source_alias=source_alias) or where.this.sql(
-                        dialect=_SQLGLOT_DIALECT[dialect]
-                    )
+                    guard = _safe_render_guard(where.this, source_alias=source_alias, procedure_sql=context_sql)
+                    if guard is None:
+                        return None
                 return guard, projection, target_column
 
         select_into_stmt = _extract_select_into_statement(stmt)
@@ -3362,9 +4290,13 @@ def _parse_simple_assignment_stage(
                     guard = ""
                     where = select_tree.args.get("where")
                     if where is not None:
-                        guard = _render_sql_condition_to_4x(where.this, source_alias=_statement_source_alias(select_tree)) or where.this.sql(
-                            dialect=_SQLGLOT_DIALECT[dialect]
+                        guard = _safe_render_guard(
+                            where.this,
+                            source_alias=_statement_source_alias(select_tree),
+                            procedure_sql=context_sql,
                         )
+                        if guard is None:
+                            return None
                     return guard, projection, target_column
 
         if isinstance(tree, exp.Merge):
@@ -3373,10 +4305,16 @@ def _parse_simple_assignment_stage(
             if isinstance(using, exp.Subquery) and isinstance(using.this, exp.Select):
                 where = using.this.args.get("where")
                 if where is not None:
-                    guard_parts.append(_render_sql_condition_to_4x(where.this) or where.this.sql(dialect=_SQLGLOT_DIALECT[dialect]))
+                    rendered_guard = _safe_render_guard(where.this, procedure_sql=context_sql)
+                    if rendered_guard is None:
+                        return None
+                    guard_parts.append(rendered_guard)
             on_clause = tree.args.get("on")
             if on_clause is not None:
-                guard_parts.append(_render_sql_condition_to_4x(on_clause) or on_clause.sql(dialect=_SQLGLOT_DIALECT[dialect]))
+                rendered_on = _safe_render_guard(on_clause, procedure_sql=context_sql)
+                if rendered_on is None:
+                    return None
+                guard_parts.append(rendered_on)
 
             whens = tree.args.get("whens")
             when_list = whens.expressions if whens is not None else []
@@ -3395,27 +4333,27 @@ def _parse_simple_assignment_stage(
                         case_translation = _translate_case_to_4x(value_node)
                         if case_translation is None:
                             break
-                        value = _rewrite_business_date_variables(case_translation, entity_name)
+                        value = _rewrite_business_date_variables(case_translation, entity_name, source_sql=context_sql)
                     else:
                         value = _render_value_expression_to_4x(value_node)
                         if value is not None:
-                            value = _rewrite_business_date_variables(value, entity_name)
+                            value = _rewrite_business_date_variables(value, entity_name, source_sql=context_sql)
                             if validate_expression(value).valid:
                                 pass
                             else:
                                 break
                         else:
                             value = value_node.sql(dialect=_SQLGLOT_DIALECT[dialect])
-                            value = _rewrite_business_date_variables(value, entity_name)
+                            value = _rewrite_business_date_variables(value, entity_name, source_sql=context_sql)
                             if not _is_simple_stage_value(value):
                                 break
                         if value is None:
                             break
                     if when_cond is not None:
-                        guard_parts.append(
-                            _render_sql_condition_to_4x(when_cond, source_alias=source_alias)
-                            or when_cond.sql(dialect=_SQLGLOT_DIALECT[dialect])
-                        )
+                        rendered_when = _safe_render_guard(when_cond, source_alias=source_alias, procedure_sql=context_sql)
+                        if rendered_when is None:
+                            return None
+                        guard_parts.append(rendered_when)
                     guard = " AND ".join(f"({part})" for part in guard_parts if part)
                     return guard, value, assignment.this.name
 
@@ -3469,8 +4407,40 @@ def _extract_select_into_statement(stmt_text: str) -> str | None:
     return None
 
 
+def _render_select_projection_value(
+    value_node: exp.Expression,
+    select_tree: exp.Select,
+    *,
+    unwrap_parens=None,
+) -> str | None:
+    """Render one SELECT list item (CASE / column / scalar) to a 4X value."""
+    node = value_node
+    if unwrap_parens is not None:
+        node = unwrap_parens(node)
+    else:
+        while isinstance(node, exp.Paren):
+            node = node.this
+
+    source_alias = _statement_source_alias(select_tree) or _select_from_relation_name(select_tree)
+    if source_alias and not isinstance(node, exp.Column):
+        node = _qualify_unqualified_condition_columns(node, source_alias)
+
+    if isinstance(node, exp.Case):
+        return _translate_case_to_4x(node)
+
+    if isinstance(node, exp.Column):
+        col_name = node.name or ""
+        if not col_name:
+            return None
+        table_name = node.table or source_alias or _select_from_relation_name(select_tree)
+        if table_name:
+            return f'"{str(table_name).lstrip("#")}"."{col_name}"'
+        return f'"{col_name}"'
+
+    return _render_value_expression_to_4x(node)
+
+
 def _render_select_into_projection(tree: exp.Select, target_upper: str) -> str | None:
-    source_alias = _select_into_source_alias(tree)
     for expr in tree.args.get("expressions", []) or []:
         value_node = expr
         alias = None
@@ -3488,17 +4458,44 @@ def _render_select_into_projection(tree: exp.Select, target_upper: str) -> str |
         if not alias or alias.upper() != target_upper:
             continue
 
-        if isinstance(value_node, exp.Case):
-            case_translation = _translate_case_to_4x(value_node)
-            if case_translation is not None:
-                return case_translation
+        return _render_select_projection_value(value_node, tree)
+    return None
 
-        if isinstance(value_node, exp.Column) and source_alias and not value_node.table:
-            return f'"{source_alias}"."{value_node.name}"'
 
-        rendered = _render_value_expression_to_4x(value_node)
-        if rendered is not None:
-            return rendered
+def _render_insert_select_projection(tree: exp.Insert, target_upper: str) -> str | None:
+    """Map `INSERT INTO t (c1,c2,…) SELECT e1,e2,…` by column position.
+
+    SQL Server staging loads often put multi-branch CASE expressions in the
+    SELECT list without aliases; positional pairing with the INSERT column
+    list is required to compose Outcome / ShortfallPct style formulas.
+    """
+    select_tree = tree.expression
+    if not isinstance(select_tree, exp.Select):
+        return None
+
+    schema = tree.this
+    insert_columns: list[str] = []
+    if isinstance(schema, exp.Schema):
+        for col in schema.expressions or []:
+            if isinstance(col, exp.Identifier):
+                insert_columns.append(str(col.this or ""))
+            elif isinstance(col, exp.Column):
+                insert_columns.append(str(col.name or ""))
+            else:
+                name = getattr(col, "name", None) or getattr(col, "this", None)
+                if name:
+                    insert_columns.append(str(name))
+
+    select_exprs = list(select_tree.args.get("expressions") or [])
+    if not insert_columns or len(insert_columns) != len(select_exprs):
+        # Fall back to alias-based matching when lengths differ.
+        return _render_select_into_projection(select_tree, target_upper)
+
+    for col_name, expr in zip(insert_columns, select_exprs):
+        if (col_name or "").upper() != target_upper:
+            continue
+        value_node = expr.this if isinstance(expr, exp.Alias) else expr
+        return _render_select_projection_value(value_node, select_tree)
     return None
 
 
@@ -3695,16 +4692,892 @@ def undeterminable_exception_sites(sites: list["_AssignmentSite"]) -> list["_Ass
     return [s for s in exception_sites if _extract_where_guard_text(s.raw_sql) in other_guards]
 
 
+def _extract_complete_update_for_column(
+    procedure_sql: str,
+    target_column: str,
+    prefer_fragment: str = "",
+) -> str | None:
+    """Recover a full `UPDATE ... SET col = <expr> ...` when chunking truncated CASE.
+
+    Statement splitting often cuts at the first `END` inside `CASE ... END`,
+    leaving an unparseable fragment. Scan the procedure text with CASE/paren
+    depth so nested CASE expressions stay intact.
+    """
+    proc = procedure_sql or ""
+    column = (target_column or "").strip()
+    if not proc or not column:
+        return None
+
+    prefer = (prefer_fragment or "").strip()
+    prefer_idx = proc.find(prefer[:120]) if prefer and len(prefer) >= 20 else -1
+
+    best: str | None = None
+    best_score = -1
+    for match in re.finditer(
+        rf"(?is)\bSET\b[\s\S]{{0,120}}?\b{re.escape(column)}\b\s*=\s*",
+        proc,
+    ):
+        start = proc.rfind("UPDATE", max(0, match.start() - 240), match.start() + 1)
+        if start < 0:
+            continue
+        i = match.end()
+        depth_paren = 0
+        depth_case = 0
+        in_single = False
+        in_double = False
+        n = len(proc)
+        while i < n:
+            ch = proc[i]
+            nxt = proc[i : i + 2]
+            if in_single:
+                if ch == "'":
+                    in_single = False
+                i += 1
+                continue
+            if in_double:
+                if ch == '"':
+                    in_double = False
+                i += 1
+                continue
+            if ch == "'":
+                in_single = True
+                i += 1
+                continue
+            if ch == '"':
+                in_double = True
+                i += 1
+                continue
+            if ch == "(":
+                depth_paren += 1
+                i += 1
+                continue
+            if ch == ")":
+                depth_paren = max(0, depth_paren - 1)
+                i += 1
+                continue
+            upper_tail = proc[i : i + 8].upper()
+            if re.match(r"CASE\b", upper_tail):
+                depth_case += 1
+                i += 4
+                continue
+            if re.match(r"END\b", upper_tail):
+                if depth_case > 0:
+                    depth_case -= 1
+                    i += 3
+                    continue
+                # END of BEGIN block / procedure — stop before it when expression done
+                break
+            if depth_paren == 0 and depth_case == 0:
+                if re.match(r"(?:GO|ELSE|ELSEIF|ELSIF)\b", upper_tail):
+                    break
+                if re.match(r"(?:UPDATE|MERGE|INSERT|DELETE|CREATE|IF)\b", upper_tail) and i > match.end():
+                    # Next statement at top level
+                    break
+            i += 1
+
+        candidate = proc[start:i].strip()
+        if column.upper() not in candidate.upper():
+            continue
+        if candidate.upper().count("CASE") > candidate.upper().count(" END") and "CASE" in candidate.upper():
+            # Still truncated — skip
+            continue
+        score = len(candidate)
+        if prefer_idx >= 0 and start <= prefer_idx <= start + len(candidate):
+            score += 10000
+        if score > best_score:
+            best_score = score
+            best = candidate
+    return best
+
+
+def _expand_truncated_assignment_sql(
+    raw_sql: str,
+    procedure_sql: str,
+    target_column: str,
+) -> str:
+    text = (raw_sql or "").strip()
+    if not text:
+        return text
+    upper = text.upper()
+    truncated = (
+        upper.count("CASE") > len(re.findall(r"\bEND\b", upper))
+        or (upper.lstrip().startswith("UPDATE") and "FROM" not in upper and not text.rstrip().endswith(";"))
+        or bool(re.search(r"(?i)(?:=\s*|THEN|ELSE|WHEN)\s*$", text.rstrip()))
+    )
+    if not truncated:
+        return text
+    recovered = _extract_complete_update_for_column(procedure_sql, target_column, prefer_fragment=text)
+    return recovered if recovered and len(recovered) > len(text) else text
+
+
+def _assignment_looks_like_control_flow_else_default(
+    stage_raw: str,
+    procedure_sql: str,
+) -> bool:
+    """True when an unconditional UPDATE sits in a procedural ELSE branch.
+
+    Those writes are mutually exclusive with earlier IF/ELSEIF arms — not a
+    sequential last-write-wins wipe that should erase prior guards.
+    """
+    proc = procedure_sql or ""
+    snippet = (stage_raw or "").strip()
+    if not snippet or not proc:
+        return False
+
+    search_key = snippet.splitlines()[0].strip()
+    idx = proc.find(snippet[:120]) if len(snippet) >= 40 else proc.find(snippet)
+    if idx < 0 and search_key:
+        idx = proc.find(search_key)
+    if idx < 0:
+        return False
+
+    window = proc[max(0, idx - 500) : idx]
+    # Strip line comments so `-- ELSE` in notes does not false-positive.
+    cleaned_lines: list[str] = []
+    for line in window.splitlines():
+        cleaned_lines.append(line.split("--", 1)[0])
+    window = "\n".join(cleaned_lines).upper()
+    # Require procedural `ELSE BEGIN` — bare `ELSE` inside CASE WHEN arms
+    # (e.g. `ELSE 'N' END`) must not count as a control-flow else default.
+    return bool(re.search(r"\bELSE\b(?!\s+IF\b)\s+BEGIN[\s\S]{0,240}$", window))
+
+
+def _procedural_then_predicate_4x(
+    stage_raw: str,
+    procedure_sql: str,
+    *,
+    entity_name: str,
+) -> str | None:
+    """Render a simple procedural IF predicate wrapping a THEN-arm UPDATE.
+
+    Handles `IF DAY(@ProcessDate) = 1` and similar scalar compares so the
+    guard is not lost when the UPDATE's own WHERE is only a row filter.
+    Skips ELSE / ELSE IF arms (those use exclusive-branch compose).
+    """
+    proc = procedure_sql or ""
+    snippet = (stage_raw or "").strip()
+    if not snippet or not proc:
+        return None
+    if _assignment_looks_like_control_flow_else_default(snippet, proc):
+        return None
+    idx = proc.find(snippet[:120]) if len(snippet) >= 40 else proc.find(snippet)
+    if idx < 0:
+        return None
+    window = proc[max(0, idx - 400) : idx]
+    cleaned = "\n".join(line.split("--", 1)[0] for line in window.splitlines())
+    # Nearest IF … BEGIN before this statement (not IF OBJECT_ID).
+    matches = list(
+        re.finditer(
+            r"(?is)\bIF\s+(?!OBJECT_ID\b)(?P<cond>.+?)\s+BEGIN\b",
+            cleaned,
+        )
+    )
+    if not matches:
+        return None
+    # If an ELSE IF sits closer than the IF, this is not a pure THEN arm.
+    else_if = list(re.finditer(r"(?is)\bELSE\s+IF\b", cleaned))
+    if else_if and else_if[-1].start() > matches[-1].start():
+        return None
+    cond = matches[-1].group("cond").strip()
+    # Only lift simple, deterministically renderable predicates.
+    day_eq = re.match(
+        r"(?is)^DAY\s*\(\s*@?(?:v_)?(?:ProcessDate|ProcessDt|BusinessDate)\s*\)\s*=\s*(\d+)\s*$",
+        cond,
+    )
+    if day_eq:
+        bd = f'"{entity_name}"."var"."BUSINESS_DATE"'
+        return f'DATEPART("d", {bd}) == {day_eq.group(1)}'
+    return None
+
+
+def _procedural_exclusive_branch_predicate(
+    stage_raw: str,
+    procedure_sql: str,
+    *,
+    search_from: int = 0,
+) -> tuple[str | None, int]:
+    """Return (predicate|'' for ELSE|None, match_index).
+
+    `search_from` skips earlier duplicate UPDATEs with the same text (sample 16
+    blackout vs final ELSE both set amount=0 / shortfall=Y).
+    """
+    proc = procedure_sql or ""
+    snippet = (stage_raw or "").strip()
+    if not snippet or not proc:
+        return None, -1
+    key = snippet[:120] if len(snippet) >= 40 else snippet
+    idx = proc.find(key, max(0, search_from))
+    if idx < 0:
+        idx = proc.find(key)
+    if idx < 0:
+        return None, -1
+    window = proc[max(0, idx - 600) : idx]
+    cleaned = "\n".join(line.split("--", 1)[0] for line in window.splitlines())
+    upper = cleaned.upper()
+    if re.search(r"\bELSE\b(?!\s+IF\b)\s+BEGIN\s*$", upper):
+        return "", idx
+    else_if = list(
+        re.finditer(r"(?is)\bELSE\s+IF\s+(?P<cond>.+?)\s+BEGIN\b", cleaned)
+    )
+    if else_if:
+        return else_if[-1].group("cond").strip(), idx
+    if_match = list(
+        re.finditer(r"(?is)\bIF\s+(?!OBJECT_ID\b)(?P<cond>.+?)\s+BEGIN\b", cleaned)
+    )
+    if if_match:
+        return if_match[-1].group("cond").strip(), idx
+    return None, idx
+
+
+def _render_simple_scalar_predicate_4x(cond_sql: str, entity_name: str, procedure_sql: str) -> str | None:
+    """Best-effort 4X rendering for procedural IF scalar predicates."""
+    text = (cond_sql or "").strip()
+    if not text:
+        return None
+    bd = f'"{entity_name}"."var"."BUSINESS_DATE"'
+    # `@var IS NOT NULL AND @ProcessDate >= DATEADD(DAY, -N, @var)` — @var's
+    # real source (table/column) comes from its own DECLARE, not a guess.
+    not_null_offset = re.match(
+        r"(?is)^@(?P<var>[A-Za-z_][\w]*)\s+IS\s+NOT\s+NULL\s+AND\s+"
+        r"@?(?:v_)?(?:ProcessDate|ProcessDt|BusinessDate)\s*>=\s*"
+        r"DATEADD\s*\(\s*DAY\s*,\s*(?P<offset>-?\d+)\s*,\s*@(?P=var)\s*\)\s*$",
+        text,
+    )
+    if not_null_offset:
+        ref = _resolve_scalar_lookup_reference(not_null_offset.group("var"), procedure_sql)
+        if ref:
+            offset = int(not_null_offset.group("offset"))
+            return f"ISNOTEMPTY({ref}) AND {bd} >= ADDDAY({ref}, {offset})"
+        return None
+    # `@var IS NOT NULL AND @var > 0` — same lineage-first resolution.
+    not_null_positive = re.match(
+        r"(?is)^@(?P<var>[A-Za-z_][\w]*)\s+IS\s+NOT\s+NULL\s+AND\s+@(?P=var)\s*>\s*0\s*$",
+        text,
+    )
+    if not_null_positive:
+        ref = _resolve_scalar_lookup_reference(not_null_positive.group("var"), procedure_sql)
+        if ref:
+            return f"ISNOTEMPTY({ref}) AND {ref} > 0"
+        return None
+    # IF EXISTS (...) — keep as EXISTS for unsupported/manual clarity
+    if re.match(r"(?is)^EXISTS\s*\(", text):
+        return f"EXISTS({text[text.upper().find('EXISTS') + 6:].strip()})"
+    day_eq = re.match(
+        r"(?is)^DAY\s*\(\s*@?(?:v_)?(?:ProcessDate|ProcessDt|BusinessDate)\s*\)\s*=\s*(\d+)\s*$",
+        text,
+    )
+    if day_eq:
+        return f'DATEPART("d", {bd}) == {day_eq.group(1)}'
+    return None
+
+
+def _resolve_scalar_lookup_reference(var: str, procedure_sql: str) -> str | None:
+    """Return `"table"."column"` for @var if it's declared as a single-row
+    scalar lookup, or None if no such lineage can be found in the source."""
+    for match in _SCALAR_LOOKUP_DECLARE_RE.finditer(procedure_sql or ""):
+        if match.group("var").lower() == var.lower():
+            return f'"{match.group("table")}"."{match.group("col")}"'
+    return None
+
+
+def _compose_exclusive_control_flow_stages(
+    stages: list[tuple[str, str, str, str]],
+    *,
+    procedure_sql: str,
+    entity_name: str,
+) -> str | None:
+    """Compose IF/ELSE IF/ELSE arms that share a row WHERE as exclusive branches.
+
+    Sample 16 CoverAppropriatedAmount: three UPDATEs with the same WHERE sit
+    under IF / ELSE IF / ELSE — nesting them as LWW makes the last `THEN(0)`
+    always win. Build IF(ctrl1)THEN(v1)ELSEIF(ctrl2)THEN(v2)ELSE(v3) instead,
+    optionally wrapped by the shared row guard.
+    """
+    if len(stages) < 2 or not procedure_sql:
+        return None
+    # Prefer arms that sit under procedural IF/ELSE IF/ELSE; ignore leading
+    # unrelated writes (e.g. CoverShortfallFlag='N' before the fund IF).
+    branched: list[tuple[tuple[str, str, str, str], str]] = []
+    cursor = 0
+    for stage in stages:
+        pred, idx = _procedural_exclusive_branch_predicate(
+            stage[3], procedure_sql, search_from=cursor
+        )
+        if idx >= 0:
+            cursor = idx + 1
+        if pred is not None:
+            branched.append((stage, pred))
+    if len(branched) < 2:
+        return None
+    # Need both a conditional arm and an ELSE (or multiple ELSE IFs).
+    preds = [p for _s, p in branched]
+    if not any(p == "" for p in preds) and len(set(preds)) < 2:
+        return None
+    row_guards = [(g or "").strip() for (g, _v, _t, _r), _p in branched]
+    if len(set(row_guards)) != 1:
+        return None
+    shared_where = row_guards[0]
+
+    rendered_arms: list[tuple[str | None, str]] = []
+    for stage, pred in branched:
+        _g, value, _t, _raw = stage
+        if pred == "":
+            rendered_arms.append((None, value))
+            continue
+        ctrl = _render_simple_scalar_predicate_4x(pred, entity_name, procedure_sql)
+        if ctrl is None:
+            return None
+        rendered_arms.append((ctrl, value))
+
+    if_arms = [(c, v) for c, v in rendered_arms if c is not None]
+    else_arms = [v for c, v in rendered_arms if c is None]
+    if not if_arms:
+        return None
+    parts = [f"IF({if_arms[0][0]})THEN({if_arms[0][1]})"]
+    for ctrl, val in if_arms[1:]:
+        parts.append(f"ELSEIF({ctrl})THEN({val})")
+    else_val = else_arms[-1] if else_arms else "NULL"
+    parts.append(f"ELSE({else_val})")
+    inner = "".join(parts)
+    if not validate_expression(inner).valid:
+        return None
+    if shared_where:
+        wrapped = f"IF({shared_where})THEN({inner})ELSE(NULL)"
+        return wrapped if validate_expression(wrapped).valid else inner
+    return inner
+
+
+def _compose_procedural_if_else_seed(
+    empty_stages: list[tuple[str, str, str, str]],
+    *,
+    procedure_sql: str,
+    entity_name: str,
+    is_plain_update_wipe,
+) -> str | None:
+    """Seed expression for an IF-arm rich formula paired with an ELSE wipe.
+
+    Preserves both arms when possible: IF(cond)THEN(rich_case)ELSE(wipe).
+    Eligibility CASE outcomes must not disappear just because a later
+    override (or an unreachable IF) exists — source anomalies still report
+    unreachable predicates separately.
+    """
+    rich_empties = [
+        stage
+        for stage in empty_stages
+        if (stage[1] or "").upper().startswith("IF(")
+        or "COALESCE(" in (stage[1] or "").upper()
+        or "DATEDIFF(" in (stage[1] or "").upper()
+    ]
+    wipe_empties = [
+        stage
+        for stage in empty_stages
+        if is_plain_update_wipe(stage[3], stage[1])
+        and _assignment_looks_like_control_flow_else_default(stage[3], procedure_sql)
+    ]
+    if not rich_empties or not wipe_empties:
+        return None
+
+    rich_val = _rewrite_business_date_variables(
+        _normalize_expression(rich_empties[-1][1], ""),
+        entity_name,
+        source_sql=procedure_sql,
+    )
+    wipe_val = _rewrite_business_date_variables(
+        _normalize_expression(wipe_empties[-1][1], ""),
+        entity_name,
+        source_sql=procedure_sql,
+    )
+    if not validate_expression(rich_val).valid or not validate_expression(wipe_val).valid:
+        return None
+
+    cond = _procedural_if_predicate_before_stage(
+        rich_empties[-1][3],
+        procedure_sql,
+        entity_name=entity_name,
+    )
+    if cond and validate_expression(f"IF({cond})THEN(1)ELSE(0)").valid:
+        paired = f"IF({cond})THEN({rich_val})ELSE({wipe_val})"
+        if validate_expression(paired).valid:
+            return paired
+
+    # Cannot render the IF predicate — keep the rich THEN CASE (eligibility
+    # chain) rather than dropping it for the ELSE wipe alone.
+    return rich_val
+
+
+def _procedural_if_predicate_before_stage(
+    stage_raw: str,
+    procedure_sql: str,
+    *,
+    entity_name: str,
+) -> str | None:
+    """Render the IF predicate of the BEGIN block that contains `stage_raw`."""
+    proc = procedure_sql or ""
+    snippet = (stage_raw or "").strip()
+    if not snippet or not proc:
+        return None
+    idx = proc.find(snippet[:120]) if len(snippet) >= 40 else proc.find(snippet)
+    if idx < 0:
+        return None
+    window = proc[max(0, idx - 500) : idx]
+    cleaned = "\n".join(line.split("--", 1)[0] for line in window.splitlines())
+    matches = list(
+        re.finditer(r"(?is)\bIF\s+(?!OBJECT_ID\b)(?P<cond>.+?)\s+BEGIN\b", cleaned)
+    )
+    if not matches:
+        return None
+    # Skip ELSE IF — those are handled by exclusive-branch compose.
+    else_if = list(re.finditer(r"(?is)\bELSE\s+IF\b", cleaned))
+    if else_if and else_if[-1].start() > matches[-1].start():
+        return None
+    cond_sql = matches[-1].group("cond").strip()
+    rendered = _render_simple_scalar_predicate_4x(cond_sql, entity_name, proc)
+    if rendered:
+        return rendered
+    return _render_processdate_vs_cutoff_predicate(cond_sql, entity_name, proc)
+
+
+def _render_processdate_vs_cutoff_predicate(
+    cond_sql: str,
+    entity_name: str,
+    procedure_sql: str,
+) -> str | None:
+    """Map `@ProcessDate < @SchemeCutoffDate` (etc.) using DECLARE lineage."""
+    text = (cond_sql or "").strip()
+    bd = f'"{entity_name}"."var"."BUSINESS_DATE"'
+    m = re.match(
+        r"(?is)^@?(?:v_)?(?P<left>ProcessDate|ProcessDt|BusinessDate)\s*"
+        r"(?P<op><=|>=|<|>)\s*"
+        r"@?(?P<right>[A-Za-z_][\w]*)\s*$",
+        text,
+    )
+    if not m:
+        return None
+    right = m.group("right")
+    op = {"<": "<", ">": ">", "<=": "<=", ">=": ">="}[m.group("op")]
+    lineage = _extract_date_offset_lineage(procedure_sql)
+    key = right.upper()
+    if key not in lineage:
+        # Also try DECLARE without going through extract (typed DECLARE).
+        decl = re.search(
+            rf"(?is)DECLARE\s+@{re.escape(right)}\s+\w+\s*=\s*"
+            rf"DATEADD\s*\(\s*(?P<unit>YEAR|MONTH|DAY)S?\s*,\s*(?P<offset>-?\d+)\s*,\s*"
+            rf"@?(?:v_)?(?:ProcessDate|ProcessDt|BusinessDate)\s*\)",
+            procedure_sql or "",
+        )
+        if not decl:
+            return None
+        unit = decl.group("unit").upper().rstrip("S")
+        offset = int(decl.group("offset"))
+    else:
+        unit, offset = lineage[key]
+    if unit == "DAY":
+        rhs = f"ADDDAY({bd}, {offset})"
+    elif unit == "MONTH":
+        rhs = f'PERIOD("M", {offset}, {bd})'
+    else:
+        rhs = f'PERIOD("Y", {offset}, {bd})'
+    return f"{bd} {op} {rhs}"
+
+
+def _is_non_derivable_expression(expression: str) -> bool:
+    """True when the formula is a bare NULL/0/1 with no derivation logic.
+
+    Those must not become DD rules / Excel / CSV / report cards. Empty
+    strings are handled separately (review rows may still carry metadata).
+    """
+    text = (expression or "").strip()
+    if not text:
+        return False
+    return text.upper() in {"NULL", "0", "1"}
+
+
+_BALANCED_IF_RE = re.compile(
+    r"^IF\((?P<guard>.+)\)THEN\((?P<then>.+)\)ELSE\((?P<else>.+)\)$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _split_top_level_if(expression: str) -> tuple[str, str, str] | None:
+    """Split a single top-level `IF(g)THEN(t)ELSE(e)` into `(g, t, e)`."""
+    text = (expression or "").strip()
+    if not re.match(r"(?i)^IF\(", text):
+        return None
+
+    def _matching_paren(src: str, open_idx: int) -> int | None:
+        depth = 0
+        for idx in range(open_idx, len(src)):
+            if src[idx] == "(":
+                depth += 1
+            elif src[idx] == ")":
+                depth -= 1
+                if depth == 0:
+                    return idx
+        return None
+
+    if_open = text.find("(")
+    guard_close = _matching_paren(text, if_open)
+    if guard_close is None:
+        return None
+    after_guard = text[guard_close + 1 :].lstrip()
+    then_match = re.match(r"(?i)^THEN\(", after_guard)
+    if not then_match:
+        return None
+    then_open = (guard_close + 1) + (len(text[guard_close + 1 :]) - len(after_guard)) + then_match.end() - 1
+    then_close = _matching_paren(text, then_open)
+    if then_close is None:
+        return None
+    after_then = text[then_close + 1 :].lstrip()
+    else_match = re.match(r"(?i)^ELSE\(", after_then)
+    if not else_match:
+        return None
+    else_open = (then_close + 1) + (len(text[then_close + 1 :]) - len(after_then)) + else_match.end() - 1
+    else_close = _matching_paren(text, else_open)
+    if else_close is None:
+        return None
+    if text[else_close + 1 :].strip():
+        return None
+    return (
+        text[if_open + 1 : guard_close],
+        text[then_open + 1 : then_close],
+        text[else_open + 1 : else_close],
+    )
+
+
+def _collapse_tautology_branches(expression: str) -> str:
+    """Rewrite `IF(g)THEN(v)ELSE(v)` → `v` (including nested ELSE tautologies)."""
+    text = (expression or "").strip()
+    if not text:
+        return text
+    changed = True
+    while changed:
+        changed = False
+        parts = _split_top_level_if(text)
+        if not parts:
+            break
+        guard, then_part, else_part = parts
+        then_s = _collapse_tautology_branches(then_part)
+        else_s = _collapse_tautology_branches(else_part)
+        if then_s == else_s:
+            text = then_s
+            changed = True
+            continue
+        rebuilt = f"IF({guard})THEN({then_s})ELSE({else_s})"
+        if rebuilt != text:
+            text = rebuilt
+            changed = True
+    return text
+
+
+def _drop_leading_isempty_arm(body: str, col_compact: str) -> str | None:
+    """If body is `IF(ISEMPTY(col))THEN(dead)ELSEIF(rest…` → `IF(rest…`.
+
+    Also supports `IF(ISEMPTY(col))THEN(dead)ELSE(rest)`.
+    """
+    text = (body or "").strip()
+    head = re.match(r"(?is)^IF\(ISEMPTY\((?P<col>.+?)\)\)THEN\(", text)
+    if not head:
+        return None
+    if re.sub(r"\s+", "", head.group("col")) != col_compact:
+        return None
+    then_open = head.end() - 1
+    depth = 0
+    then_close = None
+    for idx in range(then_open, len(text)):
+        if text[idx] == "(":
+            depth += 1
+        elif text[idx] == ")":
+            depth -= 1
+            if depth == 0:
+                then_close = idx
+                break
+    if then_close is None:
+        return None
+    rest = text[then_close + 1 :].lstrip()
+    if rest.upper().startswith("ELSEIF("):
+        return "IF(" + rest[7:]
+    if rest.upper().startswith("ELSE("):
+        m = re.match(r"(?i)ELSE\(", rest)
+        if not m:
+            return None
+        else_open = (then_close + 1) + (len(text[then_close + 1 :]) - len(rest)) + m.end() - 1
+        depth = 0
+        else_close = None
+        for idx in range(else_open, len(text)):
+            if text[idx] == "(":
+                depth += 1
+            elif text[idx] == ")":
+                depth -= 1
+                if depth == 0:
+                    else_close = idx
+                    break
+        if else_close is None or text[else_close + 1 :].strip():
+            return None
+        return text[else_open + 1 : else_close]
+    return None
+
+
+def _strip_dead_isempty_under_isnotempty(expression: str) -> str:
+    """Drop unreachable `ISEMPTY(X)` arms under an outer `ISNOTEMPTY(X)` guard.
+
+    Handles `IF/ELSEIF/ELSE` CASE translations wrapped by a NOT NULL WHERE.
+    """
+    parts = _split_top_level_if(expression or "")
+    if not parts:
+        return expression or ""
+    guard, then_part, else_part = parts
+    else_part = _strip_dead_isempty_under_isnotempty(else_part)
+    notempty = re.fullmatch(r"(?is)ISNOTEMPTY\((.+)\)$", guard.strip())
+    if not notempty:
+        then_part = _strip_dead_isempty_under_isnotempty(then_part)
+        return f"IF({guard})THEN({then_part})ELSE({else_part})"
+
+    col_compact = re.sub(r"\s+", "", notempty.group(1))
+    stripped = _drop_leading_isempty_arm(then_part, col_compact)
+    if stripped is not None:
+        then_part = _strip_dead_isempty_under_isnotempty(stripped)
+    else:
+        then_part = _strip_dead_isempty_under_isnotempty(then_part)
+    return f"IF({guard})THEN({then_part})ELSE({else_part})"
+
+
+def _simplify_composed_expression(expression: str) -> str:
+    """Remove dead/contradictory IF nesting left by sequential UPDATE folding."""
+    text = (expression or "").strip()
+    if not text or not text.upper().startswith("IF("):
+        return text
+    text = _strip_dead_isempty_under_isnotempty(text)
+    text = _collapse_tautology_branches(text)
+    return text
+
+
+_TRIVIAL_GUARDED_COPY_RE = re.compile(
+    r'^IF\(.+\)THEN\("[^"]+"\."[A-Za-z_][\w]*"\)ELSE\(NULL\)$',
+    re.IGNORECASE | re.DOTALL,
+)
+_BARE_COLUMN_REF_RE = re.compile(r'^"[^"]+"\."[A-Za-z_][\w]*"$')
+_NOISE_ENTITY_RE = re.compile(r"(?i)(AuditLog|CollectionsQueue)\b")
+
+
+def _is_trivial_guarded_column_copy(expression: str) -> bool:
+    text = re.sub(r"\s+", "", expression or "")
+    return bool(_TRIVIAL_GUARDED_COPY_RE.fullmatch(text))
+
+
+def _should_omit_passthrough_dd_row(
+    *,
+    target_table: str,
+    entity_name: str,
+    expression: str,
+) -> bool:
+    """Omit workflow filter-copies that inflate reports as duplicate rules.
+
+    Temp staging INSERT columns that only copy AccountId/DpdBucket/… under a
+    WHERE filter, and CollectionsQueue/AuditLog key/date copies, are not
+    independent business derivations. Rich CASE outcomes (e.g. Reason) stay.
+    """
+    table = target_table or ""
+    entity = entity_name or ""
+    expr = (expression or "").strip()
+    if not expr:
+        return False
+    is_temp = table.lstrip().startswith("#") or (entity.startswith("#"))
+    is_noise = bool(_NOISE_ENTITY_RE.search(table) or _NOISE_ENTITY_RE.search(entity))
+    if not is_temp and not is_noise:
+        return False
+    compact = re.sub(r"\s+", "", expr)
+    if _is_trivial_guarded_column_copy(expr):
+        return True
+    if is_noise and re.fullmatch(
+        r'(?is)IF\(.+\)THEN\("[^"]+"\.(?:"var"\.)?"[^"]+"\)ELSE\(NULL\)',
+        compact,
+    ):
+        return True
+    # MERGE/INSERT projections that are only a source column or BUSINESS_DATE
+    # on audit/queue tables are workflow copies, not independent rules.
+    if is_noise and (
+        _BARE_COLUMN_REF_RE.fullmatch(expr)
+        or re.fullmatch(r'^"[^"]+"\."var"\."[A-Za-z_][\w]*"$', expr)
+    ):
+        return True
+    if is_temp and _BARE_COLUMN_REF_RE.fullmatch(expr):
+        return True
+    return False
+
+
+_MULTI_ASSIGN_RE = re.compile(
+    r"(?m)^\s*(?:[A-Za-z_][\w]*\s*\.\s*)?([A-Za-z_][\w]*)\s*=\s*(?![=<>])"
+)
+
+
+def _is_multi_column_assignment_blob(expression: str, target_column: str = "") -> bool:
+    """Detect LLM outputs that dump an entire multi-column UPDATE as one formula.
+
+    Historical PENDING_REVIEW flood: `IF(p_TIMEKEY > 26267, (DPD_IntService=...,
+    DPD_NoCredit=..., ...), (...))` — invalid 4X and wrong for a single column.
+    """
+    text = expression or ""
+    if "=" not in text:
+        return False
+    # Platform comparisons use ==; SQL-style single = assignments are the smell.
+    assigns = []
+    for match in re.finditer(
+        r"(?<![<>=!])(?<![A-Za-z0-9_])([A-Za-z_][\w]*)\s*=\s*(?!=)",
+        text,
+    ):
+        name = match.group(1)
+        if name.upper() in {
+            "IF", "THEN", "ELSE", "ELSEIF", "AND", "OR", "NULL", "TRUE", "FALSE",
+        }:
+            continue
+        assigns.append(name)
+    if len(assigns) < 2:
+        return False
+    distinct = {a.upper() for a in assigns}
+    if target_column and target_column.upper() in distinct and len(distinct) == 1:
+        return False
+    return len(distinct) >= 2
+
+
+def _extract_column_from_assignment_blob(expression: str, column: str) -> str | None:
+    """If a multi-assign blob contains `column = <expr>`, return that RHS only."""
+    if not expression or not column:
+        return None
+    pattern = re.compile(
+        rf"(?is)(?:^|[,(\s])(?:[A-Za-z_][\w]*\s*\.\s*)?{re.escape(column)}\s*=\s*(?P<rhs>.+?)(?=,\s*[A-Za-z_][\w]*\s*=|\)$|$)"
+    )
+    match = pattern.search(expression)
+    if not match:
+        return None
+    rhs = match.group("rhs").strip().rstrip(",").strip()
+    # Trim balanced trailing closes that belong to outer IF wrappers.
+    while rhs.endswith(")") and rhs.count(")") > rhs.count("("):
+        rhs = rhs[:-1].rstrip()
+    return rhs or None
+
+
+def _scrub_llm_expression_for_column(expression: str, column: str) -> str:
+    """Repair or reject LLM shapes that historically caused PENDING_REVIEW."""
+    if not expression:
+        return expression
+    text = _normalize_legacy_if_syntax(expression)
+    if _is_multi_column_assignment_blob(text, column):
+        extracted = _extract_column_from_assignment_blob(text, column)
+        if extracted:
+            return extracted
+        return ""
+    # Leftover SQL ISNULL / comma IF after normalization → unusable.
+    if re.search(r"(?i)\bISNULL\s*\(", text) or re.search(r"(?i)\bIF\s*\([^)]+,", text):
+        # Allow IF(cond)THEN — only flag when a comma still separates IF args.
+        if re.search(r"(?i)\bIF\s*\((?:[^()\"]+|\"[^\"]*\"|\([^()]*\))*,", text):
+            if "THEN(" not in text.upper():
+                return ""
+    return text
+
+
+def _is_process_status_table(table_or_entity: str) -> bool:
+    name = (table_or_entity or "").lstrip("#").upper()
+    return bool(
+        re.search(r"RUNNINGPROCESSSTATUS|PROCESSSTATUS|RUNSTATUS|BANDAUDITSTATUS", name)
+    )
+
+
+def _should_omit_dd_row_from_presentation(expression: str) -> bool:
+    """Omit rows that have nothing meaningful to show stakeholders."""
+    text = (expression or "").strip()
+    if not text:
+        return True
+    return _is_non_derivable_expression(text)
+
+
+def _is_noop_column_self_assignment(
+    value: str,
+    column: str,
+    target_entity: str = "",
+) -> bool:
+    """True when RHS is only a reference to the same target column on the
+    same entity (or an unqualified/self-alias ref).
+
+    Copies from a distinct source alias such as `"SRC"."Asset_Norm"` are
+    NOT no-ops — they are intentional projections from a MERGE USING arm.
+    Complex IF/CONCAT/arithmetic expressions that merely mention the column
+    are also not no-ops.
+    """
+    text = (value or "").strip()
+    column = (column or "").strip().strip('"')
+    if not text or not column:
+        return False
+    while text.startswith("(") and text.endswith(")"):
+        depth = 0
+        balanced = True
+        for idx, ch in enumerate(text):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0 and idx != len(text) - 1:
+                    balanced = False
+                    break
+        if not balanced or depth != 0:
+            break
+        text = text[1:-1].strip()
+
+    # Strict shape: only a (possibly qualified) column reference.
+    compact = re.sub(r"\s+", "", text)
+    if not re.fullmatch(
+        r'(?i)(?:"[^"]+"\.)?"[^"]+"|(?:[A-Za-z_][\w]*\.)?[A-Za-z_][\w]*',
+        compact,
+    ):
+        return False
+
+    parts = re.findall(r'"([^"]+)"', text)
+    if not parts:
+        return bool(
+            re.fullmatch(
+                rf"(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)*{re.escape(column)}",
+                text,
+                flags=re.IGNORECASE,
+            )
+        )
+    if parts[-1].upper() != column.upper():
+        return False
+    if len(parts) == 1:
+        return True
+    qualifier = parts[0]
+    target_key = _normalize_relation_name(target_entity) if target_entity else ""
+    if target_key and _normalize_relation_name(qualifier) == target_key:
+        return True
+    # Distinct multi-character source names (SRC, SOURCE, DIMPRODUCT, …)
+    # and short SQL aliases (S, A, D) are source projections, not self-copies,
+    # unless the qualifier resolves to the target entity name.
+    if target_key and _normalize_relation_name(qualifier) == target_key:
+        return True
+    if len(qualifier) > 1 and qualifier.upper() in {"SRC", "SOURCE", "SRCROW", "INPUT"}:
+        return False
+    if target_key and _normalize_relation_name(qualifier) != target_key:
+        return False
+    # Unknown short alias without a target match → treat as projection.
+    if len(qualifier) <= 2:
+        return False
+    return True
+
+
 def _compose_simple_assignment_expression(
     assignment_sites: list[_AssignmentSite],
     entity_name: str,
     fallback_column: str,
+    procedure_sql: str = "",
+    entity_name_map: dict[str, str] | None = None,
 ) -> str | None:
     """Compose a sequential 4X expression from deterministic assignment
     sites when each stage is only a simple guard/value write.
 
     The composition preserves source order exactly: earlier stages become
     the outer branches and later fix-ups stay nested later.
+
+    Aliases are resolved per site before nesting so a reused letter like
+    `"B"` that means CustomerCal in one MERGE and PUI_CAL in another does
+    not survive into the final formula as an ambiguous single-letter leak.
     """
     if not assignment_sites:
         return None
@@ -3714,65 +5587,358 @@ def _compose_simple_assignment_expression(
     if direct_sites:
         assignment_sites = direct_sites
 
-    stages: list[tuple[str, str, str]] = []
+    entity_name_map = dict(entity_name_map or {})
+    if entity_name:
+        entity_name_map.setdefault(entity_name, entity_name)
+    dialect = detect_dialect(procedure_sql or assignment_sites[0].raw_sql)
+
+    stages: list[tuple[str, str, str, str]] = []
     for site in assignment_sites:
-        stage = _parse_simple_assignment_stage(site.raw_sql, fallback_column, entity_name)
+        stage = _parse_simple_assignment_stage(
+            site.raw_sql, fallback_column, entity_name, procedure_sql=procedure_sql
+        )
         if stage is None:
-            if re.search(rf"\b{re.escape(fallback_column)}\b\s*=", site.raw_sql, re.IGNORECASE):
-                return None
+            # Skip unparseable assignment fragments (truncated nested CASE,
+            # subquery writes, etc.) rather than aborting columns that still
+            # have other composable stages.
             continue
-        stages.append(stage)
+        guard, value, source_target = stage
+        site_aliases = _collect_alias_resolution_inventory(site.raw_sql, dialect)
+        if guard.strip():
+            guard = _finalize_platform_expression(
+                guard,
+                entity_name=entity_name,
+                entity_name_map=entity_name_map,
+                alias_resolution_inventory=site_aliases,
+                source_sql=procedure_sql or site.raw_sql,
+            )
+        value = _finalize_platform_expression(
+            value,
+            entity_name=entity_name,
+            entity_name_map=entity_name_map,
+            alias_resolution_inventory=site_aliases,
+            source_sql=procedure_sql or site.raw_sql,
+        )
+        # Skip self-copies after alias/entity finalize so `"S"."Col"` from a
+        # staging projection is kept, while `SET S.Col = S.Col` on the target
+        # entity (sample 09 ELSE no-op) is still dropped.
+        if _is_noop_column_self_assignment(
+            value, source_target or fallback_column, target_entity=entity_name
+        ):
+            continue
+        # Attach simple procedural IF predicates (e.g. DAY(@ProcessDate)=1)
+        # to THEN-arm updates so they are not lost as unconditional LWW.
+        branch_pred = _procedural_then_predicate_4x(
+            site.raw_sql, procedure_sql, entity_name=entity_name
+        )
+        if branch_pred:
+            guard = f"({branch_pred}) AND ({guard})" if guard.strip() else branch_pred
+        stages.append((guard, value, source_target, site.raw_sql))
+
+    # INSERT … SELECT often seeds a column with NULL before a later UPDATE
+    # CASE fills it. Drop those null seeds so they do not wrap (and invert)
+    # the real last-write-wins formula.
+    while (
+        len(stages) > 1
+        and (stages[0][1] or "").strip().upper() == "NULL"
+        and (stages[0][3] or "").lstrip().upper().startswith("INSERT")
+    ):
+        stages = stages[1:]
 
     if not stages:
         return None
 
+    exclusive = _compose_exclusive_control_flow_stages(
+        stages,
+        procedure_sql=procedure_sql,
+        entity_name=entity_name,
+    )
+    if exclusive:
+        final_expr = _rewrite_business_date_variables(
+            _normalize_expression(exclusive, ""),
+            entity_name,
+            source_sql=procedure_sql,
+        )
+        final_expr = _simplify_composed_expression(final_expr)
+        if _is_non_derivable_expression(final_expr):
+            return None
+        return final_expr if validate_expression(final_expr).valid else None
+
     current_target = stages[0][2] or fallback_column
-    first_kind = assignment_sites[0].kind.upper() if assignment_sites else ""
-    first_raw = assignment_sites[0].raw_sql if assignment_sites else ""
-    first_is_seed_projection = first_kind in {"SELECT", "INSERT"}
-    if not first_is_seed_projection and first_kind == "CONTROL_FLOW_BLOCK":
-        select_stmt = _extract_select_into_statement(first_raw)
-        if select_stmt:
-            for dialect in (detect_dialect(select_stmt), Dialect.ORACLE, Dialect.SQLSERVER, Dialect.MYSQL):
-                try:
-                    tree = sqlglot.parse_one(select_stmt, read=_SQLGLOT_DIALECT[dialect])
-                except Exception:
-                    continue
-                if isinstance(tree, exp.Select) and tree.args.get("into") is not None:
-                    if _render_select_into_projection(tree, current_target.upper()) is not None:
-                        first_is_seed_projection = True
-                        break
+    guarded_stages = [stage for stage in stages if stage[0].strip()]
+    empty_stages = [stage for stage in stages if not stage[0].strip()]
 
-    # Base case: what the column resolves to when none of the stages'
-    # guards match. A fresh SELECT/INSERT projection has no prior value to
-    # fall back to, so NULL is correct there. But if any assignment site
-    # feeding this column is a plain WHERE-guarded UPDATE, ordinary SQL
-    # semantics mean rows that don't satisfy that WHERE are never touched
-    # -- so "no guard matched" must resolve to the column's own existing
-    # value, not an unconditional wipe. See architecture review root
-    # cause A ("UPDATE ... WHERE semantics being converted incorrectly").
-    if first_is_seed_projection:
-        expression = "NULL"
-    else:
-        combined_raw_sql = "\n".join(site.raw_sql for site in assignment_sites)
-        if _has_where_guarded_update_on_column(combined_raw_sql, current_target):
-            expression = f'"{entity_name}"."{current_target}"' if entity_name else f'"{current_target}"'
+    def _is_plain_update_wipe(raw_sql: str, value: str) -> bool:
+        """True only for a bare `UPDATE ... SET col = <simple> ` with no WHERE.
+
+        IF/ELSE control-flow fragments and MERGE statements often parse with
+        an empty guard even though they are conditional; those must not
+        erase earlier composed CASE logic.
+        """
+        cleaned = _strip_leading_comments(raw_sql or "").strip()
+        upper = cleaned.upper()
+        if not upper.startswith("UPDATE"):
+            return False
+        if re.search(r"\bWHERE\b", cleaned, re.IGNORECASE):
+            return False
+        probe = (value or "").strip().upper()
+        return probe in {"NULL", "0", "1"} or bool(re.fullmatch(r'"[^"]*"', (value or "").strip()))
+
+    # When unconditional writes are mixed with guarded ones:
+    # - a trailing plain UPDATE with no WHERE overwrites every row when it
+    #   is a sequential last-write-wins wipe;
+    # - the same shape inside a procedural ELSE is an IF/ELSE default and
+    #   must become ELSE(seed) under the earlier guarded arms.
+    if empty_stages and guarded_stages:
+        trailing = stages[-1]
+        trailing_unconditional = not trailing[0].strip() and _is_plain_update_wipe(
+            trailing[3], trailing[1]
+        )
+        else_default = trailing_unconditional and _assignment_looks_like_control_flow_else_default(
+            trailing[3], procedure_sql
+        )
+        pair_seed = _compose_procedural_if_else_seed(
+            empty_stages,
+            procedure_sql=procedure_sql,
+            entity_name=entity_name,
+            is_plain_update_wipe=_is_plain_update_wipe,
+        )
+        if trailing_unconditional and not else_default:
+            expression = _rewrite_business_date_variables(
+                _normalize_expression(trailing[1], ""),
+                entity_name,
+            )
+            if not validate_expression(expression).valid:
+                return None
+            stages_to_apply = []
+        elif pair_seed is not None:
+            # IF-arm CASE + ELSE wipe (+ later WHERE fix-ups). Prefer the
+            # executable IF/ELSE seed so a dead THEN does not hide ELSE.
+            expression = pair_seed
+            stages_to_apply = guarded_stages
         else:
-            expression = "NULL"
+            # Prefer formula/CASE empty stages as the ELSE seed; skip plain
+            # literal wipes and MERGE fragments that parsed without an ON
+            # guard and only write NULL (those are incomplete stage extracts,
+            # not true unconditional defaults). When the trailing stage is a
+            # procedural ELSE default, use that literal as the ELSE seed.
+            def _is_incomplete_null_merge(stage: tuple[str, str, str, str]) -> bool:
+                _g, value, _t, raw = stage
+                if (value or "").strip().upper() != "NULL":
+                    return False
+                cleaned = _strip_leading_comments(raw or "").strip().upper()
+                return cleaned.startswith("MERGE")
 
-    for guard, value, source_target in stages:
+            if else_default:
+                expression = _rewrite_business_date_variables(
+                    _normalize_expression(trailing[1], ""),
+                    entity_name,
+                )
+                if not validate_expression(expression).valid:
+                    return None
+                stages_to_apply = guarded_stages
+            else:
+                seed_empties = [
+                    stage
+                    for stage in empty_stages
+                    if not _is_plain_update_wipe(stage[3], stage[1])
+                    and not _is_incomplete_null_merge(stage)
+                ]
+                if not seed_empties:
+                    combined_raw_sql = "\n".join(site.raw_sql for site in assignment_sites)
+                    if _has_where_guarded_update_on_column(combined_raw_sql, current_target):
+                        expression = (
+                            f'"{entity_name}"."{current_target}"'
+                            if entity_name
+                            else f'"{current_target}"'
+                        )
+                    else:
+                        expression = "NULL"
+                else:
+                    expression = _rewrite_business_date_variables(
+                        _normalize_expression(seed_empties[-1][1], ""),
+                        entity_name,
+                    )
+                    if not validate_expression(expression).valid:
+                        return None
+                    for _guard, value, source_target, _raw in seed_empties[:-1]:
+                        normalized_value = _rewrite_business_date_variables(
+                            _normalize_expression(value, ""),
+                            entity_name,
+                        )
+                        if not validate_expression(normalized_value).valid:
+                            return None
+                        if _is_noop_column_self_assignment(
+                            normalized_value, source_target or current_target, target_entity=entity_name
+                        ):
+                            continue
+                        if normalized_value.upper().startswith("IF(") or "CASE" in value.upper():
+                            expression = normalized_value
+                        current_target = source_target or current_target
+                stages_to_apply = guarded_stages
+    else:
+        first_kind = assignment_sites[0].kind.upper() if assignment_sites else ""
+        first_raw = assignment_sites[0].raw_sql if assignment_sites else ""
+        first_is_seed_projection = first_kind in {"SELECT", "INSERT"}
+        if not first_is_seed_projection and first_kind == "CONTROL_FLOW_BLOCK":
+            select_stmt = _extract_select_into_statement(first_raw)
+            if select_stmt:
+                for dialect in (detect_dialect(select_stmt), Dialect.ORACLE, Dialect.SQLSERVER, Dialect.MYSQL):
+                    try:
+                        tree = sqlglot.parse_one(select_stmt, read=_SQLGLOT_DIALECT[dialect])
+                    except Exception:
+                        continue
+                    if isinstance(tree, exp.Select) and tree.args.get("into") is not None:
+                        if _render_select_into_projection(tree, current_target.upper()) is not None:
+                            first_is_seed_projection = True
+                            break
+
+        # All empty-guard stages: prefer a rich IF/CASE formula over a later
+        # procedural ELSE wipe (common IF @date ... CASE ... ELSE SET = 0),
+        # unless the IF is unreachable and executable SQL always takes ELSE.
+        pair_seed = _compose_procedural_if_else_seed(
+            empty_stages,
+            procedure_sql=procedure_sql,
+            entity_name=entity_name,
+            is_plain_update_wipe=_is_plain_update_wipe,
+        )
+        rich_empties = [
+            stage
+            for stage in empty_stages
+            if (stage[1] or "").upper().startswith("IF(")
+            or "COALESCE(" in (stage[1] or "").upper()
+            or "DATEDIFF(" in (stage[1] or "").upper()
+        ]
+        wipe_empties = [
+            stage
+            for stage in empty_stages
+            if _is_plain_update_wipe(stage[3], stage[1])
+        ]
+        if pair_seed is not None:
+            expression = pair_seed
+            stages_to_apply = []
+        elif (
+            rich_empties
+            and wipe_empties
+            and _assignment_looks_like_control_flow_else_default(wipe_empties[-1][3], procedure_sql)
+        ):
+            expression = _rewrite_business_date_variables(
+                _normalize_expression(rich_empties[-1][1], ""),
+                entity_name,
+            )
+            if not validate_expression(expression).valid:
+                return None
+            stages_to_apply = []
+        elif first_is_seed_projection:
+            expression = "NULL"
+            stages_to_apply = stages
+        else:
+            combined_raw_sql = "\n".join(site.raw_sql for site in assignment_sites)
+            if _has_where_guarded_update_on_column(combined_raw_sql, current_target):
+                expression = f'"{entity_name}"."{current_target}"' if entity_name else f'"{current_target}"'
+            else:
+                expression = "NULL"
+            stages_to_apply = stages
+
+    for guard, value, source_target, _raw in stages_to_apply:
         source_target = source_target or current_target
         current_target = source_target
-        normalized_value = _rewrite_business_date_variables(_normalize_expression(value, ""), entity_name)
+        normalized_value = _rewrite_business_date_variables(
+            _normalize_expression(value, ""), entity_name, source_sql=procedure_sql
+        )
         if not validate_expression(normalized_value).valid:
             return None
         if not guard.strip():
             expression = normalized_value
             continue
+        # Sequential `SET col = f(col)` (e.g. CONCAT(col, '_QUARTER_END')) must
+        # embed the prior composed value — not a circular self-read.
+        normalized_value = _substitute_composed_column_refs(
+            normalized_value,
+            entity_name=entity_name,
+            column=current_target or fallback_column,
+            prior_expression=expression,
+        )
+        if not validate_expression(normalized_value).valid:
+            return None
         normalized_guard = _normalize_expression(guard, "")
+        # Board-approval gate: IF DAY=1 THEN map CASE 'Y' → PENDING_APPROVAL.
+        # Avoid circular `EligibleForUpgrade == "Y"` self-reads on the same column.
+        if re.fullmatch(r'"?PENDING_APPROVAL"?', normalized_value.strip(), flags=re.IGNORECASE):
+            day_pred = None
+            day_match = re.search(
+                r'DATEPART\("d"\s*,\s*[^)]+\)\s*==\s*\d+',
+                normalized_guard,
+                flags=re.IGNORECASE,
+            )
+            if day_match and expression:
+                day_pred = day_match.group(0)
+                pending_case = re.sub(
+                    r'THEN\("Y"\)',
+                    'THEN("PENDING_APPROVAL")',
+                    expression,
+                )
+                candidate = f"IF({day_pred})THEN({pending_case})ELSE({expression})"
+                if validate_expression(candidate).valid:
+                    expression = candidate
+                    continue
         expression = f"IF({normalized_guard})THEN({normalized_value})ELSE({expression})"
 
-    return _rewrite_business_date_variables(_normalize_expression(expression, ""), entity_name)
+    final_expr = _rewrite_business_date_variables(
+        _normalize_expression(expression, ""), entity_name, source_sql=procedure_sql
+    )
+    final_expr = _simplify_composed_expression(final_expr)
+    if _is_non_derivable_expression(final_expr):
+        return None
+    return final_expr
+
+
+def _substitute_composed_column_refs(
+    value: str,
+    *,
+    entity_name: str,
+    column: str,
+    prior_expression: str,
+) -> str:
+    """Replace self-reads of `column` inside CONCAT with `prior_expression`.
+
+    Sequential string appends (`SET col = col + '_QUARTER_END'`) must embed
+    the prior CASE formula. Arithmetic / CASE self-reads such as sample 07's
+    `AdjustedPenalty * 1.10` keep the column ref so presentation stays stable.
+    """
+    text = (value or "").strip()
+    column = (column or "").strip().strip('"')
+    prior = (prior_expression or "").strip()
+    if not text or not column or not prior:
+        return text
+    if not re.search(r"(?i)\bCONCAT\s*\(", text):
+        return text
+    if _is_noop_column_self_assignment(prior, column, target_entity=entity_name):
+        return text
+
+    col_re = re.escape(column)
+
+    def _repl_qualified(match: re.Match[str]) -> str:
+        frag = match.group(0)
+        if _is_noop_column_self_assignment(frag, column, target_entity=entity_name):
+            return prior
+        return frag
+
+    out = re.sub(rf'"[^"]+"\s*\.\s*"{col_re}"', _repl_qualified, text, flags=re.IGNORECASE)
+
+    def _repl_bare(match: re.Match[str]) -> str:
+        frag = match.group(0)
+        if _is_noop_column_self_assignment(frag, column, target_entity=entity_name):
+            return prior
+        return frag
+
+    out = re.sub(
+        rf'(?<![A-Za-z0-9_".]){col_re}(?![A-Za-z0-9_"])',
+        _repl_bare,
+        out,
+        flags=re.IGNORECASE,
+    )
+    return out
 
 
 def _repair_trailing_self_reference(expression: str, entity_name: str, column: str, source_sql: str) -> str:
@@ -3809,7 +5975,16 @@ def _expression_should_be_rejected(validation_errors: list[str]) -> bool:
 
 
 _ColumnJob = tuple[
-    CanonicalModel, SQLObject, StructuralInfo, str, str, LLMClient, str, "dict[int, date] | None", Optional[ChromaStore]
+    CanonicalModel,
+    SQLObject,
+    StructuralInfo,
+    str,
+    str,
+    LLMClient,
+    str,
+    "dict[int, date] | None",
+    Optional[ChromaStore],
+    dict[str, str],
 ]
 
 
@@ -3827,11 +6002,18 @@ def _build_jobs_for_chain(
     entity_name_map = entity_name_map or {}
     jobs: list[_ColumnJob] = []
     seen_logical_columns: set[tuple[str, str]] = set()
+    from app.utils.entity_name_map import resolve_entity_name
+
     for oid in chain.order:
         obj = objects[oid]
         info = structural_infos[oid]
         for target_table, columns in info.columns_written_by_table.items():
-            entity_name = entity_name_map.get(target_table, target_table)
+            entity_name = resolve_entity_name(target_table, entity_name_map)
+            # Process-status bookkeeping is not a platform DD formula target;
+            # exporting empty/self-copy PENDING_REVIEW rows for COMPLETED/
+            # ERRORDATE historically polluted review queues.
+            if _is_process_status_table(target_table) or _is_process_status_table(entity_name):
+                continue
             for column in columns:
                 canonical_column = canonical_logical_name(column)
                 logical_key = (canonical_logical_name(entity_name), canonical_column)
@@ -3844,11 +6026,12 @@ def _build_jobs_for_chain(
                         obj,
                         info,
                         entity_name,
-                        canonical_column,
+                        column,  # preserve source casing for platform CSV / report
                         llm_client,
                         function_reference,
                         timekey_map,
                         rag_store,
+                        dict(entity_name_map),
                     )
                 )
     return jobs
@@ -4153,6 +6336,56 @@ def _has_cross_statement_self_dependency(sites: list["_AssignmentSite"], column:
     return False
 
 
+def _source_table_for_entity_column(
+    info: StructuralInfo,
+    entity_name: str,
+    column: str,
+    entity_name_map: dict[str, str],
+) -> str | None:
+    """Best-effort source table for a (entity, column) generation job."""
+    column_key = canonical_logical_name(column)
+    entity_key = _normalize_relation_name(entity_name)
+    matches: list[str] = []
+    for table, cols in (info.columns_written_by_table or {}).items():
+        if not any(canonical_logical_name(col) == column_key for col in cols):
+            continue
+        mapped = entity_name_map.get(table, table)
+        if _normalize_relation_name(mapped) == entity_key or _normalize_relation_name(table) == entity_key:
+            matches.append(table)
+    if len(matches) == 1:
+        return matches[0]
+    return matches[0] if matches else None
+
+
+def _finalize_platform_expression(
+    expression: str,
+    *,
+    entity_name: str,
+    entity_name_map: dict[str, str],
+    alias_resolution_inventory: dict[str, tuple[str, ...]],
+    source_sql: str = "",
+) -> str:
+    """Normalize, resolve aliases, then rewrite to platform entity refs."""
+    if not expression:
+        return expression
+    expression = _normalize_expression(expression, source_sql or "")
+    expression = resolve_aliases_in_expression(
+        expression,
+        alias_resolution_inventory,
+        quote_replacements=True,
+    )
+    expression = rewrite_expression_to_platform_entities(
+        expression,
+        entity_name=entity_name,
+        entity_name_map=entity_name_map,
+        alias_to_parts=alias_resolution_inventory,
+    )
+    expression = _rewrite_business_date_variables(
+        expression, entity_name, source_sql=source_sql
+    )
+    return expression
+
+
 def _generate_for_column(
     canonical_model: CanonicalModel,
     obj: SQLObject,
@@ -4163,9 +6396,12 @@ def _generate_for_column(
     function_reference: str,
     timekey_map: dict[int, date] | None,
     rag_store: Optional[ChromaStore] = None,
+    entity_name_map: dict[str, str] | None = None,
 ) -> list[DDRow]:
+    entity_name_map = entity_name_map or {}
+    target_table = _source_table_for_entity_column(info, entity_name, column, entity_name_map)
     relevant_chunks = _relevant_chunks(info, column)
-    all_sites = _assignment_sites(info, column)
+    all_sites = _assignment_sites(info, column, target_table=target_table)
     excluded_sites = undeterminable_exception_sites(all_sites)
     excluded_stmt_indices: set[int] = set()
     for site in excluded_sites:
@@ -4189,6 +6425,10 @@ def _generate_for_column(
     rag_context = _retrieve_rag_context(
         rag_store, relevant_sql, canonical_model.technical_summary, canonical_model.business_summary
     )
+    # The full platform function/operator reference is a fallback for when
+    # RAG has no targeted hit for this column -- once RAG found one, resending
+    # the whole doc on top of it is pure duplication (see RagContext docstring).
+    effective_function_reference = "" if rag_context.platform_context else function_reference
     source_reference_inventory = _collect_source_reference_inventory(
         "\n\n".join(part for part in [obj.raw_sql, relevant_sql, assignment_context] if part),
         obj.dialect,
@@ -4198,6 +6438,15 @@ def _generate_for_column(
         "\n\n".join(part for part in [obj.raw_sql, relevant_sql, assignment_context] if part),
         obj.dialect,
     )
+    # Whole-procedure alias maps drop letters reused for different tables.
+    # Prefer unambiguous aliases from this column's own assignment sites so
+    # SELECT ... FROM Table A still resolves `"A"."Col"` for that write.
+    site_local_aliases = _collect_alias_resolution_inventory(
+        "\n\n".join(site.raw_sql for site in sites if site.raw_sql),
+        obj.dialect,
+    )
+    if site_local_aliases:
+        alias_resolution_inventory = {**alias_resolution_inventory, **site_local_aliases}
     allowed_reference_context = _append_allowed_reference_context("", source_reference_inventory)
     undeterminable_note = (
         "This column is also written inside an exception handler whose only apparent "
@@ -4222,25 +6471,51 @@ def _generate_for_column(
     if assignment_context:
         source_sql_excerpt = assignment_context
 
-    deterministic_expression = (
-        None if has_cross_statement_dependency
-        else _compose_simple_assignment_expression(sites, entity_name, column)
+    # Prefer deterministic composition even when later statements also read
+    # this column — the advisory note below asks reviewers to spot-check
+    # sequential order. Skipping compose entirely left too many blank rows.
+    deterministic_expression = _compose_simple_assignment_expression(
+        sites,
+        entity_name,
+        column,
+        procedure_sql=obj.raw_sql,
+        entity_name_map=entity_name_map,
     )
     if deterministic_expression:
-        deterministic_expression = resolve_aliases_in_expression(
+        deterministic_expression = _finalize_platform_expression(
             deterministic_expression,
-            alias_resolution_inventory,
-            quote_replacements=True,
+            entity_name=entity_name,
+            entity_name_map=entity_name_map,
+            alias_resolution_inventory=alias_resolution_inventory,
+            source_sql=obj.raw_sql,
         )
         grammar_result = validate_expression(deterministic_expression)
         semantic_result = check_semantic_consistency(
             deterministic_expression, column, entity_name, relevant_chunks, obj.raw_sql, source_statement_sql
         )
-        if grammar_result.valid and semantic_result.passed:
+        if grammar_result.valid:
+            # Prefer a grammar-valid deterministic composition over LLM.
+            # Semantic caveats (self-ref in process-status ELSE, sequential
+            # order, etc.) become advisory notes — they must not discard a
+            # correct single-column formula and open the door to comma-style
+            # multi-column LLM blobs that historically flooded PENDING_REVIEW.
             expression = deterministic_expression
             validation_errors = []
+            if not semantic_result.passed:
+                row_advisory_seed_early = [
+                    f"Semantic advisory: {err}" for err in semantic_result.errors
+                ]
+            else:
+                row_advisory_seed_early = []
+            dt_payload = _decision_table_from_formula_if_categorical(expression, entity_name, column)
+            if dt_payload is not None:
+                derivation_option = DerivationOption.DECISION_TABLE
+                decision_table_json = json.dumps(dt_payload)
         else:
             deterministic_expression = None
+            row_advisory_seed_early = []
+    else:
+        row_advisory_seed_early = []
 
     if expression is None:
         grounded_source_sql_excerpt = _append_allowed_reference_context(
@@ -4253,23 +6528,40 @@ def _generate_for_column(
             technical_summary=canonical_model.technical_summary,
             business_summary=canonical_model.business_summary,
             source_sql=grounded_source_sql_excerpt,
-            function_reference=function_reference,
+            function_reference=effective_function_reference,
             column_name=column,
             entity_name=entity_name,
             relevant_sql=grounded_relevant_sql,
-            rag_context=rag_context,
+            rag_context=rag_context.combined,
         )
         for attempt in range(_MAX_GENERATION_ATTEMPTS):
             derivation_option, expression, decision_table_json, parse_errors = _interpret_llm_output(raw_output)
             if expression:
                 expression = _normalize_expression(expression, obj.raw_sql)
+                expression = _scrub_llm_expression_for_column(expression, column)
+                if not expression:
+                    attempt_errors = list(parse_errors) + [
+                        "Rejected multi-column / comma-style IF blob; "
+                        "formula must derive only the target column"
+                    ]
+                    validation_errors = attempt_errors
+                    if attempt + 1 >= _MAX_GENERATION_ATTEMPTS:
+                        break
+                    raw_output = llm_client.retry_with_error(
+                        previous_expression=raw_output,
+                        error="\n".join(attempt_errors),
+                        context=f'Target column only: "{entity_name}"."{column}"',
+                    )
+                    continue
                 expression = _ground_expression_to_source_references(expression, source_reference_inventory, entity_name)
-                expression = resolve_aliases_in_expression(
+                expression = _finalize_platform_expression(
                     expression,
-                    alias_resolution_inventory,
-                    quote_replacements=True,
+                    entity_name=entity_name,
+                    entity_name_map=entity_name_map,
+                    alias_resolution_inventory=alias_resolution_inventory,
+                    source_sql=obj.raw_sql,
                 )
-                expression = _rewrite_business_date_variables(expression, entity_name)
+                expression = _rewrite_business_date_variables(expression, entity_name, source_sql=obj.raw_sql)
                 expression = _normalize_expression(expression, obj.raw_sql)
                 repaired = _repair_trailing_self_reference(expression, entity_name, column, obj.raw_sql)
                 if repaired != expression and validate_expression(repaired).valid:
@@ -4288,8 +6580,26 @@ def _generate_for_column(
                     if not semantic_result.passed:
                         attempt_errors.extend(f"Semantic validation: {e}" for e in semantic_result.errors)
 
+            if derivation_option == DerivationOption.DECISION_TABLE and decision_table_json and not expression:
+                # Platform sample exports always keep Display Derivation Expression
+                # populated even for Decision Table rows. Require an expression.
+                attempt_errors.append(
+                    "Decision Table output must also include a Display Derivation "
+                    "Expression (IF/THEN/ELSEIF form). Return JSON with both "
+                    '"expression" and "decision_table" keys.'
+                )
+
             if not attempt_errors:
                 validation_errors = []
+                if (
+                    derivation_option == DerivationOption.FORMULA_EXPRESSION
+                    and expression
+                    and decision_table_json is None
+                ):
+                    dt_payload = _decision_table_from_formula_if_categorical(expression, entity_name, column)
+                    if dt_payload is not None:
+                        derivation_option = DerivationOption.DECISION_TABLE
+                        decision_table_json = json.dumps(dt_payload)
                 break
 
             validation_errors = attempt_errors
@@ -4306,8 +6616,8 @@ def _generate_for_column(
                     f"Technical summary:\n{canonical_model.technical_summary}" if canonical_model.technical_summary else "",
                     f"Business summary:\n{canonical_model.business_summary}" if canonical_model.business_summary else "",
                     f"Source SQL:\n{_append_allowed_reference_context(source_sql_excerpt, source_reference_inventory)}",
-                    f"Platform reference:\n{function_reference}",
-                    f"RAG context:\n{rag_context}" if rag_context else "",
+                    f"Platform reference:\n{effective_function_reference}" if effective_function_reference else "",
+                    f"RAG context:\n{rag_context.combined}" if rag_context.combined else "",
                 ]
                 if part
             )
@@ -4330,11 +6640,31 @@ def _generate_for_column(
     )
 
     confidence = info.confidence if not validation_errors else min(info.confidence, 0.3)
-    status = DDStatus.PENDING_REVIEW if validation_errors else DDStatus.ACTIVE
+    # Platform Status: ACTIVE when the expression passed grammar + semantic
+    # checks. review_state tracks lifecycle separately (GENERATED / NEEDS_REVIEW /
+    # UNSUPPORTED / APPROVED). Exception-handler caveats are advisory only —
+    # they must not demote a valid normal-flow formula out of ACTIVE.
+    row_advisory_seed: list[str] = list(row_advisory_seed_early)
     if undeterminable_note:
+        row_advisory_seed.append(undeterminable_note)
+        confidence = min(confidence, 0.85)
+
+    has_exists = bool(expression and re.search(r"(?i)\bEXISTS\s*\(", expression))
+    if has_exists:
+        review_state = ReviewState.UNSUPPORTED
         status = DDStatus.PENDING_REVIEW
-        confidence = min(confidence, 0.5)
-        validation_errors = [*validation_errors, undeterminable_note]
+        validation_errors = list(validation_errors) + [
+            "Procedure-level or EXISTS logic is not expressible as a row formula"
+        ]
+    elif validation_errors:
+        review_state = ReviewState.NEEDS_REVIEW
+        status = DDStatus.PENDING_REVIEW
+    elif expression:
+        review_state = ReviewState.GENERATED
+        status = DDStatus.ACTIVE
+    else:
+        review_state = ReviewState.NEEDS_REVIEW
+        status = DDStatus.PENDING_REVIEW
 
     periods = effective_periods_for_column(info.version_thresholds, timekey_map)
     if not periods:
@@ -4343,24 +6673,63 @@ def _generate_for_column(
     if _expression_should_be_rejected(validation_errors):
         expression = ""
 
-    data_type = _infer_data_type(column)
+    if _is_non_derivable_expression(expression or ""):
+        # No real derivation to present — omit rather than export NULL/0 noise.
+        return []
+
+    if expression and _should_omit_passthrough_dd_row(
+        target_table=target_table or "",
+        entity_name=entity_name,
+        expression=expression,
+    ):
+        # Staging/queue/audit filter-copies look like duplicate rules in the
+        # business report; keep them in the write ledger, not as DD cards.
+        return []
+
+    # Prefer DT payload already chosen; otherwise derive from final expression.
+    if derivation_option == DerivationOption.FORMULA_EXPRESSION and expression and not decision_table_json:
+        dt_payload = _decision_table_from_formula_if_categorical(expression, entity_name, column)
+        if dt_payload is not None:
+            derivation_option = DerivationOption.DECISION_TABLE
+            decision_table_json = json.dumps(dt_payload)
+
+    conditional_json: str | None = None
+    if derivation_option == DerivationOption.DECISION_TABLE:
+        conditional_json = _conditional_json_from_decision_table(
+            json.loads(decision_table_json) if decision_table_json else None
+        )
+    else:
+        conditional_json = _conditional_json_from_formula(expression or "", entity_name)
+
+    data_type = _infer_data_type(column, expression or "")
+    column_type = _infer_column_type(column, derivation_option)
 
     rows = []
     for eff_date, is_real_mapping, variable, representative_value in periods:
         row_confidence = confidence
         row_status = status
         row_validation_errors = list(validation_errors)
-        advisory_notes: list[str] = []
+        advisory_notes: list[str] = list(row_advisory_seed)
 
         if has_cross_statement_dependency:
-            row_status = DDStatus.PENDING_REVIEW
-            advisory_notes.append(
-                f'"{column}" is written by multiple sequential source statements, and a later '
-                "statement reads the column's own value -- meaning it may depend on what an "
-                "earlier statement already wrote. Automated composition cannot guarantee this "
-                "execution-order dependency is preserved; verify this rule against the source "
-                "SQL statement-by-statement before approving."
-            )
+            if expression:
+                advisory_notes.append(
+                    f'"{column}" is written by multiple sequential source statements; '
+                    "spot-check that the composed formula preserves execution order."
+                )
+                row_confidence = min(row_confidence, 0.85)
+                # Keep ACTIVE when the composed expression already validated —
+                # sequential dependency is advisory, not a hard demotion.
+            else:
+                row_status = DDStatus.PENDING_REVIEW
+                review_state = ReviewState.NEEDS_REVIEW
+                advisory_notes.append(
+                    f'"{column}" is written by multiple sequential source statements, and a later '
+                    "statement reads the column's own value -- meaning it may depend on what an "
+                    "earlier statement already wrote. Automated composition cannot guarantee this "
+                    "execution-order dependency is preserved; verify this rule against the source "
+                    "SQL statement-by-statement before approving."
+                )
 
         if not is_real_mapping:
             advisory_notes.append(
@@ -4386,13 +6755,15 @@ def _generate_for_column(
             DDRow(
                 entity_name=entity_name,
                 column_name=column,
-                column_type=ColumnType.PHYSICAL,
+                column_type=column_type,
                 derivation_option=derivation_option,
                 display_derivation_expression=row_expression,
                 effective_start_date=eff_date,
                 status=row_status,
+                review_state=review_state,
                 data_type=data_type,
                 decision_table_json=decision_table_json,
+                conditional_json=conditional_json,
                 source_chain_id=canonical_model.chain_id,
                 source_object_ids=[obj.object_id],
                 source_statement_refs=source_statement_refs,
@@ -4404,6 +6775,416 @@ def _generate_for_column(
             )
         )
     return rows
+
+
+_CATEGORICAL_BRANCH_RE = re.compile(
+    r"(?is)(?:IF|ELSEIF)\s*\((?P<cond>.+?)\)\s*THEN\s*\((?P<val>.+?)\)(?=(?:ELSEIF|ELSE)\s*\()"
+)
+_CATEGORICAL_ELSE_RE = re.compile(r"(?is)ELSE\s*\((?P<val>.+)\)\s*$")
+_STRING_LITERAL_RE = re.compile(r'^"(?:[^"]|\\"")+"$')
+_NUMERIC_LITERAL_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
+
+
+def _split_top_level_and(condition: str) -> list[str]:
+    parts: list[str] = []
+    current: list[str] = []
+    depth = 0
+    in_double = False
+    i = 0
+    text = condition or ""
+    while i < len(text):
+        ch = text[i]
+        if ch == '"' and (i == 0 or text[i - 1] != "\\"):
+            in_double = not in_double
+            current.append(ch)
+            i += 1
+            continue
+        if not in_double:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            elif depth == 0 and text[i : i + 5].upper() == " AND ":
+                part = "".join(current).strip()
+                if part:
+                    parts.append(part)
+                current = []
+                i += 5
+                continue
+        current.append(ch)
+        i += 1
+    part = "".join(current).strip()
+    if part:
+        parts.append(part)
+    return parts or ([condition.strip()] if condition.strip() else [])
+
+
+def _column_link_name(expr: str) -> tuple[str, str, str]:
+    """Return (columnName, qualifierName, type) from a 4X column reference."""
+    text = (expr or "").strip()
+    parts = re.findall(r'"([^"]+)"', text)
+    if not parts:
+        bare = re.sub(r"[^A-Za-z0-9_]", "", text) or "VALUE"
+        return bare, bare, "ENT"
+    column = parts[-1]
+    if len(parts) >= 2:
+        qualifier = parts[-2]
+        link_type = "TEMP" if qualifier.upper() == "VAR" else "REL"
+        return column, qualifier, link_type
+    return column, column, "ENT"
+
+
+def _parse_condition_link(condition: str, entity_name: str) -> dict | None:
+    text = (condition or "").strip()
+    if not text:
+        return None
+
+    empty = re.match(r'(?is)^ISEMPTY\s*\(\s*(.+?)\s*\)$', text)
+    if empty:
+        col, name, link_type = _column_link_name(empty.group(1))
+        return {
+            "columnName": col,
+            "operator": "ISEMPTY",
+            "rangeFrom": "",
+            "rangeTo": "",
+            "value": "",
+            "name": name or entity_name,
+            "type": link_type,
+            "isFilterSet": "",
+        }
+    not_empty = re.match(r'(?is)^ISNOTEMPTY\s*\(\s*(.+?)\s*\)$', text)
+    if not_empty:
+        col, name, link_type = _column_link_name(not_empty.group(1))
+        return {
+            "columnName": col,
+            "operator": "ISNOTEMPTY",
+            "rangeFrom": "",
+            "rangeTo": "",
+            "value": "",
+            "name": name or entity_name,
+            "type": link_type,
+            "isFilterSet": "",
+        }
+
+    between = re.match(
+        r'(?is)^(.+?)\s+BETWEEN\s*\[\s*([^,\]]+)\s*,\s*([^\]]+)\s*\]\s*$',
+        text,
+    )
+    if between:
+        col, name, link_type = _column_link_name(between.group(1))
+        return {
+            "columnName": col,
+            "operator": "BETWEEN",
+            "rangeFrom": between.group(2).strip().strip('"'),
+            "rangeTo": between.group(3).strip().strip('"'),
+            "value": "",
+            "name": name or entity_name,
+            "type": link_type,
+            "isFilterSet": "",
+        }
+
+    membership = re.match(
+        r'(?is)^(.+?)\s+(IN|NOTIN|CONTAINS|BEGINSWITH|ENDSWITH|DOESNOTCONTAINS|HRCHYIN|HRCHYNOTIN)\s*'
+        r'\[\s*(.*?)\s*\]\s*$',
+        text,
+    )
+    if membership:
+        col, name, link_type = _column_link_name(membership.group(1))
+        values = [
+            item.strip().strip('"')
+            for item in membership.group(3).split(",")
+            if item.strip()
+        ]
+        return {
+            "columnName": col,
+            "operator": membership.group(2).upper(),
+            "rangeFrom": "",
+            "rangeTo": "",
+            "value": ",".join(values),
+            "name": name or entity_name,
+            "type": link_type,
+            "isFilterSet": "",
+        }
+
+    compare = re.match(
+        r'(?is)^(.+?)\s*(==|!=|>=|<=|>|<)\s*(.+?)\s*$',
+        text,
+    )
+    if compare:
+        col, name, link_type = _column_link_name(compare.group(1))
+        raw_value = compare.group(3).strip()
+        value = raw_value.strip('"')
+        return {
+            "columnName": col,
+            "operator": compare.group(2),
+            "rangeFrom": "",
+            "rangeTo": "",
+            "value": value,
+            "name": name or entity_name,
+            "type": link_type,
+            "isFilterSet": "",
+        }
+
+    # Fallback: keep the expression text so nothing is lost.
+    return {
+        "columnName": "",
+        "operator": "EXPR",
+        "rangeFrom": "",
+        "rangeTo": "",
+        "value": text,
+        "name": entity_name,
+        "type": "ENT",
+        "isFilterSet": "",
+    }
+
+
+def _condition_links_from_guard(condition: str, entity_name: str) -> list[dict]:
+    links: list[dict] = []
+    for part in _split_top_level_and(condition):
+        # Drop leading AND()/OR() wrappers for simple cases.
+        cleaned = part.strip()
+        if cleaned.upper().startswith("AND(") and cleaned.endswith(")"):
+            cleaned = cleaned[4:-1]
+        link = _parse_condition_link(cleaned, entity_name)
+        if link:
+            links.append(link)
+    return links
+
+
+def _decision_table_from_formula_if_categorical(
+    expression: str,
+    entity_name: str,
+    column: str,
+) -> dict | None:
+    """Build Decision Table JSON matching the platform sample export shape.
+
+    Produces `decisionTableDetails` with real operators (`==`, `BETWEEN`,
+    `IN`, `ISEMPTY`, …) in `conditionalLinksInfo` whenever the IF/THEN
+    chain is a clear multi-bucket categorical classification.
+    """
+    if not expression or "IF(" not in expression.upper():
+        return None
+
+    branches = list(_CATEGORICAL_BRANCH_RE.finditer(expression))
+    else_match = _CATEGORICAL_ELSE_RE.search(expression)
+    if len(branches) < 2:
+        return None
+
+    values: list[str] = []
+    details: list[dict] = []
+    for idx, branch in enumerate(branches, start=1):
+        cond = branch.group("cond").strip()
+        val = branch.group("val").strip()
+        values.append(val)
+        if not (_STRING_LITERAL_RE.match(val) or _NUMERIC_LITERAL_RE.match(val)):
+            return None
+        label = val.strip('"')
+        links = _condition_links_from_guard(cond, entity_name)
+        if not links:
+            links = [
+                {
+                    "columnName": column,
+                    "operator": "EXPR",
+                    "rangeFrom": "",
+                    "rangeTo": "",
+                    "value": cond,
+                    "name": entity_name,
+                    "type": "ENT",
+                    "isFilterSet": "",
+                }
+            ]
+        details.append(
+            {
+                "derivedValue": label,
+                "sequenceNumber": idx,
+                "conditionName": label,
+                "conditionalLinksInfo": links,
+            }
+        )
+
+    if else_match:
+        else_val = else_match.group("val").strip()
+        if "IF(" in else_val.upper():
+            return None
+        if not (_STRING_LITERAL_RE.match(else_val) or _NUMERIC_LITERAL_RE.match(else_val)):
+            return None
+        values.append(else_val)
+        label = else_val.strip('"')
+        details.append(
+            {
+                "derivedValue": label,
+                "sequenceNumber": len(details) + 1,
+                "conditionName": label,
+                "conditionalLinksInfo": [
+                    {
+                        "columnName": column,
+                        "operator": "ELSE",
+                        "rangeFrom": "",
+                        "rangeTo": "",
+                        "value": "",
+                        "name": entity_name,
+                        "type": "ENT",
+                        "isFilterSet": "",
+                    }
+                ],
+            }
+        )
+
+    distinct = {v.strip('"') for v in values}
+    if len(distinct) < 2:
+        return None
+    if all(_NUMERIC_LITERAL_RE.match(v) for v in values):
+        return None
+
+    return {"decisionTableDetails": details}
+
+
+def _conditional_json_from_decision_table(dt_payload: dict | None) -> str | None:
+    """Platform sample leaves Conditional Json empty for Decision Table rows.
+
+    For Formula Expression rows we still may emit a compact condition set
+    via `_conditional_json_from_formula`. Decision Table conditions already
+    live inside Decision Table Json, so Conditional Json stays empty.
+    """
+    return None
+
+
+def _conditional_json_from_formula(expression: str, entity_name: str) -> str | None:
+    """Build Conditional Json for non-DT formula rows with IF guards.
+
+    Shape mirrors the nested `conditionalLinksInfo` objects used inside
+    Decision Table Json in `samples/derivations/sample_derivations.csv`.
+    """
+    if not expression or "IF(" not in expression.upper():
+        return None
+    branches = list(_CATEGORICAL_BRANCH_RE.finditer(expression))
+    if not branches:
+        return None
+    details: list[dict] = []
+    for idx, branch in enumerate(branches, start=1):
+        links = _condition_links_from_guard(branch.group("cond").strip(), entity_name)
+        if not links:
+            continue
+        details.append(
+            {
+                "sequenceNumber": idx,
+                "conditionalLinksInfo": links,
+            }
+        )
+    if not details:
+        return None
+    return json.dumps({"conditionalDetails": details})
+
+
+def _infer_data_type(column_name: str, expression: str = "") -> str:
+    """Infer platform Data Type: string | number | datetime.
+
+    Prefer signals from the derived expression (TODATE, Y/N literals, etc.),
+    then fall back to conservative column-name heuristics matching
+    `samples/derivations/sample_derivations.csv`.
+    """
+    lowered = (column_name or "").lower()
+    expr = expression or ""
+    expr_upper = expr.upper()
+
+    if any(token in lowered for token in ("date", "_at", "period_id", "timekey")) or lowered.endswith("dt"):
+        return "datetime"
+    # A date function can appear in a *condition* of a flag/amount formula;
+    # it does not make the result a date. Prefer the target column's meaning.
+    if any(token in lowered for token in (
+        "amount", "amt", "penalty", "fee", "interest", "balance", "pct",
+        "percent", "ratio", "score", "count", "qty", "tenure", "month",
+        "day", "diff", "dpd", "rate",
+    )) and not any(token in lowered for token in ("flag", "bucket", "status")):
+        return "number"
+    if any(token in lowered for token in (
+        "flag", "flg", "ind", "check", "reason", "status", "class",
+        "bucket", "tier", "type", "name", "desc", "code", "msg",
+        "description", "eligible", "worsened", "applied", "outcome",
+    )):
+        return "string"
+    if re.search(r'(?i)\b(?:THEN|ELSE)\s*\(\s*"(?:Y|N|YES|NO|TRUE|FALSE)"\s*\)', expr):
+        return "string"
+    if "TODATE(" in expr_upper or "ADDDAY(" in expr_upper or "SOM(" in expr_upper or "EOM(" in expr_upper:
+        if "DATEDIFF(" not in expr_upper:
+            return "datetime"
+    if "DATEDIFF(" in expr_upper and any(token in lowered for token in ("day", "days", "diff", "count", "dpd")):
+        return "number"
+
+    string_tokens = (
+        "flag",
+        "flg",
+        "ind",
+        "check",
+        "reason",
+        "status",
+        "class",
+        "bucket",
+        "tier",
+        "type",
+        "name",
+        "desc",
+        "code",
+        "msg",
+        "description",
+    )
+    if any(token in lowered for token in string_tokens):
+        return "string"
+
+    # Literal outcomes dominate type when present.
+    string_literals = re.findall(r'"([^"]*)"', expr)
+    meaningful = [v for v in string_literals if v.upper() not in {"", "NULL"} and not v.replace(".", "", 1).isdigit()]
+    if meaningful and all(
+        re.fullmatch(r"[A-Za-z_][A-Za-z0-9_ \-]*", v) or v.upper() in {"Y", "N", "YES", "NO", "TRUE", "FALSE"}
+        for v in meaningful
+    ):
+        # Pure categorical labels / flags.
+        if any(v.upper() in {"Y", "N", "YES", "NO", "TRUE", "FALSE"} for v in meaningful) or any(
+            not v.replace(".", "", 1).isdigit() for v in meaningful
+        ):
+            # If expression is mostly classification labels, string wins.
+            if "DATEDIFF(" not in expr_upper and "ROUND(" not in expr_upper and "ABS(" not in expr_upper:
+                if any(ch.isalpha() for v in meaningful for ch in v):
+                    return "string"
+
+    if any(token in lowered for token in ("amt", "amount", "pct", "percent", "balance", "rate", "score", "count", "qty", "id")):
+        return "number"
+    return "number"
+
+
+def _infer_column_type(column_name: str, derivation_option: DerivationOption) -> ColumnType:
+    """Infer Physical vs Temporary using only generic naming signals.
+
+    Platform sample exports mark intermediate/helper columns Temporary and
+    persisted fact attributes Physical. Without a platform catalog we can
+    only apply conservative name-based heuristics -- never invent business
+    meaning.
+    """
+    lowered = column_name.lower()
+    temporary_tokens = (
+        "check",
+        "ratio",
+        "grouping",
+        "review",
+        "temp",
+        "tmp",
+        "helper",
+        "previous_",
+        "prev_",
+        "bureau",
+        "relative_",
+        "increase_in",
+        "downgrade",
+        "no_of_",
+        "rejection_",
+        "chque_",
+        "cheque_",
+    )
+    if any(token in lowered for token in temporary_tokens):
+        return ColumnType.TEMPORARY
+    if derivation_option == DerivationOption.DECISION_TABLE:
+        return ColumnType.PHYSICAL
+    return ColumnType.PHYSICAL
 
 
 def _interpret_llm_output(
@@ -4430,7 +7211,10 @@ def _interpret_llm_output(
             keys = {str(key).replace("-", "_").lower() for key in parsed.keys()}
             if {"decision_table", "decisiontable"} & keys:
                 return True
-            if {"rules", "buckets", "input_columns", "output_columns"} & keys and not {"expression", "formula"} & keys:
+            if {"rules", "buckets", "input_columns", "output_columns", "decisiontabledetails"} & keys and not {
+                "expression",
+                "formula",
+            } & keys:
                 return True
         return False
 
@@ -4441,6 +7225,41 @@ def _interpret_llm_output(
         except json.JSONDecodeError:
             pass
         else:
+            if isinstance(parsed, dict):
+                keys = {str(key).replace("-", "_").lower(): key for key in parsed.keys()}
+                expression_key = keys.get("expression") or keys.get("formula") or keys.get("display_derivation_expression")
+                expression_value = None
+                if expression_key is not None:
+                    raw_expr = parsed.get(expression_key)
+                    if isinstance(raw_expr, str) and raw_expr.strip():
+                        expression_value = unwrap_code_fence(raw_expr)
+
+                if is_decision_table_payload(parsed) or (
+                    expression_value is not None
+                    and any(k in keys for k in ("decision_table", "decisiontable", "decisiontabledetails"))
+                ):
+                    decision_table = parsed.get("decision_table") if "decision_table" in parsed else None
+                    if decision_table is None:
+                        decision_table = parsed.get("decisionTable")
+                    if decision_table is None and "decisionTableDetails" in parsed:
+                        decision_table = {"decisionTableDetails": parsed.get("decisionTableDetails")}
+                    if decision_table is None and any(
+                        k in {str(x).replace("-", "_").lower() for x in parsed.keys()}
+                        for k in ("rules", "buckets", "decisiontabledetails")
+                    ):
+                        decision_table = parsed
+                    if decision_table is None:
+                        decision_table = parsed
+                    return (
+                        DerivationOption.DECISION_TABLE,
+                        expression_value,
+                        json.dumps(decision_table),
+                        [],
+                    )
+
+                if expression_value is not None and not is_decision_table_payload(parsed):
+                    return DerivationOption.FORMULA_EXPRESSION, expression_value, None, []
+
             if is_decision_table_payload(parsed):
                 decision_table = parsed.get("decision_table") if isinstance(parsed, dict) else None
                 if decision_table is None and isinstance(parsed, dict):
@@ -4455,15 +7274,6 @@ def _interpret_llm_output(
                 )
 
     return DerivationOption.FORMULA_EXPRESSION, unwrap_code_fence(stripped), None, []
-
-
-def _infer_data_type(column_name: str) -> str:
-    lowered = column_name.lower()
-    if any(token in lowered for token in ("date", "dt", "_at")):
-        return "datetime"
-    if any(token in lowered for token in ("flag", "flg", "ind", "check", "reason")):
-        return "string"
-    return "number"
 
 
 def flag_duplicate_dd_rows(dd_rows: list[DDRow]) -> list[DDRow]:

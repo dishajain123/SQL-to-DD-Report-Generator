@@ -104,6 +104,33 @@ def collect_table_aliases(text: str, dialect: Dialect) -> dict[str, tuple[str, .
                 continue
             alias_to_parts[alias.upper()].add(parts)
 
+        # MERGE/FROM derived-table aliases (`USING (SELECT ... FROM T ...) SRC`)
+        # are not Table nodes. Map them to the subquery's primary base table so
+        # `"SRC"."Col"` / `"C"."Col"` resolve instead of leaking single-letter
+        # aliases into Platform Conditions.
+        for subquery in tree.find_all(exp.Subquery):
+            alias_node = subquery.args.get("alias")
+            alias = None
+            if isinstance(alias_node, exp.TableAlias):
+                alias = _exact_identifier_text(alias_node)
+            elif isinstance(alias_node, exp.Identifier):
+                alias = _exact_identifier_text(alias_node)
+            elif isinstance(alias_node, str) and alias_node.strip():
+                alias = alias_node.strip()
+            if not alias:
+                continue
+            select = subquery.this if isinstance(subquery.this, exp.Select) else None
+            if not isinstance(select, exp.Select):
+                continue
+            from_clause = select.args.get("from_")
+            if not isinstance(from_clause, exp.From):
+                continue
+            source = from_clause.this
+            if isinstance(source, exp.Table):
+                parts = _table_reference_parts(source)
+                if parts:
+                    alias_to_parts[alias.upper()].add(parts)
+
     return {
         alias: next(iter(parts_set))
         for alias, parts_set in alias_to_parts.items()
@@ -225,3 +252,127 @@ def resolve_aliases_in_expression(
         i += 1
 
     return "".join(result)
+
+
+_QUOTED_SEGMENT_RE = re.compile(r'"([^"]+)"')
+
+
+def rewrite_expression_to_platform_entities(
+    expression: str,
+    *,
+    entity_name: str,
+    entity_name_map: dict[str, str] | None = None,
+    alias_to_parts: dict[str, tuple[str, ...]] | None = None,
+) -> str:
+    """Rewrite SQL schema/table qualifiers into platform entity qualifiers.
+
+    Platform Formula Expressions use `"Entity"."Column"` (or
+    `"Entity"."rel"."Column"` / `"Entity"."var"."Name"`), never SQL schema
+    prefixes such as `"PRO"."AccountCal"."Column"`. This step is applied
+    after alias resolution so the DD export matches the Derivations schema
+    observed in the platform sample export.
+    """
+    if not expression:
+        return expression
+
+    entity_name = (entity_name or "").strip().strip('"')
+    entity_name_map = entity_name_map or {}
+    alias_to_parts = alias_to_parts or {}
+
+    # Map every known source table identifier (bare table, schema.table, and
+    # each path component) onto the platform entity name for that table.
+    table_to_entity: dict[str, str] = {}
+
+    def remember(source_name: str, mapped_entity: str) -> None:
+        key = source_name.strip().strip('"')
+        if not key or not mapped_entity:
+            return
+        table_to_entity[key.upper()] = mapped_entity
+
+    for source_table, mapped in entity_name_map.items():
+        remember(source_table, mapped)
+        remember(mapped, mapped)
+
+    if entity_name:
+        remember(entity_name, entity_name)
+
+    for parts in alias_to_parts.values():
+        if not parts:
+            continue
+        table_name = parts[-1]
+        mapped = entity_name_map.get(table_name, table_name)
+        # Prefer the caller's target entity when this alias points at the
+        # same logical table the column is being generated for.
+        if entity_name and table_name.upper() == entity_name.upper():
+            mapped = entity_name
+        elif entity_name and entity_name_map.get(table_name, table_name).upper() == entity_name.upper():
+            mapped = entity_name
+        remember(table_name, mapped)
+        remember(".".join(parts), mapped)
+        for part in parts:
+            # Schema-only tokens like PRO must never become standalone
+            # entity rewrites; only remember multi-part and table names.
+            if part.upper() == table_name.upper():
+                remember(part, mapped)
+
+    if not table_to_entity:
+        return expression
+
+    # Longest source keys first so `"PRO"."AccountCal"` wins over `"PRO"`.
+    source_keys = sorted(table_to_entity.keys(), key=len, reverse=True)
+
+    def replace_leading_qualifier(match: re.Match[str]) -> str:
+        segments = _QUOTED_SEGMENT_RE.findall(match.group(0))
+        if len(segments) < 2:
+            return match.group(0)
+
+        # Preserve platform temp/business-date conventions already in entity form.
+        if len(segments) >= 3 and segments[1].upper() == "VAR":
+            if entity_name and segments[0].upper() != entity_name.upper():
+                # Only rewrite the leading qualifier when it is a known source table.
+                leading_key = segments[0].upper()
+                dotted_key = ".".join(segments[:2]).upper()
+                replacement = table_to_entity.get(dotted_key) or table_to_entity.get(leading_key)
+                if replacement:
+                    return '"' + replacement + '"' + "".join(f'."{seg}"' for seg in segments[1:])
+            return match.group(0)
+
+        # Platform formulas use `"Entity"."Column"` (exactly two segments).
+        # Only rewrite the leading qualifier; never collapse the path to a
+        # single token by treating the column name as a table (that produced
+        # `"FeeSchedule"."LateFee"` → `"LateFee"` when `LateFee` was wrongly
+        # present in the entity map).
+        if len(segments) == 2:
+            dotted = ".".join(segments).upper()
+            if dotted in table_to_entity:
+                return f'"{table_to_entity[dotted]}"'
+            replacement = table_to_entity.get(segments[0].upper())
+            if replacement:
+                return f'"{replacement}"."{segments[1]}"'
+            return match.group(0)
+
+        for width in (2, 1):
+            if len(segments) < width + 1:
+                continue
+            leading = ".".join(segments[:width]).upper()
+            replacement = table_to_entity.get(leading)
+            if replacement:
+                return '"' + replacement + '"' + "".join(f'."{seg}"' for seg in segments[width:])
+        return match.group(0)
+
+    quoted_path_re = re.compile(r'"[^"]+"(?:\s*\.\s*"[^"]+")+')
+    rewritten = quoted_path_re.sub(replace_leading_qualifier, expression)
+
+    # Also rewrite unquoted Schema.Table.Column / Table.Column when the
+    # leading table is a known source relation (deterministic compose can
+    # emit either shape before normalization).
+    for source_key in source_keys:
+        mapped = table_to_entity[source_key]
+        if "." in source_key:
+            parts = source_key.split(".")
+            pattern = r"(?<![A-Za-z0-9_\"])" + r"\s*\.\s*".join(re.escape(p) for p in parts) + r"(?=\s*\.)"
+        else:
+            pattern = rf'(?<![A-Za-z0-9_"]){re.escape(source_key)}(?=\s*\.)'
+        rewritten = re.sub(pattern, mapped, rewritten, flags=re.IGNORECASE)
+
+    return rewritten

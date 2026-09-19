@@ -1,0 +1,84 @@
+[
+  {
+    "operation": "UPDATE",
+    "target_table": "##ACCOUNTCAL",
+    "target_kind": "temp_global",
+    "columns": [
+      "AppGovGur"
+    ],
+    "source_line": 25,
+    "excerpt": "UPDATE  A SET A.AppGovGur =0 FROM ##ACCOUNTCAL A INNER JOIN ##CustomerCal B\r ON A.CustomerEntityID=B.CustomerEntityID\r WHERE B.FlgProcessing='N'\r \t\r \r IF OBJECT",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "temp_staging"
+  },
+  {
+    "operation": "SELECT_INTO",
+    "target_table": "#TEMPTABLEAppGovGur",
+    "target_kind": "temp_local",
+    "columns": [],
+    "source_line": 36,
+    "excerpt": "INTO #TEMPTABLEAppGovGur\r FROM ##ACCOUNTCAL  A\r WHERE A.FacilityType IN('BP','BD')  AND  ISNULL(A.GovtGtyAmt,0) > 0\r \r \r \r UPDATE A SET A.AppGovGur=B.GovGur\r FR",
+    "has_join": true,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "temp_staging"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "##ACCOUNTCAL",
+    "target_kind": "temp_global",
+    "columns": [
+      "AppGovGur"
+    ],
+    "source_line": 42,
+    "excerpt": "UPDATE A SET A.AppGovGur=B.GovGur\r FROM ##ACCOUNTCAL A INNER JOIN #TEMPTABLEAppGovGur B ON A.AccountEntityID=B.AccountEntityID\r WHERE  A.FacilityType IN('BP','B",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "temp_staging"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "##ACCOUNTCAL",
+    "target_kind": "temp_global",
+    "columns": [
+      "AppGovGur"
+    ],
+    "source_line": 47,
+    "excerpt": "UPDATE A SET A.AppGovGur=GovtGtyAmt\r FROM ##ACCOUNTCAL A \r WHERE  NOT (A.FacilityType IN('BP','BD'))\r \t  \r UPDATE PRO.ACLRUNNINGPROCESSSTATUS \r \tSET COMPLETED='",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "temp_staging"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "ACLRUNNINGPROCESSSTATUS",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 51,
+    "excerpt": "UPDATE PRO.ACLRUNNINGPROCESSSTATUS \r \tSET COMPLETED='Y',ERRORDATE=NULL,ERRORDESCRIPTION=NULL,COUNT=ISNULL(COUNT,0)+1\r \tWHERE RUNNINGPROCESSNAME='GovtGuarAppropr",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "ACLRUNNINGPROCESSSTATUS",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 63,
+    "excerpt": "UPDATE PRO.ACLRUNNINGPROCESSSTATUS \r \tSET COMPLETED='N',ERRORDATE=GETDATE(),ERRORDESCRIPTION=ERROR_MESSAGE(),COUNT=ISNULL(COUNT,0)+1\r \tWHERE RUNNINGPROCESSNAME=",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  }
+]

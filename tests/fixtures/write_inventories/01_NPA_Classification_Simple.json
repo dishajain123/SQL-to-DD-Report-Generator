@@ -1,0 +1,100 @@
+[
+  {
+    "operation": "UPDATE",
+    "target_table": "AccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "AssetClass"
+    ],
+    "source_line": 26,
+    "excerpt": "UPDATE A         SET A.AssetClass = (                 CASE                     WHEN A.DaysPastDue <= 90 THEN 'STANDARD'                     WHEN A.DaysPastDue B",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "AccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "NpaFlag"
+    ],
+    "source_line": 39,
+    "excerpt": "UPDATE A         SET A.NpaFlag = (                 CASE                     WHEN A.AssetClass = 'STANDARD' THEN 'N'                     ELSE 'Y'",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "AccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "AddlProvision"
+    ],
+    "source_line": 53,
+    "excerpt": "UPDATE A         SET A.AddlProvision = (A.OutstandingBalance * A.AddlProvisionPer) / 100         FROM PRO.AccountCal A         WHERE A.NpaFlag = 'Y'           A",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "AccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "ClassificationDate"
+    ],
+    "source_line": 60,
+    "excerpt": "UPDATE A         SET A.ClassificationDate = @ProcessDate         FROM PRO.AccountCal A         WHERE A.NpaFlag = 'Y'           AND A.ClassificationDate IS NULL",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "AccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "RestructureReviewFlag"
+    ],
+    "source_line": 67,
+    "excerpt": "UPDATE A         SET A.RestructureReviewFlag = 'Y'         FROM PRO.AccountCal A         WHERE A.DaysPastDue BETWEEN 61 AND 90          UPDATE PRO.RunStatus",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "RunStatus",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 72,
+    "excerpt": "UPDATE PRO.RunStatus         SET COMPLETED = 'Y', ErrorDate = NULL, ErrorDescription = NULL, RunCount = ISNULL(RunCount, 0) + 1         WHERE ProcessName = 'NPA",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "RunStatus",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 79,
+    "excerpt": "UPDATE PRO.RunStatus         SET COMPLETED = 'N', ErrorDate = GETDATE(), ErrorDescription = ERROR_MESSAGE(), RunCount = ISNULL(RunCount, 0) + 1         WHERE Pr",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  }
+]

@@ -1,0 +1,136 @@
+[
+  {
+    "operation": "UPDATE",
+    "target_table": "CustomerRiskProfile",
+    "target_kind": "persistent",
+    "columns": [
+      "UtilizationRatio"
+    ],
+    "source_line": 28,
+    "excerpt": "UPDATE C         SET C.UtilizationRatio = C.CurrentBalance / C.CreditLimit         FROM PRO.CustomerRiskProfile C         WHERE C.CreditLimit IS NOT NULL",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "CustomerRiskProfile",
+    "target_kind": "persistent",
+    "columns": [
+      "RiskScore"
+    ],
+    "source_line": 36,
+    "excerpt": "UPDATE C         SET C.RiskScore =             (ISNULL(C.OverdueDays, 0) * 0.5)             + (ISNULL(C.UtilizationRatio, 0) * 100 * 0.3)             + (ISNULL(",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "CustomerRiskProfile",
+    "target_kind": "persistent",
+    "columns": [
+      "RiskTier"
+    ],
+    "source_line": 44,
+    "excerpt": "UPDATE C         SET C.RiskTier = (                 CASE                     WHEN C.RiskScore < 20 THEN 'LOW'                     WHEN C.RiskScore < 50 THEN 'MO",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "CustomerRiskProfile",
+    "target_kind": "persistent",
+    "columns": [
+      "RecommendedLimitAdjustmentPct"
+    ],
+    "source_line": 60,
+    "excerpt": "UPDATE C             SET C.RecommendedLimitAdjustmentPct =                 CASE                     WHEN C.RiskTier = 'LOW' THEN                         CASE WH",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "CustomerRiskProfile",
+    "target_kind": "persistent",
+    "columns": [
+      "RecommendedLimitAdjustmentPct"
+    ],
+    "source_line": 74,
+    "excerpt": "UPDATE C             SET C.RecommendedLimitAdjustmentPct = 0             FROM PRO.CustomerRiskProfile C         END          IF OBJECT_ID('tempdb..#RiskScoreSta",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "INSERT",
+    "target_table": "#RiskScoreStaging",
+    "target_kind": "temp_local",
+    "columns": [],
+    "source_line": 91,
+    "excerpt": "INSERT INTO #RiskScoreStaging (CustomerId, RiskScore, RiskTier)         SELECT CustomerId, RiskScore, RiskTier         FROM PRO.CustomerRiskProfile         WHER",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "temp_staging"
+  },
+  {
+    "operation": "MERGE",
+    "target_table": "RiskScoreHistory",
+    "target_kind": "persistent",
+    "columns": [],
+    "source_line": 99,
+    "excerpt": "MERGE PRO.RiskScoreHistory AS Target         USING #RiskScoreStaging AS Source         ON Target.CustomerId = Source.CustomerId         WHEN MATCHED THEN",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "set_based_merge"
+  },
+  {
+    "operation": "INSERT",
+    "target_table": "RiskScoreAuditLog",
+    "target_kind": "persistent",
+    "columns": [],
+    "source_line": 113,
+    "excerpt": "INSERT INTO PRO.RiskScoreAuditLog (CustomerId, ScoreDate, RiskScore, RiskTier)         SELECT CustomerId, @ProcessDate, RiskScore, RiskTier         FROM PRO.Cus",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "set_based_insert"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "ACLRUNNINGPROCESSSTATUS",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 119,
+    "excerpt": "UPDATE PRO.ACLRUNNINGPROCESSSTATUS         SET COMPLETED = 'Y', ERRORDATE = NULL, ERRORDESCRIPTION = NULL, COUNT = ISNULL(COUNT, 0) + 1         WHERE RUNNINGPRO",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "ACLRUNNINGPROCESSSTATUS",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 126,
+    "excerpt": "UPDATE PRO.ACLRUNNINGPROCESSSTATUS         SET COMPLETED = 'N', ERRORDATE = GETDATE(), ERRORDESCRIPTION = ERROR_MESSAGE(), COUNT = ISNULL(COUNT, 0) + 1",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  }
+]

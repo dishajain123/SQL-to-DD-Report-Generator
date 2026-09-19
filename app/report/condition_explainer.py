@@ -48,6 +48,13 @@ _ALL_CAPS_PARTS = sorted(
         "REVIEW",
         "RENEWAL",
         "PROCESSING",
+        "PROCESS",
+        "RUNNING",
+        "NAME",
+        "ACCOUNT",
+        "LATE",
+        "FEE",
+        "ASSESSMENT",
         "MAX",
         "MIN",
         "FLG",
@@ -80,12 +87,23 @@ def explain_expression(expression: str) -> str | None:
 
 
 def _normalize_line(text: str) -> str:
+    # Preserve leading indentation so nested outcomes stay under their branch.
+    leading_ws = text[: len(text) - len(text.lstrip(" "))]
     stripped = " ".join(text.split()).strip()
     if not stripped:
         return ""
     if stripped[-1] not in ".!?:":
         stripped += "."
-    return stripped[0].upper() + stripped[1:]
+    # Keep markdown bullets / outcomes lowercase after the marker where needed,
+    # but capitalize the first alphabetic character of the visible sentence.
+    body = stripped
+    prefix = ""
+    if body.startswith("- "):
+        prefix = "- "
+        body = body[2:]
+    if body:
+        body = body[0].upper() + body[1:]
+    return f"{leading_ws}{prefix}{body}"
 
 
 def _unwrap(node):
@@ -106,18 +124,13 @@ def _render_node(node, depth: int) -> list[str]:
     node = _unwrap(node)
     if isinstance(node, Tree) and node.data == "if_expr":
         return _render_if_chain(node, depth)
-    value, note = _render_value_with_note(node)
-    if value == "no value":
-        return [f"{_indent(depth)}- Leave the field blank"]
-    if note:
-        return [f"{_indent(depth)}- Return {value}, {note}"]
-    return [f"{_indent(depth)}- Return {value}"]
+    return _render_outcome(node, depth, bulleted=depth == 0)
 
 
 def _render_if_chain(node: Tree, depth: int) -> list[str]:
     children = list(node.children)
     if len(children) < 2:
-        return [f"{_indent(depth)}- Return the calculated value"]
+        return [f"{_indent(depth)}Return the calculated value"]
 
     condition = children[0]
     then_branch = children[1]
@@ -142,18 +155,24 @@ def _render_branch(prefix: str, condition, branch, depth: int) -> list[str]:
     return lines
 
 
+def _render_outcome(node, depth: int, bulleted: bool = False) -> list[str]:
+    value, note = _render_value_with_note(node)
+    if value == "no value":
+        text = "Leave the field blank"
+    elif note:
+        text = f"Return {value}, {note}"
+    else:
+        text = f"Return {value}"
+    marker = "- " if bulleted else ""
+    return [f"{_indent(depth)}{marker}{text}"]
+
+
 def _render_branch_result(node, depth: int) -> list[str]:
     node = _unwrap(node)
     if isinstance(node, Tree) and node.data == "if_expr":
-        nested = _render_if_chain(node, depth)
-        return nested
-
-    value, note = _render_value_with_note(node)
-    if value == "no value":
-        return [f"{_indent(depth)}- Leave the field blank"]
-    if note:
-        return [f"{_indent(depth)}- Return {value}, {note}"]
-    return [f"{_indent(depth)}- Return {value}"]
+        return _render_if_chain(node, depth)
+    # Leaf outcomes are indented prose under the branch — not another bullet.
+    return _render_outcome(node, depth, bulleted=False)
 
 
 def _render_condition(node) -> str:
@@ -560,10 +579,11 @@ def _render_column_ref(node: Tree) -> str:
         else:
             text = _render_identifier(child)
         if is_string_literal:
+            raw_literal = text
             if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", text):
                 text = _render_name_text(text)
             rendered_parts.append(text)
-            original_parts.append((text, is_string_literal))
+            original_parts.append((raw_literal, is_string_literal))
             continue
         text = text.strip()
         if text:
@@ -659,6 +679,9 @@ def _render_literal_text(text: str) -> str:
     upper = text.upper()
     if upper in mapping:
         return mapping[upper]
+    # Keep coded procedure / status identifiers readable and exact.
+    if "_" in text and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", text):
+        return f'"{text}"'
     return _render_name_text(text)
 
 

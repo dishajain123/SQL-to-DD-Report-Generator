@@ -13,6 +13,9 @@ ELSE(Condition1...ConditionN)
 ### Commonly used
 - `ISEMPTY(<ColumnName>)`
 - `MAX(<ColumnName>, [<GroupbyColumns>])`
+- `MIN(<ColumnName>, [<GroupbyColumns>])`
+- `SUM(<ColumnName>)`
+- `COUNT(<ColumnName/Value>)` — use `COUNT(1)` for row counts
 - `COALESCE(<ColumnName/Value>,<Default value if column is null>)`
 
 ### Text
@@ -51,8 +54,8 @@ ELSE(Condition1...ConditionN)
 ## Operators
 
 ### Logical
-- `AND(<Condition1>,<Condition2>...<ConditionN>)`
-- `OR(<Condition1>,<Condition2>...<ConditionN>)`
+- Infix: `Condition1 AND Condition2`, `Condition1 OR Condition2`
+- Function form: `AND(<Condition1>,<Condition2>...<ConditionN>)`, `OR(<Condition1>,<Condition2>...<ConditionN>)`
 - `NOT(<Condition>)`
 
 ### Membership / matching

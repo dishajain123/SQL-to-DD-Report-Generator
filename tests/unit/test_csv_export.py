@@ -1,7 +1,7 @@
 from datetime import date
 import csv
 
-from app.models.core import ColumnType, DDRow, DDStatus, DerivationOption
+from app.models.core import ColumnType, DDRow, DDStatus, DerivationOption, ReviewState
 from app.report.dd_export import COLUMNS, export_dd_rows, read_existing_dd_excel
 
 
@@ -42,7 +42,7 @@ def test_export_writes_row_data(tmp_path):
     assert rows[0]["Display Derivation Expression"] == row.display_derivation_expression
 
 
-def test_export_handles_decision_table_rows(tmp_path):
+def test_export_withholds_decision_table_without_display_expression(tmp_path):
     row = _sample_row(
         derivation_option=DerivationOption.DECISION_TABLE,
         display_derivation_expression="",
@@ -50,7 +50,13 @@ def test_export_handles_decision_table_rows(tmp_path):
     )
     out = export_dd_rows([row], tmp_path / "dd.csv")
     rows = _read_csv(out)
-    assert rows[0]["Decision Table Json"] == row.decision_table_json
+    assert rows == []
+
+
+def test_export_withholds_unsupported_row_even_with_candidate_expression(tmp_path):
+    row = _sample_row(review_state=ReviewState.UNSUPPORTED)
+    out = export_dd_rows([row], tmp_path / "dd.csv")
+    assert _read_csv(out) == []
 
 
 def test_merge_preserves_unrelated_existing_rows(tmp_path):

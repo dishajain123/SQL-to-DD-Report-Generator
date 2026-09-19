@@ -1,0 +1,121 @@
+[
+  {
+    "operation": "INSERT",
+    "target_table": "#ReconciliationResults",
+    "target_kind": "temp_local",
+    "columns": [],
+    "source_line": 46,
+    "excerpt": "INSERT INTO #ReconciliationResults (FeedName, Outcome, ShortfallPct, SeverityTier, ReconciledOn)         SELECT             FeedName,             CASE",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "temp_staging"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "BatchFeedRegistry",
+    "target_kind": "persistent",
+    "columns": [
+      "RetryCount",
+      "SeverityTier"
+    ],
+    "source_line": 70,
+    "excerpt": "UPDATE PRO.BatchFeedRegistry         SET RetryCount = 1         WHERE FeedDate = @ProcessDate           AND FeedName IN (SELECT FeedName FROM #ReconciliationRes",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": true,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "#ReconciliationResults",
+    "target_kind": "temp_local",
+    "columns": [
+      "SeverityTier"
+    ],
+    "source_line": 77,
+    "excerpt": "UPDATE R         SET R.SeverityTier = (                 CASE                     WHEN R.Outcome = 'RECONCILED' THEN 'NONE'                     WHEN R.Outcome =",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "temp_staging"
+  },
+  {
+    "operation": "MERGE",
+    "target_table": "BatchReconciliationSummary",
+    "target_kind": "persistent",
+    "columns": [],
+    "source_line": 93,
+    "excerpt": "MERGE PRO.BatchReconciliationSummary AS Target         USING #ReconciliationResults AS Source         ON Target.FeedName = Source.FeedName         WHEN MATCHED",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "set_based_merge"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "BatchReconciliationSummary",
+    "target_kind": "persistent",
+    "columns": [
+      "SeverityTier"
+    ],
+    "source_line": 109,
+    "excerpt": "UPDATE T         SET T.SeverityTier = 'CRITICAL'         FROM PRO.BatchReconciliationSummary T         WHERE T.Outcome <> 'RECONCILED'           AND T.FirstReco",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "INSERT",
+    "target_table": "BatchReconciliationLog",
+    "target_kind": "persistent",
+    "columns": [],
+    "source_line": 117,
+    "excerpt": "INSERT INTO PRO.BatchReconciliationLog (FeedName, Outcome, ReconciledOn)         SELECT R.FeedName, R.Outcome, R.ReconciledOn         FROM #ReconciliationResult",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "set_based_insert"
+  },
+  {
+    "operation": "INSERT",
+    "target_table": "CollectionsQueue",
+    "target_kind": "persistent",
+    "columns": [],
+    "source_line": 123,
+    "excerpt": "INSERT INTO PRO.CollectionsQueue (AccountId, EscalationDate, Reason)         SELECT FeedName, ReconciledOn,                CASE WHEN SeverityTier = 'CRITICAL' T",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "set_based_insert"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "ACLRUNNINGPROCESSSTATUS",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 129,
+    "excerpt": "UPDATE PRO.ACLRUNNINGPROCESSSTATUS         SET COMPLETED = 'Y', ERRORDATE = NULL, ERRORDESCRIPTION = NULL, COUNT = ISNULL(COUNT, 0) + 1         WHERE RUNNINGPRO",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "ACLRUNNINGPROCESSSTATUS",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 136,
+    "excerpt": "UPDATE PRO.ACLRUNNINGPROCESSSTATUS         SET COMPLETED = 'N', ERRORDATE = GETDATE(), ERRORDESCRIPTION = ERROR_MESSAGE(), COUNT = ISNULL(COUNT, 0) + 1",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  }
+]

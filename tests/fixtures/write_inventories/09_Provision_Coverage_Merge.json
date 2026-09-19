@@ -1,0 +1,136 @@
+[
+  {
+    "operation": "INSERT",
+    "target_table": "#ProvisionCoverage",
+    "target_kind": "temp_local",
+    "columns": [],
+    "source_line": 40,
+    "excerpt": "INSERT INTO #ProvisionCoverage (AccountId, OutstandingBalance, ProvisionAmount, CoverageRatio, ReviewReason)         SELECT A.AccountId,                A.Outsta",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "temp_staging"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "#ProvisionCoverage",
+    "target_kind": "temp_local",
+    "columns": [
+      "ReviewReason"
+    ],
+    "source_line": 54,
+    "excerpt": "UPDATE S         SET S.ReviewReason = (                 CASE                     WHEN S.CoverageRatio IS NULL THEN 'NO_BALANCE'                     WHEN S.Cover",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "temp_staging"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "#ProvisionCoverage",
+    "target_kind": "temp_local",
+    "columns": [
+      "ReviewReason"
+    ],
+    "source_line": 70,
+    "excerpt": "UPDATE S SET S.ReviewReason = S.ReviewReason + '_QUARTER_END'             FROM #ProvisionCoverage S             WHERE S.CoverageRatio IS NOT NULL AND S.Coverage",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "temp_staging"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "#ProvisionCoverage",
+    "target_kind": "temp_local",
+    "columns": [
+      "ReviewReason"
+    ],
+    "source_line": 76,
+    "excerpt": "UPDATE S SET S.ReviewReason = S.ReviewReason             FROM #ProvisionCoverage S             WHERE S.CoverageRatio IS NOT NULL AND S.CoverageRatio < 0.5",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "temp_staging"
+  },
+  {
+    "operation": "MERGE",
+    "target_table": "ProvisionCoverageSummary",
+    "target_kind": "persistent",
+    "columns": [],
+    "source_line": 84,
+    "excerpt": "MERGE PRO.ProvisionCoverageSummary AS Target         USING #ProvisionCoverage AS Source         ON Target.AccountId = Source.AccountId         WHEN MATCHED THEN",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "set_based_merge"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "ProvisionCoverageSummary",
+    "target_kind": "persistent",
+    "columns": [
+      "BelowThresholdFlag"
+    ],
+    "source_line": 99,
+    "excerpt": "UPDATE T         SET T.BelowThresholdFlag = 'Y'         FROM PRO.ProvisionCoverageSummary T         WHERE T.CoverageRatio IS NOT NULL           AND T.CoverageRa",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "ProvisionCoverageSummary",
+    "target_kind": "persistent",
+    "columns": [
+      "BelowThresholdFlag"
+    ],
+    "source_line": 108,
+    "excerpt": "UPDATE T         SET T.BelowThresholdFlag = 'N'         FROM PRO.ProvisionCoverageSummary T         WHERE T.CoverageRatio >= 0.5           AND T.LastUpdatedDate",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "INSERT",
+    "target_table": "CollectionsQueue",
+    "target_kind": "persistent",
+    "columns": [],
+    "source_line": 117,
+    "excerpt": "INSERT INTO PRO.CollectionsQueue (AccountId, EscalationDate, Reason)         SELECT AccountId, @ProcessDate,                CASE WHEN CoverageRatio < 0.25 THEN",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "set_based_insert"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "ACLRUNNINGPROCESSSTATUS",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 124,
+    "excerpt": "UPDATE PRO.ACLRUNNINGPROCESSSTATUS         SET COMPLETED = 'Y', ERRORDATE = NULL, ERRORDESCRIPTION = NULL, COUNT = ISNULL(COUNT, 0) + 1         WHERE RUNNINGPRO",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "ACLRUNNINGPROCESSSTATUS",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 131,
+    "excerpt": "UPDATE PRO.ACLRUNNINGPROCESSSTATUS         SET COMPLETED = 'N', ERRORDATE = GETDATE(), ERRORDESCRIPTION = ERROR_MESSAGE(), COUNT = ISNULL(COUNT, 0) + 1",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  }
+]

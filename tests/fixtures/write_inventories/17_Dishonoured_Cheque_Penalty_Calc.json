@@ -1,0 +1,161 @@
+[
+  {
+    "operation": "UPDATE",
+    "target_table": "DishonouredCheque",
+    "target_kind": "persistent",
+    "columns": [
+      "PenaltyAmount"
+    ],
+    "source_line": 29,
+    "excerpt": "UPDATE D         SET D.PenaltyAmount = (                 CASE                     WHEN D.DishonourReason IS NULL THEN NULL                     WHEN D.RepeatCoun",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "DishonouredCheque",
+    "target_kind": "persistent",
+    "columns": [
+      "HoldForReview"
+    ],
+    "source_line": 44,
+    "excerpt": "UPDATE D         SET D.HoldForReview = 'Y'         FROM PRO.DishonouredCheque D         WHERE D.DishonourDate = @ProcessDate           AND D.DishonourReason IS",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "LoanAccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "OutstandingBalance"
+    ],
+    "source_line": 52,
+    "excerpt": "UPDATE A         SET A.OutstandingBalance = ISNULL(A.OutstandingBalance, 0) + D.PenaltyAmount         FROM PRO.LoanAccountCal A         INNER JOIN PRO.Dishonour",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "DishonouredCheque",
+    "target_kind": "persistent",
+    "columns": [
+      "PenaltyApplied"
+    ],
+    "source_line": 59,
+    "excerpt": "UPDATE D         SET D.PenaltyApplied = 'Y'         FROM PRO.DishonouredCheque D         WHERE D.DishonourDate = @ProcessDate           AND D.PenaltyAmount IS N",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "INSERT",
+    "target_table": "#PenaltyStaging",
+    "target_kind": "temp_local",
+    "columns": [],
+    "source_line": 77,
+    "excerpt": "INSERT INTO #PenaltyStaging (AccountId, PenaltyAmount, DishonourCount)         SELECT D.AccountId, D.PenaltyAmount,                (SELECT COUNT(*) FROM PRO.Dis",
+    "has_join": false,
+    "has_aggregate_or_window": true,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "temp_staging"
+  },
+  {
+    "operation": "MERGE",
+    "target_table": "ChequePenaltyLedger",
+    "target_kind": "persistent",
+    "columns": [],
+    "source_line": 88,
+    "excerpt": "MERGE PRO.ChequePenaltyLedger AS Target         USING #PenaltyStaging AS Source         ON Target.AccountId = Source.AccountId         WHEN MATCHED THEN",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "set_based_merge"
+  },
+  {
+    "operation": "SELECT_INTO",
+    "target_table": "#NewSuspensions",
+    "target_kind": "temp_local",
+    "columns": [],
+    "source_line": 107,
+    "excerpt": "INTO #NewSuspensions         FROM #PenaltyStaging P         INNER JOIN PRO.LoanAccountCal A ON A.AccountId = P.AccountId         WHERE P.DishonourCount >= 3",
+    "has_join": true,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": true,
+    "expected_output_type": "temp_staging"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "LoanAccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "ChequeBookSuspended",
+      "COMPLETED"
+    ],
+    "source_line": 115,
+    "excerpt": "UPDATE PRO.LoanAccountCal         SET ChequeBookSuspended = 'Y'         WHERE AccountId IN (SELECT AccountId FROM #NewSuspensions)          INSERT INTO PRO.Acco",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": true,
+    "expected_output_type": "procedure_or_exists"
+  },
+  {
+    "operation": "INSERT",
+    "target_table": "AccountStatusAuditLog",
+    "target_kind": "persistent",
+    "columns": [],
+    "source_line": 119,
+    "excerpt": "INSERT INTO PRO.AccountStatusAuditLog (AccountId, TransitionDate, NewStatus, Reason)         SELECT AccountId, @ProcessDate, 'CHEQUE_BOOK_SUSPENDED', 'REPEAT_DI",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": true,
+    "expected_output_type": "set_based_insert"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "ACLRUNNINGPROCESSSTATUS",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 123,
+    "excerpt": "UPDATE PRO.ACLRUNNINGPROCESSSTATUS         SET COMPLETED = 'Y', ERRORDATE = NULL, ERRORDESCRIPTION = NULL, COUNT = ISNULL(COUNT, 0) + 1         WHERE RUNNINGPRO",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": true,
+    "expected_output_type": "process_status"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "ACLRUNNINGPROCESSSTATUS",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 134,
+    "excerpt": "UPDATE PRO.ACLRUNNINGPROCESSSTATUS             SET COMPLETED = 'N', ERRORDATE = GETDATE(), ERRORDESCRIPTION = ERROR_MESSAGE(), COUNT = ISNULL(COUNT, 0) + 1",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  },
+  {
+    "operation": "INSERT",
+    "target_table": "ACLRUNNINGPROCESSSTATUS",
+    "target_kind": "persistent",
+    "columns": [],
+    "source_line": 140,
+    "excerpt": "INSERT INTO PRO.ACLRUNNINGPROCESSSTATUS (RUNNINGPROCESSNAME, COMPLETED, ERRORDATE, ERRORDESCRIPTION, COUNT)             VALUES ('Dishonoured_Cheque_Penalty_Calc",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  }
+]

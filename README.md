@@ -56,9 +56,12 @@ If you want to run the LLM-backed steps for real, set these in `.env` before
 starting the app:
 
 ```env
-LLM_PROVIDER=auto
-LLM_API_KEY=your_real_key_here
-LLM_MODEL_NAME=gpt-4.1
+LLM_PROVIDER=bedrock
+GPT_MODEL=bedrock/amazon.nova-lite-v1:0
+AWS_ACCESS_KEY_ID=your_access_key_id
+AWS_SECRET_ACCESS_KEY=your_secret_access_key
+AWS_DEFAULT_REGION=us-east-1
+LLM_SYNTHESIS_MAX_TOKENS=8192
 ```
 
 ## Run Backend
@@ -127,9 +130,12 @@ DEFAULT_PLATFORM_NAME=4X
 DEFAULT_INTENT=Generate DD
 DEFAULT_FUNCTION_REFERENCE_PATH=samples/platform_docs/4x_functions_operators.md
 DEFAULT_ENTITY_NAME_MAP_JSON={}
-LLM_PROVIDER=auto
-LLM_API_KEY=your_real_key_here
-LLM_MODEL_NAME=gpt-4.1
+LLM_PROVIDER=bedrock
+GPT_MODEL=bedrock/amazon.nova-lite-v1:0
+AWS_ACCESS_KEY_ID=your_access_key_id
+AWS_SECRET_ACCESS_KEY=your_secret_access_key
+AWS_DEFAULT_REGION=us-east-1
+LLM_SYNTHESIS_MAX_TOKENS=8192
 ```
 
 ## Run Check
@@ -163,9 +169,11 @@ All configuration is environment variables (loaded from `.env` via
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `LLM_PROVIDER` | `auto` | Chooses `openai` or `groq`. `auto` infers it from `LLM_MODEL_NAME` or `LLM_BASE_URL`. |
+| `LLM_PROVIDER` | `auto` | Chooses `openai`, `groq`, or `bedrock`. `auto` infers it from the model or base URL. |
 | `LLM_API_KEY` | (empty) | API key for the selected provider. |
-| `LLM_MODEL_NAME` | provider-specific | Primary model used for reasoning/DD generation. |
+| `GPT_MODEL` / `LLM_MODEL_NAME` | provider-specific | Primary model; `GPT_MODEL` takes precedence. For Bedrock, use `bedrock/amazon.nova-lite-v1:0`. |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION` | AWS SDK defaults | Bedrock authentication and region. |
+| `LLM_SYNTHESIS_MAX_TOKENS` | `1024` | DD formula token limit; Nova Lite requests are capped at its 5K output limit. |
 | `LLM_BASE_URL` | provider-specific | Override for the provider's chat-completions endpoint. |
 | `CHROMA_PERSIST_DIR` | `.chroma` | Where the RAG vector store persists to disk. |
 | `SQLITE_DB_PATH` | `dd_automation.db` | Job history / DD rows / review decisions / audit log. |
@@ -173,9 +181,8 @@ All configuration is environment variables (loaded from `.env` via
 | `STRUCTURAL_CONFIDENCE_THRESHOLD` | `0.5` | Below this, Structural Guardrails fail an object. |
 | `OUTPUT_GUARDRAIL_CONFIDENCE_THRESHOLD` | `0.7` | Below this, a DD row is flagged for review. |
 
-If you want to override the model, set `LLM_MODEL_NAME` in `.env`. If you
-want to switch providers, change `LLM_PROVIDER` and the matching key / base
-URL. The app will pick up the new values on restart.
+Set `GPT_MODEL` or `LLM_MODEL_NAME` in `.env` to override the model. Bedrock uses
+the AWS SDK credential chain; the app picks up changes on restart.
 
 ## LLM setup and output check
 
@@ -187,7 +194,7 @@ python3 scripts/run_groq_smoke.py
 
 What it does:
 
-1. Checks whether `LLM_API_KEY` is present in your environment.
+1. Checks whether API credentials are configured for non-Bedrock providers.
 2. Runs the technical reasoning step and prints the summary.
 3. Runs the business reasoning step and prints the summary.
 4. Runs DD formula generation and prints the final expression text.
@@ -296,6 +303,18 @@ If you want the shortest reliable path from clone to working app:
 7. Optional: `python3 scripts/run_groq_smoke.py`
 
 ## GitHub Ready Notes
+
+For the bundled SQL regression corpus, run
+`.venv/bin/python -m scripts.generate_sample_dd_demo` to create
+`output/demo_01_to_18/`. Each sample has a platform CSV/XLSX, a business
+`report.md`, and a `qa_coverage_report.md`. Grammar-valid composed formulas
+are exported as ACTIVE; coverage caveats (MERGE / procedure branch / temp
+staging) appear as advisory notes and in the QA ledger. The same entity-name
+defaults and coverage rules are used by the live API/Streamlit pipeline, so a
+live run of samples 01–18 matches this demo shape. Run
+`.venv/bin/python -m scripts.release_gate_samples_01_18` before presenting
+the corpus. It exits nonzero while any sample has unresolved coverage,
+function, or source-anomaly blockers.
 
 - Keep `.env` local; only commit `.env.example`.
 - If you need to change the company/platform the UI submits under, update

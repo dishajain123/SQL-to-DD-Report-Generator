@@ -1,0 +1,136 @@
+[
+  {
+    "operation": "UPDATE",
+    "target_table": "LoanAccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "DaysSinceLastAccrual"
+    ],
+    "source_line": 28,
+    "excerpt": "UPDATE A         SET A.DaysSinceLastAccrual = (                 CASE                     WHEN A.LastAccrualDate IS NULL THEN 1                     ELSE DATEDIFF",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "LoanAccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "EffectiveInterestRate"
+    ],
+    "source_line": 43,
+    "excerpt": "UPDATE A             SET A.EffectiveInterestRate = A.BaseInterestRate - 0.02             FROM PRO.LoanAccountCal A             WHERE A.AccountStatus = 'ACTIVE'",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "LoanAccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "EffectiveInterestRate"
+    ],
+    "source_line": 50,
+    "excerpt": "UPDATE A             SET A.EffectiveInterestRate = A.BaseInterestRate             FROM PRO.LoanAccountCal A             WHERE A.AccountStatus = 'ACTIVE'",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "LoanAccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "EffectiveInterestRate"
+    ],
+    "source_line": 59,
+    "excerpt": "UPDATE A             SET A.EffectiveInterestRate = A.BaseInterestRate             FROM PRO.LoanAccountCal A             WHERE A.AccountStatus = 'ACTIVE'",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "INSERT",
+    "target_table": "#AccrualStaging",
+    "target_kind": "temp_local",
+    "columns": [],
+    "source_line": 77,
+    "excerpt": "INSERT INTO #AccrualStaging (AccountId, AccruedInterestAmount, AccrualTier)         SELECT A.AccountId,                (A.OutstandingBalance * A.EffectiveIntere",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "temp_staging"
+  },
+  {
+    "operation": "MERGE",
+    "target_table": "InterestAccrualLedger",
+    "target_kind": "persistent",
+    "columns": [],
+    "source_line": 92,
+    "excerpt": "MERGE PRO.InterestAccrualLedger AS Target         USING #AccrualStaging AS Source         ON Target.AccountId = Source.AccountId         WHEN MATCHED THEN",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "set_based_merge"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "LoanAccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "OutstandingBalance"
+    ],
+    "source_line": 106,
+    "excerpt": "UPDATE A         SET A.OutstandingBalance = A.OutstandingBalance + ISNULL(S.AccruedInterestAmount, 0),             A.LastAccrualDate = @ProcessDate         FROM",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "INSERT",
+    "target_table": "CollateralReview",
+    "target_kind": "persistent",
+    "columns": [],
+    "source_line": 114,
+    "excerpt": "INSERT INTO PRO.CollateralReview (AccountId, ReviewDate, ShortfallAmount)         SELECT AccountId, @ProcessDate, AccruedInterestAmount         FROM #AccrualSta",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "set_based_insert"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "ACLRUNNINGPROCESSSTATUS",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 119,
+    "excerpt": "UPDATE PRO.ACLRUNNINGPROCESSSTATUS         SET COMPLETED = 'Y', ERRORDATE = NULL, ERRORDESCRIPTION = NULL, COUNT = ISNULL(COUNT, 0) + 1         WHERE RUNNINGPRO",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "ACLRUNNINGPROCESSSTATUS",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 126,
+    "excerpt": "UPDATE PRO.ACLRUNNINGPROCESSSTATUS         SET COMPLETED = 'N', ERRORDATE = GETDATE(), ERRORDESCRIPTION = ERROR_MESSAGE(), COUNT = ISNULL(COUNT, 0) + 1",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  }
+]

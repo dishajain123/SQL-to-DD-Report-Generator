@@ -1,0 +1,165 @@
+[
+  {
+    "operation": "UPDATE",
+    "target_table": "LoanAccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "CoverRequestedAmount"
+    ],
+    "source_line": 30,
+    "excerpt": "UPDATE A         SET A.CoverRequestedAmount = NULL,             A.CoverShortfallFlag = 'N'         FROM PRO.LoanAccountCal A         WHERE A.GuaranteeCoveredFla",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "LoanAccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "CoverRequestedAmount"
+    ],
+    "source_line": 39,
+    "excerpt": "UPDATE A         SET A.CoverRequestedAmount = A.ProvisionAmount         FROM PRO.LoanAccountCal A         WHERE A.GuaranteeCoveredFlag = 'Y'           AND A.Pro",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "LoanAccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "CoverAppropriatedAmount"
+    ],
+    "source_line": 50,
+    "excerpt": "UPDATE A             SET A.CoverAppropriatedAmount = 0,                 A.CoverShortfallFlag = 'Y'             FROM PRO.LoanAccountCal A             WHERE A.Gua",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "LoanAccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "CoverAppropriatedAmount"
+    ],
+    "source_line": 62,
+    "excerpt": "UPDATE A             SET A.CoverAppropriatedAmount =                 CASE                     WHEN A.AssetClass IN ('DOUBTFUL', 'LOSS') THEN",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "LoanAccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "CoverAppropriatedAmount"
+    ],
+    "source_line": 85,
+    "excerpt": "UPDATE A             SET A.CoverAppropriatedAmount = 0,                 A.CoverShortfallFlag = 'Y'             FROM PRO.LoanAccountCal A             WHERE A.Gua",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "LoanAccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "NetProvisionAfterCover"
+    ],
+    "source_line": 94,
+    "excerpt": "UPDATE A         SET A.NetProvisionAfterCover = A.ProvisionAmount - ISNULL(A.CoverAppropriatedAmount, 0)         FROM PRO.LoanAccountCal A         WHERE A.Guara",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "INSERT",
+    "target_table": "#CoverLedgerStaging",
+    "target_kind": "temp_local",
+    "columns": [],
+    "source_line": 111,
+    "excerpt": "INSERT INTO #CoverLedgerStaging (AccountId, CoverAppropriatedAmount, NetProvisionAfterCover)         SELECT AccountId, CoverAppropriatedAmount, NetProvisionAfte",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "temp_staging"
+  },
+  {
+    "operation": "MERGE",
+    "target_table": "GuaranteeCoverLedger",
+    "target_kind": "persistent",
+    "columns": [],
+    "source_line": 119,
+    "excerpt": "MERGE PRO.GuaranteeCoverLedger AS Target         USING #CoverLedgerStaging AS Source         ON Target.AccountId = Source.AccountId         WHEN MATCHED THEN",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "set_based_merge"
+  },
+  {
+    "operation": "INSERT",
+    "target_table": "CollectionsQueue",
+    "target_kind": "persistent",
+    "columns": [],
+    "source_line": 132,
+    "excerpt": "INSERT INTO PRO.CollectionsQueue (AccountId, EscalationDate, Reason)         SELECT AccountId, @ProcessDate, 'GUARANTEE_COVER_SHORTFALL'         FROM PRO.LoanAc",
+    "has_join": false,
+    "has_aggregate_or_window": true,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "set_based_insert"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "GuaranteeFund",
+    "target_kind": "persistent",
+    "columns": [
+      "AvailableBalance",
+      "COMPLETED"
+    ],
+    "source_line": 139,
+    "excerpt": "UPDATE PRO.GuaranteeFund         SET AvailableBalance = @AvailableCoverBalance - (                 SELECT ISNULL(SUM(CoverAppropriatedAmount), 0)",
+    "has_join": false,
+    "has_aggregate_or_window": true,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "ACLRUNNINGPROCESSSTATUS",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 148,
+    "excerpt": "UPDATE PRO.ACLRUNNINGPROCESSSTATUS         SET COMPLETED = 'Y', ERRORDATE = NULL, ERRORDESCRIPTION = NULL, COUNT = ISNULL(COUNT, 0) + 1         WHERE RUNNINGPRO",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "ACLRUNNINGPROCESSSTATUS",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 155,
+    "excerpt": "UPDATE PRO.ACLRUNNINGPROCESSSTATUS         SET COMPLETED = 'N', ERRORDATE = GETDATE(), ERRORDESCRIPTION = ERROR_MESSAGE(), COUNT = ISNULL(COUNT, 0) + 1",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  }
+]

@@ -1,0 +1,100 @@
+[
+  {
+    "operation": "UPDATE",
+    "target_table": "AccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "SmaStage"
+    ],
+    "source_line": 25,
+    "excerpt": "UPDATE A         SET A.SmaStage = (                 CASE                     WHEN A.OverdueDays BETWEEN 1 AND 30 THEN 'SMA_0'                     WHEN A.Overdue",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "AccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "FlagSma"
+    ],
+    "source_line": 38,
+    "excerpt": "UPDATE A         SET A.FlagSma = (                 CASE                     WHEN A.SmaStage IS NOT NULL THEN 'Y'                     ELSE 'N'                 EN",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "AccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "SmaReason"
+    ],
+    "source_line": 48,
+    "excerpt": "UPDATE A         SET A.SmaReason = (                 CASE                     WHEN A.FacilityType IN ('CC', 'OD') THEN 'CASH CREDIT / OVERDRAFT OVERDUE'",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "AccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "SmaStageDate"
+    ],
+    "source_line": 62,
+    "excerpt": "UPDATE A         SET A.SmaStageDate = DATEADD(DAY, -A.OverdueDays + 1, @ProcessDate)         FROM PRO.AccountCal A         WHERE A.FlagSma = 'Y'          -- Rul",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "AccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "SmaStage"
+    ],
+    "source_line": 68,
+    "excerpt": "UPDATE A         SET A.SmaStage = NULL,             A.FlagSma = 'N',             A.SmaReason = NULL         FROM PRO.AccountCal A         WHERE A.OverdueDays =",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "RunStatus",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 75,
+    "excerpt": "UPDATE PRO.RunStatus         SET COMPLETED = 'Y', ErrorDate = NULL, ErrorDescription = NULL, RunCount = ISNULL(RunCount, 0) + 1         WHERE ProcessName = 'SMA",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "RunStatus",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 82,
+    "excerpt": "UPDATE PRO.RunStatus         SET COMPLETED = 'N', ErrorDate = GETDATE(), ErrorDescription = ERROR_MESSAGE(), RunCount = ISNULL(RunCount, 0) + 1         WHERE Pr",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  }
+]

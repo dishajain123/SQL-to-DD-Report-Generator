@@ -1,31 +1,14 @@
 """Architecture step 17: Report Generator -> Combined Report.
 
-The report is presentation-focused and intentionally avoids embedding the
-full source SQL. It organizes DD output into a fixed narrative structure
-so reviewers can understand the process, the platform syntax, the business
-logic, and the column-level derivations without losing the exact platform
-formula text or the traceability metadata needed for review.
+Presentation-focused business report. Structure:
 
-Structure:
-  1. A one-line plain-English summary + a "How to Read a Condition" legend
-     + an optional Glossary -- all aimed at a non-technical reader before
-     anything technical appears.
-  2. Process Overview -- process/company/platform/intent, the canonical
-     model's own technical/business narrative, and a deterministic Tables
-     Read / Tables Written breakdown built from StructuralInfo (not the
-     LLM), so this is always available even if the LLM summary is thin.
-  3. Rule Summary -- a compact, scannable table (no formulas) with anchor
-     links into the detail cards below, so a reviewer can jump straight to
-     the one rule they care about instead of scrolling a giant table.
-  4. Detailed Business Rules & DD Conditions -- one card per rule, grouped
-     by target table, each showing the exact platform condition
-     alongside a deterministic plain-English explanation derived from
-     the same parsed logic.
-
-There is no separate "Business Rules / Logic Explanation" section
-duplicating the same explanation already shown per rule in the cards, and
-no "Process Control & Traceability" section -- pending-review reasons are
-inlined directly on the row/card they belong to instead.
+  1. At a Glance metadata (procedure, dialect, inputs, table counts)
+  2. One-line summary + How to Read a Condition + optional Glossary
+  3. Process Overview — What This Does, Process Flow, and one combined
+     Tables Involved table (read / written / both)
+  4. Business Rule Summary — Rule | Affected Field | Business Purpose
+  5. Detailed Business Rules & DD Conditions — per rule: table, column,
+     platform condition, plain-English explanation (no status noise)
 """
 from __future__ import annotations
 
@@ -38,6 +21,7 @@ from lark import Lark, Tree, Token
 
 from app.models.core import CanonicalModel, DDRow, Dialect, JobPlan, SQLObject, StructuralInfo
 from app.report.condition_explainer import explain_expression
+from app.report.process_metadata import build_at_a_glance_lines
 from app.utils.identity import canonical_expression_key, canonical_logical_name
 from app.utils.sql_aliases import (
     collect_known_reference_names,
@@ -526,14 +510,18 @@ def _row_known_reference_names(row: DDRow, objects: dict[str, SQLObject]) -> fro
 
 
 def _build_rule_groups(dd_rows: list[DDRow], objects: dict[str, SQLObject]) -> list[_RuleGroup]:
+    from app.derivation.dd_generation_engine import _should_omit_dd_row_from_presentation
+
     grouped_rows = _group_dd_rows_for_report(dd_rows)
     rule_groups: list[_RuleGroup] = []
     counter = 1
     for rows in grouped_rows:
         first = rows[0]
+        formula = first.display_derivation_expression or ""
+        if _should_omit_dd_row_from_presentation(formula):
+            continue
         rule_id = f"BR-{counter:03d}"
         counter += 1
-        formula = first.display_derivation_expression or ""
         alias_map = _row_alias_map(first, objects)
         if alias_map:
             formula = resolve_aliases_in_expression(formula, alias_map, quote_replacements=True)
@@ -578,15 +566,12 @@ def _human_readable_explanation(rule: _RuleGroup) -> str:
     return "This platform condition could not be rendered safely in plain English, but the exact machine-readable condition is preserved above."
 
 
-def _tables_read_written_lines(
+def _tables_involved_lines(
     canonical_models: list[CanonicalModel],
     objects: dict[str, SQLObject],
     structural_infos: dict[str, StructuralInfo] | None,
 ) -> list[str]:
-    """Deterministic Tables Read / Tables Written tables built directly
-    from StructuralInfo -- not the LLM -- so this is always available
-    (and always accurate to what was actually parsed) regardless of how
-    detailed the canonical model's own narrative summary happens to be."""
+    """One combined table of relations touched by the process."""
     if not structural_infos:
         return []
 
@@ -600,6 +585,7 @@ def _tables_read_written_lines(
 
     read_by_table: dict[str, set[str]] = defaultdict(set)
     written_by_table: dict[str, set[str]] = defaultdict(set)
+    insert_column_names: set[str] = set()
     for oid in object_ids:
         info = structural_infos.get(oid)
         if info is None:
@@ -609,26 +595,251 @@ def _tables_read_written_lines(
             read_by_table[table].add(object_name)
         for table, columns in info.columns_written_by_table.items():
             written_by_table[table].update(columns)
+        for stmt in info.statements or []:
+            raw = stmt.raw_text or ""
+            for match in re.finditer(
+                r"(?is)\bINSERT\s*(?:\s+INTO\s+[A-Za-z0-9_#\.\"]+)?\s*\(([^)]+)\)",
+                raw,
+            ):
+                for part in match.group(1).split(","):
+                    token = part.strip().strip('"').split(".")[-1]
+                    if token and re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", token):
+                        insert_column_names.add(token)
+            for match in re.finditer(
+                r"(?is)\b(?:INSERT\s+INTO|MERGE\s+INTO|MERGE|DELETE\s+FROM)\s+([A-Za-z0-9_#\.\"]+)",
+                raw,
+            ):
+                token = match.group(1).strip().strip('"')
+                bare = token.split(".")[-1]
+                if not bare or bare.upper() in {"SET", "SELECT", "VALUES", "INTO"}:
+                    continue
+                # Skip single-letter aliases (UPDATE A / USING S).
+                if len(bare) == 1:
+                    continue
+                written_by_table.setdefault(bare, set())
+                if stmt.set_columns_by_table:
+                    written_by_table[bare].update(stmt.set_columns_by_table.get(bare, []))
 
-    lines: list[str] = []
-    if read_by_table:
-        lines.append("### Tables Read")
-        lines.append("")
-        lines.append("| Table | Read By |")
-        lines.append("|---|---|")
-        for table in sorted(read_by_table):
-            lines.append(f"| {table} | {', '.join(sorted(read_by_table[table]))} |")
-        lines.append("")
+    written_column_names = {
+        col.split(".")[-1]
+        for cols in written_by_table.values()
+        for col in cols
+        if col
+    } | insert_column_names
+    all_tables = sorted(set(read_by_table) | set(written_by_table))
+    # Drop SELECT-list / INSERT-list column tokens that structural analysis
+    # sometimes mislabels as tables (e.g. LateFee, AccountId).
+    filtered_tables: list[str] = []
+    for table in all_tables:
+        bare = table.split(".")[-1]
+        is_written = table in written_by_table
+        looks_like_column = (
+            bare in written_column_names
+            and "." not in table
+            and not bare.startswith("#")
+            and not is_written
+        )
+        if looks_like_column:
+            continue
+        filtered_tables.append(table)
+    if not filtered_tables:
+        return []
 
-    if written_by_table:
-        lines.append("### Tables Written")
-        lines.append("")
-        lines.append("| Table | Columns Set |")
-        lines.append("|---|---|")
-        for table in sorted(written_by_table):
-            lines.append(f"| {table} | {', '.join(sorted(written_by_table[table]))} |")
-        lines.append("")
+    lines: list[str] = ["### Tables Involved", ""]
+    lines.append("| Table | Role | Columns Set | Used By |")
+    lines.append("|---|---|---|---|")
+    for table in filtered_tables:
+        is_read = table in read_by_table
+        is_written = table in written_by_table
+        if is_read and is_written:
+            role = "Read & Written"
+        elif is_written:
+            role = "Written"
+        else:
+            role = "Read"
+        columns = ", ".join(sorted(written_by_table.get(table, []))) or "—"
+        used_by_names = set(read_by_table.get(table, set()))
+        for oid in object_ids:
+            info = structural_infos.get(oid)
+            if info is None:
+                continue
+            if table in (info.columns_written_by_table or {}) or table in (info.tables_written or []):
+                used_by_names.add(objects[oid].name if oid in objects else oid)
+        used_by = ", ".join(sorted(used_by_names)) or "—"
+        lines.append(f"| {table} | {role} | {columns} | {used_by} |")
+    lines.append("")
+    return lines
 
+
+def _statement_target_label(stmt: "StatementInfo") -> str:
+    written = sorted({t for t in (stmt.tables_written or []) if t and not t.startswith("@")})
+    if written:
+        return ", ".join(f"`{t}`" for t in written)
+    raw = stmt.raw_text or ""
+    match = re.search(
+        r"(?is)\b(?:INSERT\s+INTO|MERGE\s+INTO|MERGE|DELETE\s+FROM|UPDATE)\s+([A-Za-z0-9_#\.\"]+)",
+        raw,
+    )
+    if match:
+        token = match.group(1).strip().strip('"').split(".")[-1]
+        if token and token.upper() not in {"SET", "SELECT", "VALUES", "INTO"} and len(token) > 1:
+            return f"`{token}`"
+    return "the target table"
+
+
+def _is_merge_branch_fragment(stmt: "StatementInfo") -> bool:
+    """True for WHEN MATCHED / WHEN NOT MATCHED fragments split out of MERGE."""
+    raw = (stmt.raw_text or "").lstrip()
+    if re.match(r"(?is)^UPDATE\s+SET\b", raw):
+        return True
+    if re.match(r"(?is)^INSERT\s*\(", raw):
+        return True
+    return False
+
+
+def _process_flow_steps(
+    canonical_models: list[CanonicalModel],
+    objects: dict[str, SQLObject],
+    structural_infos: dict[str, StructuralInfo] | None,
+) -> list[str]:
+    """Numbered process-flow steps derived from statement structure."""
+    if not structural_infos:
+        return []
+
+    object_ids: list[str] = []
+    seen: set[str] = set()
+    for model in canonical_models:
+        for oid in model.object_ids:
+            if oid not in seen:
+                seen.add(oid)
+                object_ids.append(oid)
+
+    steps: list[str] = []
+    for oid in object_ids:
+        info = structural_infos.get(oid)
+        if info is None:
+            continue
+        for stmt in info.statements:
+            kind = (stmt.statement_type or "").upper()
+            if kind in {"", "UNKNOWN", "DECLARE", "SET_VAR", "BEGIN", "END", "COMMIT", "ROLLBACK", "PRINT"}:
+                continue
+            if _is_merge_branch_fragment(stmt):
+                continue
+
+            written_cols = {
+                c.split(".")[-1]
+                for column_list in (stmt.set_columns_by_table or {}).values()
+                for c in column_list
+                if c
+            }
+            raw = stmt.raw_text or ""
+            for match in re.finditer(
+                r"(?is)\bINSERT\s*(?:\s+INTO\s+[A-Za-z0-9_#\.\"]+)?\s*\(([^)]+)\)",
+                raw,
+            ):
+                for part in match.group(1).split(","):
+                    token = part.strip().strip('"').split(".")[-1]
+                    if token and re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", token):
+                        written_cols.add(token)
+            read = sorted(
+                {
+                    t
+                    for t in (stmt.tables_read or [])
+                    if t
+                    and not (
+                        "." not in t
+                        and not t.startswith("#")
+                        and t.split(".")[-1] in written_cols
+                    )
+                }
+            )
+            cols: list[str] = []
+            for column_list in (stmt.set_columns_by_table or {}).values():
+                cols.extend(column_list)
+            cols = sorted({c for c in cols if c})
+            target = _statement_target_label(stmt)
+            target_bare = re.sub(r"[`\"]", "", target).split(",")[0].strip()
+            if target_bare.lower() != "the target table":
+                read = [t for t in read if t.split(".")[-1] != target_bare]
+            col_text = f" ({', '.join(cols)})" if cols else ""
+            source = f" from {', '.join(read)}" if read else ""
+
+            if kind == "UPDATE":
+                steps.append(f"Update {target}{col_text}.")
+            elif kind == "INSERT":
+                steps.append(f"Insert into {target}{col_text}{source}.")
+            elif kind == "MERGE":
+                steps.append(f"Merge into {target}{col_text}{source}.")
+            elif kind == "DELETE":
+                steps.append(f"Delete from {target}.")
+            elif kind == "SELECT":
+                if "INTO" in (stmt.raw_text or "").upper() or cols:
+                    steps.append(f"Load {target}{source}.")
+                elif read:
+                    steps.append(f"Read from {', '.join(read)}.")
+            elif kind == "CONTROL_FLOW":
+                if cols:
+                    steps.append(f"Apply conditional updates on {target}{col_text}.")
+            elif cols:
+                steps.append(f"Process {target}{col_text}.")
+
+    deduped: list[str] = []
+    for step in steps:
+        if not deduped or deduped[-1] != step:
+            deduped.append(step)
+    return deduped[:25]
+
+
+def _what_this_does_lines(
+    canonical_models: list[CanonicalModel],
+    structural_infos: dict[str, StructuralInfo] | None,
+) -> list[str]:
+    business_summaries = [
+        model.business_summary.strip()
+        for model in canonical_models
+        if model.business_summary.strip()
+    ]
+    written_tables: list[str] = []
+    if structural_infos:
+        seen: set[str] = set()
+        for model in canonical_models:
+            for oid in model.object_ids:
+                info = structural_infos.get(oid)
+                if info is None:
+                    continue
+                candidates = list(info.tables_written or [])
+                for stmt in info.statements or []:
+                    raw = stmt.raw_text or ""
+                    for match in re.finditer(
+                        r"(?is)\b(?:INSERT\s+INTO|MERGE\s+INTO|MERGE|DELETE\s+FROM)\s+([A-Za-z0-9_#\.\"]+)",
+                        raw,
+                    ):
+                        token = match.group(1).strip().strip('"').split(".")[-1]
+                        if token and len(token) > 1 and token.upper() not in {"SET", "SELECT", "VALUES", "INTO"}:
+                            candidates.append(token)
+                for table in candidates:
+                    key = canonical_logical_name(table)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    written_tables.append(table)
+
+    lines: list[str] = ["### What This Does", ""]
+    if business_summaries:
+        body = " ".join(business_summaries)
+        if written_tables:
+            body = body.rstrip(".")
+            body = f"{body}. This procedure also writes to: {', '.join(written_tables)}."
+        lines.append(body)
+    elif written_tables:
+        lines.append(
+            "This procedure derives business fields and writes to: "
+            + ", ".join(written_tables)
+            + "."
+        )
+    else:
+        lines.append("This procedure derives business fields from the uploaded source SQL.")
+    lines.append("")
     return lines
 
 
@@ -639,55 +850,56 @@ def _process_overview_lines(
     structural_infos: dict[str, StructuralInfo] | None,
 ) -> list[str]:
     lines: list[str] = ["## 1. Process Overview", ""]
+    lines.extend(_what_this_does_lines(canonical_models, structural_infos))
 
-    technical_summaries = [model.technical_summary.strip() for model in canonical_models if model.technical_summary.strip()]
-    business_summaries = [model.business_summary.strip() for model in canonical_models if model.business_summary.strip()]
+    flow_steps = _process_flow_steps(canonical_models, objects, structural_infos)
+    lines.append("### Process Flow")
+    lines.append("")
+    if flow_steps:
+        for idx, step in enumerate(flow_steps, start=1):
+            lines.append(f"{idx}. {step}")
+    else:
+        # Fall back to technical summary sentences when structure is thin.
+        technical = [
+            model.technical_summary.strip()
+            for model in canonical_models
+            if model.technical_summary.strip()
+        ]
+        if technical:
+            sentences = re.split(r"(?<=[.!?])\s+", " ".join(technical))
+            for idx, sentence in enumerate([s.strip() for s in sentences if s.strip()][:12], start=1):
+                lines.append(f"{idx}. {sentence}")
+        else:
+            lines.append("1. Execute the uploaded procedure and apply the derived platform conditions.")
+    lines.append("")
 
-    if technical_summaries:
-        lines.append("### What the Source SQL Does")
-        lines.append("")
-        for summary in technical_summaries:
-            lines.append(summary)
-            lines.append("")
-
-    if business_summaries:
-        lines.append("### What It Means for the Business")
-        lines.append("")
-        for summary in business_summaries:
-            lines.append(summary)
-            lines.append("")
-
-    lines.extend(_tables_read_written_lines(canonical_models, objects, structural_infos))
+    lines.extend(_tables_involved_lines(canonical_models, objects, structural_infos))
     return lines
 
 
+def _rule_display_name(rule: "_RuleGroup") -> str:
+    return f"Determine {rule.column_name} ({rule.entity_name})"
+
+
 def _rule_summary_table_lines(business_groups: list[_RuleGroup], technical_groups: list[_RuleGroup]) -> list[str]:
-    lines: list[str] = ["## 2. Rule Summary", ""]
+    lines: list[str] = ["## Business Rule Summary", ""]
     all_rules = business_groups + technical_groups
     if not all_rules:
         lines.append("- No DD rows were generated for this job.")
         lines.append("")
         return lines
 
-    lines.append("| Rule ID | Table | Column | Business Meaning | Effective Date(s) |")
-    lines.append("|---|---|---|---|---|")
-    technical_ids = {rule.rule_id for rule in technical_groups}
+    lines.append("| Rule | Affected Field | Business Purpose |")
+    lines.append("|---|---|---|")
     for rule in all_rules:
         anchor = _slugify(rule.rule_id, rule.column_name)
-        label = f"{rule.rule_id} (technical)" if rule.rule_id in technical_ids else rule.rule_id
-        meaning = rule.business_meaning
-        if rule.status == "PENDING_REVIEW":
-            meaning = f"PENDING_REVIEW: {meaning}"
+        label = _rule_display_name(rule)
+        purpose = rule.business_meaning or "Not specified"
+        affected = f"{rule.entity_name}.{rule.column_name}" if rule.entity_name else rule.column_name
         lines.append(
-            f"| [{label}](#{anchor}) | {rule.entity_name} | {rule.column_name} | {_flatten_for_table_cell(meaning)} | {rule.effective_dates} |"
+            f"| [{label}](#{anchor}) | `{affected}` | {_flatten_for_table_cell(purpose)} |"
         )
     lines.append("")
-    if technical_groups:
-        lines.append(
-            "*Rows marked (technical) are operational monitoring fields, not business rules -- see the "
-            "technical-housekeeping subsection below.*"
-        )
-        lines.append("")
     return lines
 
 
@@ -695,21 +907,15 @@ def _rule_card_lines(rule: _RuleGroup) -> list[str]:
     anchor = _slugify(rule.rule_id, rule.column_name)
     lines: list[str] = []
     lines.append(f'<a id="{anchor}"></a>')
-    lines.append(f"#### {rule.rule_id} \u2014 {rule.column_name}")
+    lines.append(f"#### {_rule_display_name(rule)}")
     lines.append("")
     lines.append(f"**Table:** `{rule.entity_name}`  ")
-
-    lines.append(f"**Effective Date(s):** {rule.effective_dates}  ")
-    if rule.status == "PENDING_REVIEW":
-        notes = rule.validation_notes or "Validation did not fully pass; see the formula below before approving."
-        lines.append(f"**Status:** PENDING_REVIEW \u2014 {notes}")
-    elif rule.advisory_notes:
-        lines.append(f"**Status:** ACTIVE (advisory) \u2014 {rule.advisory_notes}")
-    else:
-        lines.append("**Status:** ACTIVE")
+    lines.append(f"**Column:** `{rule.column_name}`  ")
+    if rule.effective_dates and rule.effective_dates != "—":
+        lines.append(f"**Effective Date(s):** {rule.effective_dates}  ")
     lines.append("")
 
-    formula = rule.formula or "(pending review \u2014 no formula was accepted)"
+    formula = rule.formula or "(no formula was accepted for this rule)"
     explanation = _human_readable_explanation(rule)
 
     lines.append("**Platform Condition:**")
@@ -719,7 +925,7 @@ def _rule_card_lines(rule: _RuleGroup) -> list[str]:
     lines.append("```")
     lines.append("")
 
-    lines.append("**Human-Readable Explanation:**")
+    lines.append("**What this rule does:**")
     lines.append("")
     lines.extend(explanation.splitlines() or [explanation])
     lines.append("")
@@ -730,19 +936,13 @@ def _rule_card_lines(rule: _RuleGroup) -> list[str]:
             lines.append(f"- {dep}")
         lines.append("")
 
-    if rule.source_statement_refs:
-        lines.append("**Source Statements**")
-        for ref in rule.source_statement_refs:
-            lines.append(f"- {ref}")
-        lines.append("")
-
     lines.append("---")
     lines.append("")
     return lines
 
 
 def _detailed_rules_lines(business_groups: list[_RuleGroup], technical_groups: list[_RuleGroup]) -> list[str]:
-    lines: list[str] = ["## 3. Detailed Business Rules & DD Conditions", ""]
+    lines: list[str] = ["## Detailed Business Rules & DD Conditions", ""]
     if not business_groups and not technical_groups:
         lines.append("- No DD rows were generated for this job.")
         return lines
@@ -754,13 +954,9 @@ def _detailed_rules_lines(business_groups: list[_RuleGroup], technical_groups: l
             lines.extend(_rule_card_lines(rule))
 
     if technical_groups:
+        lines.append("### Operational / housekeeping fields")
+        lines.append("")
         for entity_name, rules in _rules_by_entity(technical_groups):
-            lines.append(f"### {entity_name} \u2014 technical housekeeping, not business logic")
-            lines.append("")
-            lines.append(
-                "> These rows are operational monitoring fields and are excluded from the business-rules count above."
-            )
-            lines.append("")
             for rule in rules:
                 lines.extend(_rule_card_lines(rule))
 
@@ -796,6 +992,15 @@ def generate_report(
     if top_summary:
         lines.append(f"> **What this process does, in one line:** {top_summary}")
         lines.append("")
+
+    lines.extend(
+        build_at_a_glance_lines(
+            canonical_models,
+            objects,
+            structural_infos,
+            business_rule_count=len(business_groups) + len(technical_groups),
+        )
+    )
 
     lines.extend(_HOW_TO_READ_A_CONDITION.splitlines())
     lines.append("")

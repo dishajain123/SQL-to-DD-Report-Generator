@@ -52,5 +52,5 @@ def test_sqlserver_sm_marking_procedure_produces_written_columns(sma_marking_sql
     assert info.statements
     assert info.tables_written
     assert info.columns_written_by_table
-    assert "DPD" in info.tables_written
+    assert any(table.upper() == "#DPD" for table in info.tables_written)
     assert any(cols for cols in info.columns_written_by_table.values())

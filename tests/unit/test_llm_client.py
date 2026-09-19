@@ -118,3 +118,31 @@ def test_llm_client_uses_configured_max_tokens_for_formula_generation():
 
     assert result == "fallback ok"
     assert transport.calls[0]["max_tokens"] == 512
+
+
+def test_bedrock_converse_uses_model_and_caps_nova_lite_output():
+    class FakeBedrock:
+        def __init__(self):
+            self.calls = []
+
+        def converse(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"output": {"message": {"content": [{"text": "  formula "}]}}}
+
+    bedrock = FakeBedrock()
+    client = LLMClient(
+        provider="bedrock",
+        model="bedrock/amazon.nova-lite-v1:0",
+        bedrock_client=bedrock,
+        max_new_tokens=8192,
+    )
+    assert client.generate_formula_expression("tech", "biz", "select 1", "ref") == "formula"
+    assert bedrock.calls[0]["modelId"] == "amazon.nova-lite-v1:0"
+    assert bedrock.calls[0]["inferenceConfig"] == {"maxTokens": 5000, "temperature": 0.0}
+    assert bedrock.calls[0]["system"][0]["text"]
+    assert bedrock.calls[0]["messages"][0]["role"] == "user"
+
+
+def test_auto_provider_accepts_bedrock_model():
+    client = LLMClient(provider="auto", model="bedrock/amazon.nova-lite-v1:0")
+    assert client.provider == "bedrock"

@@ -1,0 +1,134 @@
+[
+  {
+    "operation": "UPDATE",
+    "target_table": "LoanAccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "AccountStatus"
+    ],
+    "source_line": 29,
+    "excerpt": "UPDATE A         SET A.AccountStatus =             CASE                 WHEN ISNULL(A.OutstandingBalance, 0) = 0 THEN                     CASE",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "LoanAccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "AccountStatus"
+    ],
+    "source_line": 52,
+    "excerpt": "UPDATE A         SET A.AccountStatus = 'ACTIVE',             A.ClosureRejectReason = 'OUTSTANDING_BALANCE'         FROM PRO.LoanAccountCal A         WHERE A.Acc",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "LoanAccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "AccountStatus"
+    ],
+    "source_line": 62,
+    "excerpt": "UPDATE A         SET A.AccountStatus = 'ACTIVE',             A.ClosureRejectReason = 'UNRESOLVED_DISPUTE'         FROM PRO.LoanAccountCal A         WHERE A.Acco",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "INSERT",
+    "target_table": "#ClosureDecisions",
+    "target_kind": "temp_local",
+    "columns": [],
+    "source_line": 83,
+    "excerpt": "INSERT INTO #ClosureDecisions (AccountId, NewStatus, Reason)         SELECT A.AccountId, A.AccountStatus,                ISNULL(A.ClosureRejectReason, 'CLOSED_Z",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "temp_staging"
+  },
+  {
+    "operation": "MERGE",
+    "target_table": "ClosureRegister",
+    "target_kind": "persistent",
+    "columns": [],
+    "source_line": 93,
+    "excerpt": "MERGE PRO.ClosureRegister AS Target         USING #ClosureDecisions AS Source         ON Target.AccountId = Source.AccountId         WHEN MATCHED THEN",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "set_based_merge"
+  },
+  {
+    "operation": "INSERT",
+    "target_table": "CollectionsQueue",
+    "target_kind": "persistent",
+    "columns": [],
+    "source_line": 107,
+    "excerpt": "INSERT INTO PRO.CollectionsQueue (AccountId, EscalationDate, Reason)         SELECT AccountId, @ProcessDate, 'CLOSURE_REJECTED_' + Reason         FROM #ClosureD",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "set_based_insert"
+  },
+  {
+    "operation": "INSERT",
+    "target_table": "AccountStatusAuditLog",
+    "target_kind": "persistent",
+    "columns": [],
+    "source_line": 114,
+    "excerpt": "INSERT INTO PRO.AccountStatusAuditLog (AccountId, TransitionDate, NewStatus, Reason)         SELECT AccountId, @ProcessDate, NewStatus, Reason         FROM #Clo",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "set_based_insert"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "LoanAccountCal",
+    "target_kind": "persistent",
+    "columns": [
+      "ClosureRejectReason"
+    ],
+    "source_line": 120,
+    "excerpt": "UPDATE A         SET A.ClosureRejectReason = NULL         FROM PRO.LoanAccountCal A         WHERE A.AccountStatus NOT IN ('ACTIVE')            OR A.ClosureRejec",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "row_formula"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "ACLRUNNINGPROCESSSTATUS",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 126,
+    "excerpt": "UPDATE PRO.ACLRUNNINGPROCESSSTATUS         SET COMPLETED = 'Y', ERRORDATE = NULL, ERRORDESCRIPTION = NULL, COUNT = ISNULL(COUNT, 0) + 1         WHERE RUNNINGPRO",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  },
+  {
+    "operation": "UPDATE",
+    "target_table": "ACLRUNNINGPROCESSSTATUS",
+    "target_kind": "persistent",
+    "columns": [
+      "COMPLETED"
+    ],
+    "source_line": 133,
+    "excerpt": "UPDATE PRO.ACLRUNNINGPROCESSSTATUS         SET COMPLETED = 'N', ERRORDATE = GETDATE(), ERRORDESCRIPTION = ERROR_MESSAGE(), COUNT = ISNULL(COUNT, 0) + 1",
+    "has_join": false,
+    "has_aggregate_or_window": false,
+    "has_exists_or_in_subquery": false,
+    "expected_output_type": "process_status"
+  }
+]
