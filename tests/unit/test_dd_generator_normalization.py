@@ -884,7 +884,14 @@ def test_real_branch_heavy_columns_receive_structured_assignment_context(
     degdate_row = next(r for r in rows if r.column_name.upper() == "DEGDATE")
     assert degdate_row.status == DDStatus.ACTIVE
     assert degdate_row.display_derivation_expression
-    assert "NEW_DEGDATE" in degdate_row.display_derivation_expression.upper() or "DEGDATE" in degdate_row.display_derivation_expression.upper()
+    # The composer now resolves SRC.NEW_DEGDATE to the USING subquery's own
+    # CASE definition for it (PreRestructureNPA_Date / RestructureDt)
+    # instead of emitting a reference to "NEW_DEGDATE", which doesn't
+    # physically exist as a column anywhere -- it's only a computed alias
+    # inside the subquery, so a literal reference to it would be
+    # unresolvable outside this MERGE. See _resolve_using_subquery_projection.
+    expr_upper = degdate_row.display_derivation_expression.upper()
+    assert "PRERESTRUCTURENPA_DATE" in expr_upper and "RESTRUCTUREDT" in expr_upper
 
     refperiod_call = next((call for call in client.calls if call["column_name"] == "REFPERIODMAX"), None)
     if refperiod_call is None:

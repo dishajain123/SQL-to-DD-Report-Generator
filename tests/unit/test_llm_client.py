@@ -22,9 +22,10 @@ class _FakeHTTPResponse:
 
 
 class _FakeTransport:
-    def __init__(self, *, reject_primary: bool = False):
+    def __init__(self, *, reject_primary: bool = False, usage: dict[str, int] | None = None):
         self.calls: list[dict[str, object]] = []
         self.reject_primary = reject_primary
+        self.usage = usage
 
     def __call__(self, req, timeout):
         payload = json.loads(req.data.decode("utf-8"))
@@ -46,17 +47,18 @@ class _FakeTransport:
                     json.dumps({"error": {"message": "The model gpt-4.1 is not available"}}).encode("utf-8")
                 ),
             )
-        return _FakeHTTPResponse(
-            {
-                "choices": [
-                    {
-                        "message": {
-                            "content": "fallback ok",
-                        }
+        response_payload: dict[str, object] = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "fallback ok",
                     }
-                ]
-            }
-        )
+                }
+            ]
+        }
+        if self.usage is not None:
+            response_payload["usage"] = self.usage
+        return _FakeHTTPResponse(response_payload)
 
 
 def test_llm_client_uses_openai_endpoint_and_model():
@@ -146,3 +148,75 @@ def test_bedrock_converse_uses_model_and_caps_nova_lite_output():
 def test_auto_provider_accepts_bedrock_model():
     client = LLMClient(provider="auto", model="bedrock/amazon.nova-lite-v1:0")
     assert client.provider == "bedrock"
+
+
+def test_token_usage_is_captured_and_tagged_with_stage_for_openai_style_response():
+    transport = _FakeTransport(usage={"prompt_tokens": 100, "completion_tokens": 25, "total_tokens": 125})
+    client = LLMClient(
+        provider="openai",
+        api_key="test-key",
+        model="gpt-4.1",
+        base_url="https://api.openai.com/v1",
+        transport=transport,
+    )
+
+    client.technical_reasoning(["SELECT 1;"])
+
+    usage = client.drain_token_usage()
+    assert len(usage) == 1
+    assert usage[0] == {
+        "stage": "technical_reasoning",
+        "provider": "openai",
+        "model": "gpt-4.1",
+        "prompt_tokens": 100,
+        "completion_tokens": 25,
+        "total_tokens": 125,
+    }
+    # drain_token_usage() clears the log, so a second drain is empty.
+    assert client.drain_token_usage() == []
+
+
+def test_missing_usage_field_does_not_break_the_response_or_log_anything():
+    transport = _FakeTransport()  # no `usage` key in the fake response payload
+    client = LLMClient(
+        provider="openai",
+        api_key="test-key",
+        model="gpt-4.1",
+        base_url="https://api.openai.com/v1",
+        transport=transport,
+    )
+
+    result = client.technical_reasoning(["SELECT 1;"])
+
+    assert result == "fallback ok"
+    assert client.drain_token_usage() == []
+
+
+def test_bedrock_token_usage_is_captured_from_converse_response():
+    class FakeBedrock:
+        def converse(self, **kwargs):
+            return {
+                "output": {"message": {"content": [{"text": "formula"}]}},
+                "usage": {"inputTokens": 40, "outputTokens": 10, "totalTokens": 50},
+            }
+
+    client = LLMClient(
+        provider="bedrock",
+        model="bedrock/amazon.nova-lite-v1:0",
+        bedrock_client=FakeBedrock(),
+        max_new_tokens=8192,
+    )
+
+    client.generate_formula_expression("tech", "biz", "select 1", "ref")
+
+    usage = client.drain_token_usage()
+    assert usage == [
+        {
+            "stage": "dd_generation",
+            "provider": "bedrock",
+            "model": "amazon.nova-lite-v1:0",
+            "prompt_tokens": 40,
+            "completion_tokens": 10,
+            "total_tokens": 50,
+        }
+    ]

@@ -4,6 +4,7 @@ only runs when the intent actually requires it (architecture step 3/12).
 """
 from __future__ import annotations
 
+import json
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional, TypedDict
 
@@ -27,6 +28,36 @@ from app.utils.config import settings
 from app.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+
+def _persist_llm_token_usage(job_id: str, llm_client: LLMClient) -> None:
+    """Drain the LLM client's token-usage log and persist it to audit_log
+    so per-call/per-stage token spend can be tracked and queried later.
+
+    Drained (not just read) so this can be called at multiple checkpoints
+    across a run without double-logging entries already persisted.
+    """
+    usage_entries = llm_client.drain_token_usage()
+    if not usage_entries:
+        return
+    db.log_audit_bulk(
+        [
+            (
+                job_id,
+                f"llm_tokens:{entry['stage']}",
+                json.dumps(
+                    {
+                        "provider": entry["provider"],
+                        "model": entry["model"],
+                        "prompt_tokens": entry["prompt_tokens"],
+                        "completion_tokens": entry["completion_tokens"],
+                        "total_tokens": entry["total_tokens"],
+                    }
+                ),
+            )
+            for entry in usage_entries
+        ]
+    )
 
 
 class PipelineState(TypedDict, total=False):
@@ -144,6 +175,7 @@ def node_canonical_models(state: PipelineState, llm_client: LLMClient) -> Pipeli
     db.log_audit_bulk(
         [(job_id, "canonical_model", f"Built for chain {chain.chain_id}") for chain in chains]
     )
+    _persist_llm_token_usage(job_id, llm_client)
     state["canonical_models"] = models
     return state
 
@@ -153,6 +185,7 @@ def node_dd_generation(
 ) -> PipelineState:
     chains = state["chains"]
     canonical_models = state["canonical_models"]
+    job_id = state["job_plan"].job_id
 
     # Every column-generation job across every chain is batched into a
     # single worker pool here (see
@@ -170,6 +203,7 @@ def node_dd_generation(
         entity_name_map=state.get("entity_name_map"),
         rag_store=rag_store,
     )
+    _persist_llm_token_usage(job_id, llm_client)
 
     model_by_chain_id = {model.chain_id: model for model in canonical_models}
     for row in all_rows:
@@ -205,7 +239,6 @@ def node_dd_generation(
         )
     state["dd_rows"] = all_rows
 
-    job_id = state["job_plan"].job_id
     db.record_dd_rows_bulk(
         job_id,
         [(row.source_chain_id, i, row.model_dump()) for i, row in enumerate(all_rows)],

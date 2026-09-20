@@ -126,7 +126,11 @@ class CoverageLedger:
         return "\n".join(lines) + "\n"
 
 
-_PROC_BRANCH_RE = re.compile(r"(?is)\b(?:ELSE\b|IF\s+(?!OBJECT_ID\b))")
+# `\bIF\b` alone never matches inside ELSIF/ELSEIF (the preceding letter
+# blocks the left word boundary) -- match those explicitly so every branch
+# of an if/elsif/else chain is recognized as procedure-guarded, not just
+# whichever branch's guard text happens to start with a bare "IF"/"ELSE".
+_PROC_BRANCH_RE = re.compile(r"(?is)\b(?:ELSE|ELSIF|ELSEIF)\b|\bIF\s+(?!OBJECT_ID\b)")
 _CATCH_RE = re.compile(r"(?is)\b(?:BEGIN\s+CATCH|EXCEPTION\b|WHEN\s+OTHERS)\b")
 _TEMP_RE = re.compile(r"^#")
 _STATUS_RE = re.compile(r"(?i)RUNNINGPROCESSSTATUS|PROCESSSTATUS|RUNSTATUS\b")

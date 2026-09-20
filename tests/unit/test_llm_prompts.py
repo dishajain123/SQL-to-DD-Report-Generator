@@ -33,7 +33,7 @@ def test_llm_client_methods_use_expected_prompt_pairs(monkeypatch):
     captured: list[tuple[str, str]] = []
 
     class Client(LLMClient):
-        def _complete(self, system: str, user: str, max_tokens: Optional[int] = None) -> str:
+        def _complete(self, system: str, user: str, max_tokens: Optional[int] = None, stage: str = "") -> str:
             captured.append((system, user))
             if system == "BUS_SYS":
                 return '{"business_summary":"ok","glossary_terms":[{"term":"DPD","definition":"days past due"}]}'

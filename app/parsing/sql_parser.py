@@ -27,7 +27,10 @@ from sqlglot import exp
 from app.models.core import Dialect, StatementInfo
 
 _DML_KEYWORDS = ("SELECT", "UPDATE", "MERGE", "INSERT", "DELETE", "TRUNCATE")
-_CONTROL_KEYWORDS = ("IF", "BEGIN", "EXCEPTION", "DECLARE", "END", "CASE", "LOOP", "WHEN")
+_CONTROL_KEYWORDS = (
+    "IF", "ELSIF", "ELSEIF", "ELSE", "BEGIN", "EXCEPTION", "DECLARE", "END",
+    "CASE", "LOOP", "WHEN",
+)
 
 _SQLGLOT_DIALECT = {
     Dialect.ORACLE: "oracle",
@@ -37,6 +40,7 @@ _SQLGLOT_DIALECT = {
 
 _TSQL_STATEMENT_START_KEYWORDS = (
     "IF",
+    "ELSE",
     "BEGIN",
     "END",
     "DECLARE",
@@ -904,18 +908,118 @@ def _join_info_from_tree(tree: exp.Expression) -> tuple[list[str], list[str]]:
     return sorted(join_tables), join_conditions
 
 
-_CONDITION_RE = re.compile(
-    r"\bIF\b\s*\(?(.+?)\)?\s*THEN\b", re.IGNORECASE | re.DOTALL
-)
+_CONDITION_KEYWORD_RE = re.compile(r"\b(?:IF|ELSIF|ELSEIF)\b", re.IGNORECASE)
+_CONDITION_TERMINATOR_RE = re.compile(r"\b(?:THEN|BEGIN)\b", re.IGNORECASE)
 _CASE_WHEN_RE = re.compile(r"\bWHEN\b\s+(.+?)\s+THEN\b", re.IGNORECASE | re.DOTALL)
 
 
+def _mask_comments_only(text: str) -> str:
+    """Blank out `--` line comments and `/* */` block comments while
+    leaving string/identifier-quoted content untouched (unlike
+    write_inventory_scan._strip_strings_and_comments, which also blanks
+    string contents -- condition text must keep literal comparison values
+    like 'ACTIVE' intact). Preserves length/newlines so downstream regex
+    match offsets stay valid."""
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    in_single = False
+    in_double = False
+    in_block = False
+    while i < n:
+        ch = text[i]
+        if in_block:
+            out.append("\n" if ch == "\n" else " ")
+            if ch == "*" and i + 1 < n and text[i + 1] == "/":
+                out.append(" ")
+                i += 2
+                in_block = False
+                continue
+            i += 1
+            continue
+        if in_single:
+            out.append(ch)
+            if ch == "'" and not (i + 1 < n and text[i + 1] == "'"):
+                in_single = False
+            i += 1
+            continue
+        if in_double:
+            out.append(ch)
+            if ch == '"':
+                in_double = False
+            i += 1
+            continue
+        if ch == "-" and i + 1 < n and text[i + 1] == "-":
+            while i < n and text[i] != "\n":
+                out.append(" ")
+                i += 1
+            continue
+        if ch == "/" and i + 1 < n and text[i + 1] == "*":
+            in_block = True
+            out.append("  ")
+            i += 2
+            continue
+        if ch == "'":
+            in_single = True
+        elif ch == '"':
+            in_double = True
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _strip_balanced_wrapping_parens(text: str) -> str:
+    """Strip a single outer `(...)` pair only when it genuinely wraps the
+    entire condition, never a partial/unbalanced leading or trailing paren.
+
+    A condition made of separately-parenthesized clauses, e.g.
+    `(a = 1) AND (b = 2)`, must be left intact -- naively stripping the
+    first `(` and last `)` there produces the unbalanced, garbled
+    `a = 1) AND (b = 2`.
+    """
+    text = text.strip()
+    while text.startswith("(") and text.endswith(")"):
+        depth = 0
+        wraps_whole = True
+        for i, ch in enumerate(text):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0 and i != len(text) - 1:
+                    wraps_whole = False
+                    break
+        if not wraps_whole:
+            break
+        text = text[1:-1].strip()
+    return text
+
+
 def _extract_conditions(stmt_text: str) -> list[str]:
-    conditions = []
-    for m in _CONDITION_RE.finditer(stmt_text):
-        conditions.append(_clean(m.group(1)))
-    for m in _CASE_WHEN_RE.finditer(stmt_text):
-        conditions.append(_clean(m.group(1)))
+    """Extract IF/ELSIF/ELSEIF and CASE WHEN guard conditions.
+
+    Handles both PL/SQL's `IF ... THEN` and T-SQL's `IF ... BEGIN` -- the
+    statement splitter frequently peels the `BEGIN` off onto its own
+    statement (see `_split_glued_control_flow`), leaving no terminator at
+    all in this fragment, in which case the condition runs to the end of
+    the text rather than being silently unmatched. `ELSIF`/`ELSEIF` are
+    matched directly instead of relying on a bare `\\bIF\\b`, which can
+    never match inside those words (the preceding letter blocks the word
+    boundary).
+    """
+    text = _mask_comments_only(stmt_text)
+    conditions: list[str] = []
+    for m in _CONDITION_KEYWORD_RE.finditer(text):
+        start = m.end()
+        terminator = _CONDITION_TERMINATOR_RE.search(text, start)
+        cond_text = text[start:terminator.start()] if terminator else text[start:]
+        cleaned = _clean(_strip_balanced_wrapping_parens(cond_text))
+        if cleaned:
+            conditions.append(cleaned)
+    for m in _CASE_WHEN_RE.finditer(text):
+        cleaned = _clean(_strip_balanced_wrapping_parens(m.group(1)))
+        if cleaned:
+            conditions.append(cleaned)
     return conditions
 
 

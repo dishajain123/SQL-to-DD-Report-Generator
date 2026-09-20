@@ -397,6 +397,22 @@ def _assignment_sites_from_statements(
             pending_headers.append(stmt)
             continue
 
+        # A bare block-closing END (not "END IF"/"END CASE"/"END TRY",
+        # which continue an outer construct) closes the immediately
+        # preceding BEGIN/EXCEPTION block a pending header came from.
+        # Without this, an unrelated small nested block's header (e.g. a
+        # scalar-variable EXCEPTION handler that has nothing to do with
+        # any later column write) keeps drifting forward through
+        # bridge_context across every subsequent closed block until it
+        # reaches -- and wrongly attaches itself to -- a real write much
+        # later in the procedure, one it was never actually guarding.
+        if pending_headers and stmt.statement_type == "CONTROL_FLOW" and re.match(
+            r"(?is)^\s*END\s*;?\s*$", stmt.raw_text or ""
+        ):
+            pending_headers = []
+            bridge_context = []
+            continue
+
         if pending_headers and not stmt.set_columns_by_table and not stmt.tables_written:
             bridge_context.append(stmt)
             continue
@@ -4106,6 +4122,54 @@ def _safe_render_guard(
     return normalized if validate_expression(probe).valid else None
 
 
+_LEADING_CONTROL_HEADER_RE = re.compile(
+    r"(?is)^\s*(?:"
+    r"ELSE\s+IF\b.*?\bBEGIN\b|"
+    r"ELSIF\b.*?\bTHEN\b|"
+    r"ELSEIF\b.*?\bTHEN\b|"
+    r"ELSE\b|"
+    r"EXCEPTION\b|"
+    r"WHEN\s+OTHERS\b.*?\bTHEN\b|"
+    r"(?:BEGIN\s+)?CATCH\b|"
+    r"BEGIN\b"
+    r")\s*"
+)
+
+
+def _strip_leading_control_header(text: str) -> str:
+    """Strip any leading control-flow header (ELSE, BEGIN, ELSIF ... THEN,
+    WHEN OTHERS THEN, CATCH, ...) so callers that expect a write statement
+    to start directly with UPDATE/MERGE/INSERT still recognize one whose
+    assignment site embeds its guarding header as a prefix (see
+    `_is_condition_bearing_header` / `_assignment_sites_from_statements`).
+    Applies repeatedly since stacked headers (e.g. `ELSE\\nBEGIN\\n`) peel
+    off one token at a time.
+    """
+    stripped = text
+    while True:
+        new = _LEADING_CONTROL_HEADER_RE.sub("", stripped, count=1)
+        if new == stripped:
+            return stripped
+        stripped = new.lstrip()
+
+
+def _resolve_using_subquery_projection(using_select: exp.Select, alias_name: str) -> exp.Expression | None:
+    """Return the real projected expression for `alias_name` in a MERGE's
+    USING (SELECT ...) subquery, or None if it isn't a computed alias there.
+
+    Only resolves an *aliased* projection (`CASE ... END AS Alias`, or any
+    other expression aliased that way) -- a plain `SELECT Col FROM ...`
+    passthrough is not rewritten, since `Col` there already is a real
+    column reference rather than something requiring subquery lookup.
+    """
+    if not alias_name:
+        return None
+    for projection in using_select.expressions or []:
+        if isinstance(projection, exp.Alias) and (projection.alias or "").lower() == alias_name.lower():
+            return projection.this
+    return None
+
+
 def _parse_simple_assignment_stage(
     raw_sql: str,
     target_column: str,
@@ -4302,8 +4366,13 @@ def _parse_simple_assignment_stage(
         if isinstance(tree, exp.Merge):
             guard_parts: list[str] = []
             using = tree.args.get("using")
-            if isinstance(using, exp.Subquery) and isinstance(using.this, exp.Select):
-                where = using.this.args.get("where")
+            using_select = (
+                using.this
+                if isinstance(using, exp.Subquery) and isinstance(using.this, exp.Select)
+                else None
+            )
+            if using_select is not None:
+                where = using_select.args.get("where")
                 if where is not None:
                     rendered_guard = _safe_render_guard(where.this, procedure_sql=context_sql)
                     if rendered_guard is None:
@@ -4329,6 +4398,19 @@ def _parse_simple_assignment_stage(
                     if assignment.this.name.upper() != target_upper:
                         continue
                     value_node = unwrap_parens(assignment.expression)
+                    if using_select is not None and isinstance(value_node, exp.Column):
+                        # THEN UPDATE SET Target.Col = S.Alias commonly just
+                        # copies a value the USING subquery already computed
+                        # (very often via CASE) under that alias -- resolve
+                        # to the real projected expression instead of
+                        # emitting a reference to `S.Alias`, which after
+                        # alias-to-table resolution becomes a reference to a
+                        # column that doesn't physically exist on the
+                        # source table (the alias only exists in the
+                        # subquery's SELECT list).
+                        resolved = _resolve_using_subquery_projection(using_select, value_node.name)
+                        if resolved is not None:
+                            value_node = unwrap_parens(resolved)
                     if isinstance(value_node, exp.Case):
                         case_translation = _translate_case_to_4x(value_node)
                         if case_translation is None:
@@ -4654,42 +4736,55 @@ def _extract_where_guard_text(raw_sql: str) -> str | None:
     return normalized or None
 
 
-def undeterminable_exception_sites(sites: list["_AssignmentSite"]) -> list["_AssignmentSite"]:
-    """Identify EXCEPTION_HANDLER write sites whose only apparent guard is
-    textually identical (once normalized) to a guard some non-exception
-    site for the same column also uses.
+_ERROR_SIGNAL_RE = re.compile(
+    r"(?i)\bERROR\b|\bEXCEPTION\b|@@ERROR|ERROR_NUMBER\s*\(|ERROR_MESSAGE\s*\(|"
+    r"ERROR_STATE\s*\(|ERROR_SEVERITY\s*\(|\bSQLCODE\b|\bSQLERRM\b|"
+    r"\bFAILED\b|\bFAILURE\b"
+)
 
-    This is the structural signature of a column that cannot honestly be
-    derived as a per-row Formula Expression at all: "an unhandled
-    exception occurred" is a runtime execution event, not a fact present
-    in row data, so it has no real data-driven guard of its own. When the
-    exception-handler statement's only extracted condition is literally
-    the same row-scoping filter the normal-flow statement also uses (for
-    example both restricted to `WHERE RUNNINGPROCESSNAME = 'X'`, since
-    they write the same process's status row), that WHERE clause isn't
-    actually distinguishing the exception case -- it just happens to be
-    present on both statements for an unrelated reason (scoping to one
-    process's row in a table several different procedures share).
+
+def _guard_has_error_signal(guard_text: str) -> bool:
+    return bool(_ERROR_SIGNAL_RE.search(guard_text or ""))
+
+
+def undeterminable_exception_sites(sites: list["_AssignmentSite"]) -> list["_AssignmentSite"]:
+    """Identify EXCEPTION_HANDLER write sites whose guard is not a genuine,
+    data-driven "an error occurred" signal.
+
+    "An unhandled exception occurred" is a runtime execution event, not a
+    fact present in row data, so it has no real per-row guard of its own
+    unless the source SQL explicitly tests an error/status indicator (e.g.
+    `@@ERROR`, `ERROR_NUMBER()`, an ErrorFlag column). Any other guard on a
+    CATCH/EXCEPTION-block write -- a plain row-scoping filter like a
+    process name or run id -- is not actually distinguishing the exception
+    case, REGARDLESS of whether it happens to textually match another
+    site's guard: a different-but-still-plain identity filter is just as
+    unrelated to "an exception occurred" as an identical one. Composing it
+    as a real condition would deterministically apply that write to every
+    row matching the filter, not only rows where an exception genuinely
+    happened -- a confidently wrong result, not just a gap.
 
     Confirmed against a real generation defect this way: both the LLM
     path and the deterministic composer independently produced the exact
     same wrong expression for a column shaped like this (ERRORDATE in
-    ACLRUNNINGPROCESSSTATUS) -- because both derive their "exception
-    occurred" guard from the same coincidentally-identical WHERE text,
-    there is no guard for either path to discover here; the fix has to
-    be structural exclusion, not a smarter guard.
+    ACLRUNNINGPROCESSSTATUS) -- the fix has to be structural exclusion,
+    not a smarter guard, since there is no data-driven guard to discover.
+
+    Only sites with a *present* non-error guard are excluded here -- a
+    site with no extractable guard at all is left alone, since that's
+    also the signature of an unrelated write incorrectly bridged onto this
+    header by statement-site construction (e.g. across a comment-only gap
+    with no real write in between); treating "no guard found" the same as
+    "a real but unrelated guard" would misfire on that mis-attribution
+    instead of on the exception-handler ambiguity this function targets.
     """
     exception_sites = [s for s in sites if _infer_assignment_role(s.raw_sql) == "EXCEPTION_HANDLER"]
-    if not exception_sites:
-        return []
-    other_guards = {
-        g
-        for g in (_extract_where_guard_text(s.raw_sql) for s in sites if _infer_assignment_role(s.raw_sql) != "EXCEPTION_HANDLER")
-        if g
-    }
-    if not other_guards:
-        return []
-    return [s for s in exception_sites if _extract_where_guard_text(s.raw_sql) in other_guards]
+    undeterminable: list["_AssignmentSite"] = []
+    for site in exception_sites:
+        guard = _extract_where_guard_text(site.raw_sql)
+        if guard and not _guard_has_error_signal(guard):
+            undeterminable.append(site)
+    return undeterminable
 
 
 def _extract_complete_update_for_column(
@@ -4819,9 +4914,21 @@ def _assignment_looks_like_control_flow_else_default(
     Those writes are mutually exclusive with earlier IF/ELSEIF arms — not a
     sequential last-write-wins wipe that should erase prior guards.
     """
-    proc = procedure_sql or ""
     snippet = (stage_raw or "").strip()
-    if not snippet or not proc:
+    if not snippet:
+        return False
+
+    # A CONTROL_FLOW_BLOCK assignment site already folds its own guarding
+    # ELSE/BEGIN header directly onto the front of the write (see
+    # _is_condition_bearing_header / _assignment_sites_from_statements) --
+    # check that embedded header first. Once it's part of the snippet
+    # itself, it's no longer part of the *preceding* text the fallback
+    # search below looks at, so that search alone would miss it here.
+    if re.match(r"(?is)^\s*ELSE\b(?!\s+IF\b)\s+BEGIN\b", snippet[:240]):
+        return True
+
+    proc = procedure_sql or ""
+    if not proc:
         return False
 
     search_key = snippet.splitlines()[0].strip()
@@ -4879,15 +4986,12 @@ def _procedural_then_predicate_4x(
     if else_if and else_if[-1].start() > matches[-1].start():
         return None
     cond = matches[-1].group("cond").strip()
-    # Only lift simple, deterministically renderable predicates.
-    day_eq = re.match(
-        r"(?is)^DAY\s*\(\s*@?(?:v_)?(?:ProcessDate|ProcessDt|BusinessDate)\s*\)\s*=\s*(\d+)\s*$",
-        cond,
-    )
-    if day_eq:
-        bd = f'"{entity_name}"."var"."BUSINESS_DATE"'
-        return f'DATEPART("d", {bd}) == {day_eq.group(1)}'
-    return None
+    # Delegate to the general scalar-predicate renderer (DAY(@ProcessDate)=N,
+    # NOT NULL + offset/positive lineage checks, EXISTS, and plain @var<op>
+    # literal comparisons) instead of only recognizing DAY(@ProcessDate)=N
+    # here -- any other wrapping IF condition (e.g. IF @RunType='MONTHLY')
+    # was previously silently dropped rather than combined into the guard.
+    return _render_simple_scalar_predicate_4x(cond, entity_name, proc)
 
 
 def _procedural_exclusive_branch_predicate(
@@ -4895,38 +4999,62 @@ def _procedural_exclusive_branch_predicate(
     procedure_sql: str,
     *,
     search_from: int = 0,
-) -> tuple[str | None, int]:
-    """Return (predicate|'' for ELSE|None, match_index).
+    allow_opening_if: bool = True,
+) -> tuple[str | None, int, bool]:
+    """Return (predicate|'' for ELSE|None, match_index, disqualified).
 
     `search_from` skips earlier duplicate UPDATEs with the same text (sample 16
     blackout vs final ELSE both set amount=0 / shortfall=Y).
+
+    `allow_opening_if` gates the generic `IF ... BEGIN` fallback used when no
+    `ELSE IF`/`ELSE` header directly precedes the statement. Only the first
+    branch of a chain may open with a bare IF; if a later branch's nearest
+    header is a bare IF rather than ELSE IF/ELSE, it is an independent,
+    unconnected IF block that happens to share a WHERE clause by coincidence
+    -- not a real elseif-chain sibling -- so the caller must not compose it
+    as one (real SQL executes independent IFs sequentially, last-write-wins,
+    not first-true-wins like ELSEIF). `disqualified=True` signals exactly
+    this case -- a genuine header was found but it's a bare IF where only
+    ELSE IF/ELSE would make this branch a real chain sibling -- distinct
+    from `pred=None, disqualified=False` (no wrapping header found at all,
+    e.g. a leading unrelated write before the chain even starts), which the
+    caller may still skip over rather than treat as chain-breaking.
     """
     proc = procedure_sql or ""
     snippet = (stage_raw or "").strip()
     if not snippet or not proc:
-        return None, -1
+        return None, -1, False
     key = snippet[:120] if len(snippet) >= 40 else snippet
     idx = proc.find(key, max(0, search_from))
     if idx < 0:
         idx = proc.find(key)
     if idx < 0:
-        return None, -1
+        return None, -1, False
     window = proc[max(0, idx - 600) : idx]
     cleaned = "\n".join(line.split("--", 1)[0] for line in window.splitlines())
     upper = cleaned.upper()
     if re.search(r"\bELSE\b(?!\s+IF\b)\s+BEGIN\s*$", upper):
-        return "", idx
+        return "", idx, False
     else_if = list(
         re.finditer(r"(?is)\bELSE\s+IF\s+(?P<cond>.+?)\s+BEGIN\b", cleaned)
     )
     if else_if:
-        return else_if[-1].group("cond").strip(), idx
+        return else_if[-1].group("cond").strip(), idx, False
     if_match = list(
         re.finditer(r"(?is)\bIF\s+(?!OBJECT_ID\b)(?P<cond>.+?)\s+BEGIN\b", cleaned)
     )
+    if not allow_opening_if:
+        return None, idx, bool(if_match)
     if if_match:
-        return if_match[-1].group("cond").strip(), idx
-    return None, idx
+        return if_match[-1].group("cond").strip(), idx, False
+    return None, idx, False
+
+
+_SIMPLE_SCALAR_COMPARISON_RE = re.compile(
+    r"(?is)^@(?P<var>[A-Za-z_][\w]*)\s*(?P<op>=|<>|!=|>=|<=|>|<)\s*"
+    r"(?P<lit>'[^']*'|-?\d+(?:\.\d+)?)\s*$"
+)
+_COMPARISON_OP_MAP = {"=": "==", "<>": "!=", "!=": "!=", ">=": ">=", "<=": "<=", ">": ">", "<": "<"}
 
 
 def _render_simple_scalar_predicate_4x(cond_sql: str, entity_name: str, procedure_sql: str) -> str | None:
@@ -4968,6 +5096,20 @@ def _render_simple_scalar_predicate_4x(cond_sql: str, entity_name: str, procedur
     )
     if day_eq:
         return f'DATEPART("d", {bd}) == {day_eq.group(1)}'
+    # Plain `@var <op> literal` (e.g. `@RunType = 'MONTHLY'`, `@Flag = 1`).
+    # @var's source comes from its own DECLARE lookup when there is one;
+    # otherwise it's treated as a bare procedure input parameter (the
+    # documented convention for a rule-gating parameter like p_TIMEKEY —
+    # see dd_generation.yaml), never guessed as a table/column reference.
+    simple_cmp = _SIMPLE_SCALAR_COMPARISON_RE.match(text)
+    if simple_cmp:
+        var = simple_cmp.group("var")
+        op = _COMPARISON_OP_MAP[simple_cmp.group("op")]
+        literal = simple_cmp.group("lit")
+        if literal.startswith("'"):
+            literal = '"' + literal[1:-1].replace('"', '\\"') + '"'
+        ref = _resolve_scalar_lookup_reference(var, procedure_sql) or var
+        return f"{ref} {op} {literal}"
     return None
 
 
@@ -4999,12 +5141,19 @@ def _compose_exclusive_control_flow_stages(
     # unrelated writes (e.g. CoverShortfallFlag='N' before the fund IF).
     branched: list[tuple[tuple[str, str, str, str], str]] = []
     cursor = 0
-    for stage in stages:
-        pred, idx = _procedural_exclusive_branch_predicate(
-            stage[3], procedure_sql, search_from=cursor
+    for position, stage in enumerate(stages):
+        pred, idx, disqualified = _procedural_exclusive_branch_predicate(
+            stage[3], procedure_sql, search_from=cursor, allow_opening_if=(position == 0)
         )
         if idx >= 0:
             cursor = idx + 1
+        if disqualified:
+            # A later branch's nearest header is an independent bare IF, not
+            # a real ELSE IF/ELSE continuation -- these are not one connected
+            # exclusive chain, so bail out entirely rather than composing a
+            # subset and silently dropping this branch's write. The caller
+            # falls back to ordinary sequential (last-write-wins) composition.
+            return None
         if pred is not None:
             branched.append((stage, pred))
     if len(branched) < 2:
@@ -5676,6 +5825,7 @@ def _compose_simple_assignment_expression(
         erase earlier composed CASE logic.
         """
         cleaned = _strip_leading_comments(raw_sql or "").strip()
+        cleaned = _strip_leading_control_header(cleaned)
         upper = cleaned.upper()
         if not upper.startswith("UPDATE"):
             return False

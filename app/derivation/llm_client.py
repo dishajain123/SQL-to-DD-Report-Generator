@@ -15,7 +15,8 @@ which provider is being used.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -235,6 +236,38 @@ def _truncate_for_provider(text: str, max_chars: int) -> str:
     return text[:max_chars] + "\n\n[truncated to fit provider input limit]"
 
 
+def _extract_openai_style_usage(parsed: dict[str, object]) -> Optional[dict[str, int]]:
+    usage = parsed.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    prompt_tokens = usage.get("prompt_tokens")
+    completion_tokens = usage.get("completion_tokens")
+    total_tokens = usage.get("total_tokens")
+    if not isinstance(prompt_tokens, int) or not isinstance(completion_tokens, int):
+        return None
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens if isinstance(total_tokens, int) else prompt_tokens + completion_tokens,
+    }
+
+
+def _extract_bedrock_usage(response: dict[str, object]) -> Optional[dict[str, int]]:
+    usage = response.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    input_tokens = usage.get("inputTokens")
+    output_tokens = usage.get("outputTokens")
+    total_tokens = usage.get("totalTokens")
+    if not isinstance(input_tokens, int) or not isinstance(output_tokens, int):
+        return None
+    return {
+        "prompt_tokens": input_tokens,
+        "completion_tokens": output_tokens,
+        "total_tokens": total_tokens if isinstance(total_tokens, int) else input_tokens + output_tokens,
+    }
+
+
 @dataclass
 class LLMClient:
     """Provider-agnostic chat-completions client for the pipeline."""
@@ -249,6 +282,39 @@ class LLMClient:
     request_timeout_seconds: float = settings.llm_request_timeout_seconds
     transport: Optional[Callable[..., Any]] = None
     bedrock_client: Optional[Any] = None
+    token_usage_log: list[dict[str, Any]] = field(default_factory=list, compare=False, repr=False)
+    _usage_lock: threading.Lock = field(default_factory=threading.Lock, compare=False, repr=False)
+
+    def _record_token_usage(self, stage: str, model: str, usage: Optional[dict[str, int]]) -> None:
+        if usage is None:
+            return
+        entry = {
+            "stage": stage,
+            "provider": self.provider,
+            "model": model,
+            "prompt_tokens": usage["prompt_tokens"],
+            "completion_tokens": usage["completion_tokens"],
+            "total_tokens": usage["total_tokens"],
+        }
+        with self._usage_lock:
+            self.token_usage_log.append(entry)
+        logger.info(
+            "llm.token_usage stage=%s provider=%s model=%s prompt_tokens=%d completion_tokens=%d total_tokens=%d",
+            stage, self.provider, model,
+            entry["prompt_tokens"], entry["completion_tokens"], entry["total_tokens"],
+        )
+
+    def drain_token_usage(self) -> list[dict[str, Any]]:
+        """Return and clear the token-usage entries recorded so far.
+
+        Thread-safe -- callers on a shared LLMClient instance (this client
+        is reused across a ThreadPoolExecutor for concurrent chain/column
+        LLM calls) can drain at a checkpoint without losing entries another
+        thread appends in between.
+        """
+        with self._usage_lock:
+            drained, self.token_usage_log = self.token_usage_log, []
+        return drained
 
     def __post_init__(self) -> None:
         self.model = self.model or settings.llm_model_name.strip()
@@ -313,9 +379,9 @@ class LLMClient:
             )
         return base_url + "/chat/completions"
 
-    def _complete_once(self, model: str, system: str, user: str, max_tokens: int) -> str:
+    def _complete_once(self, model: str, system: str, user: str, max_tokens: int, stage: str = "") -> str:
         if self.provider == "bedrock":
-            return self._complete_bedrock(model, system, user, max_tokens)
+            return self._complete_bedrock(model, system, user, max_tokens, stage)
         if not self.api_key:
             raise RuntimeError(
                 "No API key is configured for the LLM provider. "
@@ -382,9 +448,11 @@ class LLMClient:
         content = message.get("content")
         if not isinstance(content, str) or not content.strip():
             raise RuntimeError(f"{self.provider} returned an empty message content")
+
+        self._record_token_usage(stage, model, _extract_openai_style_usage(parsed))
         return content.strip()
 
-    def _complete_bedrock(self, model: str, system: str, user: str, max_tokens: int) -> str:
+    def _complete_bedrock(self, model: str, system: str, user: str, max_tokens: int, stage: str = "") -> str:
         model_id = model.removeprefix("bedrock/")
         if not model_id:
             raise ValueError("Set GPT_MODEL or LLM_MODEL_NAME to a Bedrock model ID.")
@@ -417,9 +485,11 @@ class LLMClient:
         answer = "".join(block.get("text", "") for block in content if isinstance(block, dict))
         if not answer.strip():
             raise RuntimeError("Bedrock returned an empty message content")
+
+        self._record_token_usage(stage, model_id, _extract_bedrock_usage(response))
         return answer.strip()
 
-    def _complete_with_model(self, system: str, user: str, max_tokens: int = 1024) -> str:
+    def _complete_with_model(self, system: str, user: str, max_tokens: int = 1024, stage: str = "") -> str:
         candidates = self._candidate_models()
         if not candidates:
             raise RuntimeError(
@@ -430,7 +500,7 @@ class LLMClient:
         last_error: Optional[Exception] = None
         for candidate in candidates:
             try:
-                return self._complete_once(candidate, system, user, max_tokens=max_tokens)
+                return self._complete_once(candidate, system, user, max_tokens=max_tokens, stage=stage)
             except _ModelRejectedError as exc:
                 last_error = exc
                 continue
@@ -440,14 +510,14 @@ class LLMClient:
             f"Last error: {last_error}"
         )
 
-    def _complete(self, system: str, user: str, max_tokens: Optional[int] = None) -> str:
-        return self._complete_with_model(system, user, max_tokens=max_tokens or self.max_new_tokens)
+    def _complete(self, system: str, user: str, max_tokens: Optional[int] = None, stage: str = "") -> str:
+        return self._complete_with_model(system, user, max_tokens=max_tokens or self.max_new_tokens, stage=stage)
 
     def technical_reasoning(self, sql_snippets: list[str]) -> str:
         prompts = _load_prompts()
         system, user_template = _prompt_pair(prompts, "technical_reasoning")
         user = _render_prompt(user_template, sql_snippets="\n\n---\n\n".join(sql_snippets))
-        return self._complete(system, user, max_tokens=768)
+        return self._complete(system, user, max_tokens=768, stage="technical_reasoning")
 
     def business_reasoning(self, technical_summary: str) -> str:
         return self.business_reasoning_details(technical_summary).summary
@@ -456,7 +526,7 @@ class LLMClient:
         prompts = _load_prompts()
         system, user_template = _prompt_pair(prompts, "business_reasoning")
         user = _render_prompt(user_template, technical_summary=technical_summary)
-        raw = self._complete(system, user, max_tokens=512)
+        raw = self._complete(system, user, max_tokens=512, stage="business_reasoning")
         return _parse_business_reasoning_output(raw)
 
     def rule_explanation(
@@ -483,7 +553,7 @@ class LLMClient:
             relevant_sql=relevant_sql.strip(),
             formula=formula.strip(),
         )
-        return self._complete(system, user, max_tokens=256)
+        return self._complete(system, user, max_tokens=256, stage="rule_explanation")
 
     def generate_formula_expression(
         self,
@@ -509,10 +579,10 @@ class LLMClient:
             relevant_sql=relevant_sql.strip(),
             rag_context=rag_context.strip(),
         )
-        return self._complete(system, user, max_tokens=self.max_new_tokens)
+        return self._complete(system, user, max_tokens=self.max_new_tokens, stage="dd_generation")
 
     def retry_with_error(self, previous_expression: str, error: str, context: str) -> str:
         prompts = _load_prompts()
         system, user_template = _prompt_pair(prompts, "retry_with_error")
         user = _render_prompt(user_template, previous_expression=previous_expression, error=error, context=context)
-        return self._complete(system, user, max_tokens=self.max_new_tokens)
+        return self._complete(system, user, max_tokens=self.max_new_tokens, stage="retry_with_error")
