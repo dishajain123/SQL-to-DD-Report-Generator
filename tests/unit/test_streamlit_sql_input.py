@@ -16,6 +16,12 @@ from app.review.sql_input import (
 )
 from app.utils import db
 
+# AppTest.from_file() resolves a relative path against the file that calls
+# it (this test module's directory), not the process's working directory
+# -- an absolute path is required so the test doesn't depend on where
+# pytest happens to be invoked from.
+STREAMLIT_APP_PATH = str(Path(__file__).resolve().parents[2] / "app" / "review" / "streamlit_app.py")
+
 
 @pytest.fixture(autouse=True)
 def isolated_streamlit_db(tmp_path, monkeypatch):
@@ -55,7 +61,7 @@ def test_bundled_sample_preview_and_submission():
     sql = (Path(__file__).resolve().parents[2] / "samples" / "sql" / name).read_bytes().decode("utf-8")
     captured = []
     with patch("urllib.request.urlopen", _capture_submissions(captured)):
-        app = AppTest.from_file("app/review/streamlit_app.py", default_timeout=15).run()
+        app = AppTest.from_file(STREAMLIT_APP_PATH, default_timeout=15).run()
         assert not app.exception
         app.radio(key="sql-input-mode").set_value("Bundled sample").run()
         assert not app.exception
@@ -72,7 +78,7 @@ def test_pasted_sql_submission():
     sql = "CREATE PROCEDURE pasted_test AS SELECT 1;"
     captured = []
     with patch("urllib.request.urlopen", _capture_submissions(captured)):
-        app = AppTest.from_file("app/review/streamlit_app.py", default_timeout=15).run()
+        app = AppTest.from_file(STREAMLIT_APP_PATH, default_timeout=15).run()
         app.radio(key="sql-input-mode").set_value("Paste SQL").run()
         app.text_area(key="pasted-sql-text").set_value(sql).run()
         assert any(sql == block.value for block in app.code)
@@ -118,7 +124,7 @@ def test_same_job_in_submission_and_review_has_unique_widget_keys(tmp_path, monk
         return _Response(b"test-csv-bytes")
 
     with patch("urllib.request.urlopen", fake_urlopen):
-        app = AppTest.from_file("app/review/streamlit_app.py", default_timeout=30).run()
+        app = AppTest.from_file(STREAMLIT_APP_PATH, default_timeout=30).run()
         app.radio(key="sql-input-mode").set_value("Paste SQL").run()
         app.text_area(key="pasted-sql-text").set_value("CREATE PROCEDURE demo AS SELECT 1;").run()
         app.button[0].click().run()
@@ -132,7 +138,7 @@ def test_same_job_in_submission_and_review_has_unique_widget_keys(tmp_path, monk
 def test_submit_without_sql_does_not_call_api():
     captured = []
     with patch("urllib.request.urlopen", _capture_submissions(captured)):
-        app = AppTest.from_file("app/review/streamlit_app.py", default_timeout=15).run()
+        app = AppTest.from_file(STREAMLIT_APP_PATH, default_timeout=15).run()
         app.button[0].click().run()
 
     assert not app.exception

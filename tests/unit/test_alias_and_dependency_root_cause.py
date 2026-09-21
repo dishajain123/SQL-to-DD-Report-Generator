@@ -131,3 +131,37 @@ def test_bare_known_parameter_is_not_misclassified_as_literal():
 def test_no_known_names_falls_back_to_curated_literal_list():
     assert _is_dependency_literal("Y", frozenset()) is True
     assert _is_dependency_literal("SOME_RANDOM_TOKEN", frozenset()) is False
+
+
+# Performance regression: collect_table_aliases is called once per DD
+# column being generated with the SAME whole-procedure text every time --
+# for a large procedure that's thousands of redundant full sqlglot parses,
+# measured to make procedure-scale generation not finish in any reasonable
+# time. It is memoized; this must not change its result.
+def test_collect_table_aliases_is_memoized_and_still_correct():
+    from app.utils.sql_aliases import _collect_table_aliases_cached
+
+    sql = "UPDATE A SET A.X = 1 FROM PRO.AccountCal A WHERE A.Y = 1"
+    _collect_table_aliases_cached.cache_clear()
+
+    result1 = collect_table_aliases(sql, Dialect.SQLSERVER)
+    misses_after_first = _collect_table_aliases_cached.cache_info().misses
+    result2 = collect_table_aliases(sql, Dialect.SQLSERVER)
+    info_after_second = _collect_table_aliases_cached.cache_info()
+
+    assert result1 == result2 == {"A": ("PRO", "AccountCal")}
+    assert info_after_second.hits >= 1
+    assert info_after_second.misses == misses_after_first
+
+
+def test_collect_table_aliases_cache_distinguishes_dialect():
+    # The cache key must include dialect, not just text -- the same raw
+    # text can legitimately parse to different aliases under different
+    # dialects (or fail under one and succeed under another).
+    from app.utils.sql_aliases import _collect_table_aliases_cached
+
+    sql = "UPDATE A SET A.X = 1 FROM PRO.AccountCal A WHERE A.Y = 1"
+    _collect_table_aliases_cached.cache_clear()
+    collect_table_aliases(sql, Dialect.SQLSERVER)
+    collect_table_aliases(sql, Dialect.ORACLE)
+    assert _collect_table_aliases_cached.cache_info().currsize == 2

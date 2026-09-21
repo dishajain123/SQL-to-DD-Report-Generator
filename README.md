@@ -1,8 +1,11 @@
 # DD Automation
 
-Turns Oracle/MySQL stored procedures into a Derivation Dictionary (DD): a
+Turns stored procedures into a Derivation Dictionary (DD): a
 technical + business report, and (optionally) a DD CSV export matching the
-banking platform's own Derivations schema. Built around a LangGraph
+banking platform's own Derivations schema. SQL Server (T-SQL) is the
+primary dialect the sample corpus and the engine's own heuristics are
+tuned against; Oracle PL/SQL is also supported and tested, but with less
+corpus coverage. Built around a LangGraph
 pipeline: parse SQL -> build cross-procedure lineage -> understand what the
 logic does -> translate it into the platform's Formula Expression grammar
 -> validate -> human review/edit -> report + CSV.
@@ -67,7 +70,7 @@ LLM_SYNTHESIS_MAX_TOKENS=8192
 ## Run Backend
 
 ```bash
-cd /Users/dishajain/Downloads/DD_Automation
+cd <path-to-your-clone-of-DD_Automation>
 source .venv/bin/activate
 uvicorn app.main:app --reload
 ```
@@ -77,7 +80,7 @@ uvicorn app.main:app --reload
 Open a second terminal and run:
 
 ```bash
-cd /Users/dishajain/Downloads/DD_Automation
+cd <path-to-your-clone-of-DD_Automation>
 source .venv/bin/activate
 .venv/bin/streamlit run app/review/streamlit_app.py
 ```
@@ -108,7 +111,7 @@ Use this sequence for a clean local run:
 
 1. Create and activate a virtual environment.
 2. Install dependencies with `pip install -r requirements.txt`.
-3. Copy [`.env.example`](/Users/dishajain/Downloads/DD_Automation/.env.example) to [`.env`](/Users/dishajain/Downloads/DD_Automation/.env) and set `LLM_API_KEY` and `LLM_MODEL_NAME`.
+3. Copy [`.env.example`](.env.example) to `.env` and set `LLM_API_KEY` and `LLM_MODEL_NAME`.
 4. Run the tests to verify the repo is healthy.
 5. Start the API or the Streamlit UI depending on what you want to use.
 6. Optionally run the LLM smoke test to see the reasoning outputs step by step.
@@ -224,8 +227,9 @@ python3 scripts/run_layer2_tests.py
 python3 scripts/run_layer3_tests.py
 ```
 
-74 tests across `tests/unit`, `tests/integration`, `tests/e2e` — all run
-offline against real sample procs, no API key needed.
+All tests across `tests/unit`, `tests/integration`, `tests/e2e` (run
+`pytest tests/ --collect-only -q` for the current count) run offline
+against real sample procs, no API key needed.
 
 ## Running the sample end-to-end workflow
 
@@ -323,7 +327,7 @@ function, or source-anomaly blockers.
   update `DEFAULT_FUNCTION_REFERENCE_PATH` and
   `DEFAULT_ENTITY_NAME_MAP_JSON` in `.env`.
 - Generated files in `output/`, SQLite DBs, Chroma caches, and `.venv/`
-  are ignored by [`.gitignore`](/Users/dishajain/Downloads/DD_Automation/.gitignore).
+  are ignored by [`.gitignore`](.gitignore).
 - The repository is designed to run tests without an API key; only the LLM
   reasoning smoke test needs live network access and a real key.
 

@@ -8,11 +8,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 SAMPLES_DIR = ROOT / "samples"
-_ATTACHED_SMA_CANDIDATES = [
-    Path("/Users/dishajain/Downloads/proc project/PRO.SMA_MARKING_12122023.StoredProcedure.sql"),
-    Path("/Users/dishajain/Downloads/proc project/TEST PROC/PRO.SMA_MARKING_12122023.StoredProcedure.sql"),
-]
-ATTACHED_SMA_SQL = next((path for path in _ATTACHED_SMA_CANDIDATES if path.exists()), _ATTACHED_SMA_CANDIDATES[0])
+ATTACHED_SMA_SQL = SAMPLES_DIR / "sql" / "PRO_SMA_MARKING_12122023_StoredProcedure.sql"
 
 from app.utils.text_encoding import decode_text_bytes
 

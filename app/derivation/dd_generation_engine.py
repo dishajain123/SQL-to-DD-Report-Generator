@@ -35,6 +35,7 @@ import re
 from datetime import date
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
@@ -3285,7 +3286,7 @@ def _is_simple_stage_value(expression: str) -> bool:
     return False
 
 
-def _translate_case_to_4x(case_node) -> str | None:
+def _translate_case_to_4x(case_node, source_alias: str | None = None) -> str | None:
     """Deterministically translate a SQL `CASE WHEN cond1 THEN val1 WHEN
     cond2 THEN val2 ELSE val3 END` expression into the platform's real
     `IF(cond1)THEN(val1)ELSEIF(cond2)THEN(val2)ELSE(val3)` syntax.
@@ -3322,14 +3323,16 @@ def _translate_case_to_4x(case_node) -> str | None:
         while isinstance(value_node, exp.Paren):
             value_node = value_node.this
         if switch_value is not None:
-            left_sql = _render_value_expression_to_4x(switch_value)
-            right_sql = _render_value_expression_to_4x(condition_node)
+            left_sql = _render_value_expression_to_4x(switch_value, source_alias=source_alias)
+            right_sql = _render_value_expression_to_4x(condition_node, source_alias=source_alias)
             if left_sql is None or right_sql is None:
                 return None
             condition_sql = f"{left_sql} == {right_sql}"
         else:
-            condition_sql = _render_sql_condition_to_4x(condition_node) or condition_node.sql(dialect="oracle")
-        value_sql = _render_value_expression_to_4x(value_node)
+            condition_sql = _render_sql_condition_to_4x(
+                condition_node, source_alias=source_alias
+            ) or condition_node.sql(dialect="oracle")
+        value_sql = _render_value_expression_to_4x(value_node, source_alias=source_alias)
         if value_sql is None:
             return None
         branches.append((condition_sql, value_sql))
@@ -3338,7 +3341,7 @@ def _translate_case_to_4x(case_node) -> str | None:
     if default_node is not None:
         while isinstance(default_node, exp.Paren):
             default_node = default_node.this
-        default_sql = _render_value_expression_to_4x(default_node)
+        default_sql = _render_value_expression_to_4x(default_node, source_alias=source_alias)
         if default_sql is None:
             return None
     else:
@@ -3374,16 +3377,55 @@ def _datediff_unit_token(unit_text: str) -> str | None:
     return mapping.get(unit_text.strip().upper())
 
 
-def _render_value_expression_to_4x(node) -> str | None:
+# Matches the same process/business-date scalar names
+# _rewrite_business_date_variables looks for (kept in sync with that
+# function's regex), so a bare reference to one of these is recognized
+# and left alone here rather than being qualified as if it were a real
+# column.
+_BUSINESS_DATE_VARIABLE_RE = re.compile(
+    r"^(?:v_)?(?:PROCESSDATE|PROCESSDT|BUSINESSDATE)$", re.IGNORECASE
+)
+
+
+def _is_procedure_parameter_name(name: str) -> bool:
+    """True for a bare identifier that is a procedure parameter/local
+    variable, not a real table column, and so must never be qualified
+    with a source-table alias.
+
+    Covers the same two documented exceptions as elsewhere in this
+    module: process/business-date scalars (see
+    _BUSINESS_DATE_VARIABLE_RE / _rewrite_business_date_variables) and a
+    rule-versioning threshold parameter (T-SQL `@TIMEKEY`, Oracle bare
+    `p_TIMEKEY`), which dd_generation.yaml documents as written bare and
+    unquoted by platform convention -- matches the same TIMEKEY-substring
+    signal app/parsing/structural_analysis.py's version-threshold
+    detector and app/guardrails/output_guardrails.py's bare-identifier
+    check both use to recognize it.
+    """
+    return bool(_BUSINESS_DATE_VARIABLE_RE.match(name)) or "TIMEKEY" in name.upper()
+
+
+def _render_value_expression_to_4x(node, source_alias: str | None = None) -> str | None:
+    """Render a value-position expression (a CASE branch's value, an
+    assignment RHS) into 4X syntax.
+
+    `source_alias` is the statement's own row source (the same alias
+    `_qualify_unqualified_condition_columns` uses for guards/conditions)
+    -- passed through so a bare column reference on the VALUE side (e.g.
+    `SET A.X = SomeOtherCol` or `MAX(SomeOtherCol)`, with no `alias.`
+    prefix in the source) gets qualified the same way a bare column in a
+    WHERE/guard already does, instead of being left as an unresolvable
+    bare token the platform can't map to any entity.
+    """
     while isinstance(node, exp.Paren):
         node = node.this
 
     # sqlglot wraps T-SQL DATEDIFF operands in TIME_STR_TO_TIME(...).
     if isinstance(node, exp.TimeStrToTime):
-        return _render_value_expression_to_4x(node.this)
+        return _render_value_expression_to_4x(node.this, source_alias=source_alias)
 
     if isinstance(node, exp.Case):
-        return _translate_case_to_4x(node)
+        return _translate_case_to_4x(node, source_alias=source_alias)
 
     if isinstance(node, exp.Column):
         name = node.name or ""
@@ -3391,14 +3433,25 @@ def _render_value_expression_to_4x(node) -> str | None:
             return None
         if node.table:
             return f'"{node.table}"."{name}"'
-        # Keep bare identifiers unquoted here so existing CASE/MAX
-        # translations stay stable; platform quoting is applied later by
-        # normalize/finalize.
+        if source_alias and not _is_procedure_parameter_name(name):
+            return f'"{source_alias}"."{name}"'
+        # No known source alias for this statement, or this is a
+        # process/business-date scalar variable (v_ProcessDate,
+        # @ProcessDate, ...) -- those are never a real column on any
+        # table, and _rewrite_business_date_variables (run later on the
+        # whole expression) specifically relies on the name staying bare
+        # so it can still recognize and rewrite it to
+        # "Entity"."var"."BUSINESS_DATE"; qualifying it here first would
+        # make it look like a real (nonexistent) column instead and
+        # silently defeat that rewrite. Otherwise keep the bare identifier
+        # unquoted rather than guessing a qualifier; platform quoting/
+        # resolution is still applied later by normalize/finalize for
+        # whatever alias information is available there.
         return name
 
     if isinstance(node, exp.Add):
-        left = _render_value_expression_to_4x(node.this)
-        right = _render_value_expression_to_4x(node.expression)
+        left = _render_value_expression_to_4x(node.this, source_alias=source_alias)
+        right = _render_value_expression_to_4x(node.expression, source_alias=source_alias)
         if left is None or right is None:
             return None
         # SQL string concatenation uses `+`; platform requires CONCAT.
@@ -3407,28 +3460,28 @@ def _render_value_expression_to_4x(node) -> str | None:
         return f"({left} + {right})"
 
     if isinstance(node, exp.Sub):
-        left = _render_value_expression_to_4x(node.this)
-        right = _render_value_expression_to_4x(node.expression)
+        left = _render_value_expression_to_4x(node.this, source_alias=source_alias)
+        right = _render_value_expression_to_4x(node.expression, source_alias=source_alias)
         if left is None or right is None:
             return None
         return f"({left} - {right})"
 
     if isinstance(node, exp.Mul):
-        left = _render_value_expression_to_4x(node.this)
-        right = _render_value_expression_to_4x(node.expression)
+        left = _render_value_expression_to_4x(node.this, source_alias=source_alias)
+        right = _render_value_expression_to_4x(node.expression, source_alias=source_alias)
         if left is None or right is None:
             return None
         return f"({left} * {right})"
 
     if isinstance(node, exp.Div):
-        left = _render_value_expression_to_4x(node.this)
-        right = _render_value_expression_to_4x(node.expression)
+        left = _render_value_expression_to_4x(node.this, source_alias=source_alias)
+        right = _render_value_expression_to_4x(node.expression, source_alias=source_alias)
         if left is None or right is None:
             return None
         return f"({left} / {right})"
 
     if isinstance(node, exp.Neg):
-        inner = _render_value_expression_to_4x(node.this)
+        inner = _render_value_expression_to_4x(node.this, source_alias=source_alias)
         if inner is None:
             return None
         return f"-{inner}"
@@ -3460,16 +3513,11 @@ def _render_value_expression_to_4x(node) -> str | None:
                         projected = projected.transform(qualify)
                     except Exception:
                         pass
-                return _render_value_expression_to_4x(projected)
+                return _render_value_expression_to_4x(projected, source_alias=source_alias)
         return None
 
     if isinstance(node, exp.Sum):
-        this = node.this
-        if isinstance(this, exp.Column) and not this.table:
-            # Leave bare for callers that already qualified; otherwise quote.
-            inner = f'"{this.name}"'
-        else:
-            inner = _render_value_expression_to_4x(this)
+        inner = _render_value_expression_to_4x(node.this, source_alias=source_alias)
         if inner is None:
             return None
         return f"SUM({inner})"
@@ -3479,52 +3527,49 @@ def _render_value_expression_to_4x(node) -> str | None:
         # Platform grammar has no `COUNT(*)`; COUNT(1) is the row-count form.
         if this is None or isinstance(this, exp.Star):
             return "COUNT(1)"
-        if isinstance(this, exp.Column) and not this.table:
-            inner = f'"{this.name}"'
-        else:
-            inner = _render_value_expression_to_4x(this)
+        inner = _render_value_expression_to_4x(this, source_alias=source_alias)
         if inner is None:
             return None
         return f"COUNT({inner})"
 
     if isinstance(node, exp.Lower):
-        inner = _render_value_expression_to_4x(node.this)
+        inner = _render_value_expression_to_4x(node.this, source_alias=source_alias)
         return f"LOWER({inner})" if inner is not None else None
 
     if isinstance(node, exp.Upper):
-        inner = _render_value_expression_to_4x(node.this)
+        inner = _render_value_expression_to_4x(node.this, source_alias=source_alias)
         return f"UPPER({inner})" if inner is not None else None
 
     if isinstance(node, exp.Trim):
-        inner = _render_value_expression_to_4x(node.this)
+        inner = _render_value_expression_to_4x(node.this, source_alias=source_alias)
         return f"TRIM({inner})" if inner is not None else None
 
     if isinstance(node, exp.Length):
-        inner = _render_value_expression_to_4x(node.this)
+        inner = _render_value_expression_to_4x(node.this, source_alias=source_alias)
         return f"LEN({inner})" if inner is not None else None
 
     if isinstance(node, exp.Substring):
         parts = [node.this, node.args.get("start"), node.args.get("length")]
-        rendered = [_render_value_expression_to_4x(part) for part in parts if part is not None]
+        rendered = [_render_value_expression_to_4x(part, source_alias=source_alias) for part in parts if part is not None]
         if len(rendered) < 2 or any(part is None for part in rendered):
             return None
         return f"SUBSTR({', '.join(rendered)})"
 
     if isinstance(node, exp.Abs):
-        inner = _render_value_expression_to_4x(node.this)
+        inner = _render_value_expression_to_4x(node.this, source_alias=source_alias)
         return f"ABS({inner})" if inner is not None else None
 
     if isinstance(node, exp.Round):
         args = [node.this]
         if node.expression is not None:
             args.append(node.expression)
-        rendered = [_render_value_expression_to_4x(arg) for arg in args]
+        rendered = [_render_value_expression_to_4x(arg, source_alias=source_alias) for arg in args]
         if any(part is None for part in rendered):
             return None
         return f"ROUND({', '.join(rendered)})"
 
     if isinstance(node, (exp.Floor, exp.Ceil)):
-        inner = _render_value_expression_to_4x(node.this)
+        inner = _render_value_expression_to_4x(node.this, source_alias=source_alias)
         if inner is None:
             return None
         name = "FLOOR" if isinstance(node, exp.Floor) else "CEIL"
@@ -3532,13 +3577,13 @@ def _render_value_expression_to_4x(node) -> str | None:
 
     if isinstance(node, exp.Replace):
         parts = [node.this, node.expression, node.args.get("replacement")]
-        rendered = [_render_value_expression_to_4x(part) for part in parts]
+        rendered = [_render_value_expression_to_4x(part, source_alias=source_alias) for part in parts]
         if any(part is None for part in rendered):
             return None
         return f"REPLACE({', '.join(rendered)})"
 
     if isinstance(node, exp.Cast):
-        inner = _render_value_expression_to_4x(node.this)
+        inner = _render_value_expression_to_4x(node.this, source_alias=source_alias)
         to_type = node.args.get("to")
         type_name = getattr(to_type, "this", None) or getattr(to_type, "name", None) or to_type
         type_text = str(type_name).strip() if type_name is not None else ""
@@ -3555,7 +3600,7 @@ def _render_value_expression_to_4x(node) -> str | None:
         type_text = str(type_name).strip() if type_name is not None else ""
         if type_text.startswith("DType."):
             type_text = type_text.split(".", 1)[1]
-        inner = _render_value_expression_to_4x(node.args.get("expression") or node.expression)
+        inner = _render_value_expression_to_4x(node.args.get("expression") or node.expression, source_alias=source_alias)
         if inner is None or not type_text:
             return None
         return f'CONVERT({inner}, "{type_text}")'
@@ -3563,7 +3608,7 @@ def _render_value_expression_to_4x(node) -> str | None:
     if isinstance(node, exp.Extract):
         part = node.this
         part_text = str(getattr(part, "this", part) or "").strip().lower()
-        field = _render_value_expression_to_4x(node.expression)
+        field = _render_value_expression_to_4x(node.expression, source_alias=source_alias)
         if not part_text or field is None:
             return None
         return f'DATEPART({field}, "{part_text}")'
@@ -3576,8 +3621,8 @@ def _render_value_expression_to_4x(node) -> str | None:
             return None
         # T-SQL DATEDIFF(unit, start, end) → sqlglot DateDiff(this=end, expression=start).
         # Platform samples use DATEDIFF(end, start, "d").
-        end = _render_value_expression_to_4x(node.this)
-        start = _render_value_expression_to_4x(node.expression)
+        end = _render_value_expression_to_4x(node.this, source_alias=source_alias)
+        start = _render_value_expression_to_4x(node.expression, source_alias=source_alias)
         if end is None or start is None:
             return None
         return f"DATEDIFF({end}, {start}, {unit_token})"
@@ -3585,8 +3630,8 @@ def _render_value_expression_to_4x(node) -> str | None:
     if isinstance(node, exp.DateAdd):
         unit = getattr(node.args.get("unit"), "this", None)
         unit_text = str(unit).upper() if unit is not None else ""
-        base = _render_value_expression_to_4x(node.this)
-        amount = _render_value_expression_to_4x(node.expression)
+        base = _render_value_expression_to_4x(node.this, source_alias=source_alias)
+        amount = _render_value_expression_to_4x(node.expression, source_alias=source_alias)
         if base is None or amount is None:
             return None
         return _format_platform_date_offset(unit_text, amount, base)
@@ -3595,8 +3640,8 @@ def _render_value_expression_to_4x(node) -> str | None:
         args = list(node.expressions or [])
         if len(args) < 2:
             return None
-        index = _render_value_expression_to_4x(args[0])
-        choices = [_render_value_expression_to_4x(arg) for arg in args[1:]]
+        index = _render_value_expression_to_4x(args[0], source_alias=source_alias)
+        choices = [_render_value_expression_to_4x(arg, source_alias=source_alias) for arg in args[1:]]
         if index is None or any(choice is None for choice in choices):
             return None
         if len(choices) == 1:
@@ -3612,12 +3657,12 @@ def _render_value_expression_to_4x(node) -> str | None:
             args: list[str] = []
             this = getattr(node, "this", None)
             if this is not None and not isinstance(node, exp.Anonymous):
-                rendered_this = _render_value_expression_to_4x(this)
+                rendered_this = _render_value_expression_to_4x(this, source_alias=source_alias)
                 if rendered_this is None:
                     return None
                 args.append(rendered_this)
             for arg in node.expressions or []:
-                rendered_arg = _render_value_expression_to_4x(arg)
+                rendered_arg = _render_value_expression_to_4x(arg, source_alias=source_alias)
                 if rendered_arg is None:
                     return None
                 args.append(rendered_arg)
@@ -3690,7 +3735,11 @@ def _qualify_unqualified_condition_columns(node, source_alias: str):
         return node
 
     def transform(n):
-        if isinstance(n, exp.Column) and not n.table:
+        if (
+            isinstance(n, exp.Column)
+            and not n.table
+            and not _is_procedure_parameter_name(n.name or "")
+        ):
             return exp.column(n.name, table=alias)
         return n
 
@@ -3893,8 +3942,8 @@ def _render_sql_condition_to_4x(
 
     if isinstance(node, exp.Between):
         left = _render_boolean_predicate_leaf(node.this, source_alias=source_alias)
-        low = _render_value_expression_to_4x(node.args.get("low"))
-        high = _render_value_expression_to_4x(node.args.get("high"))
+        low = _render_value_expression_to_4x(node.args.get("low"), source_alias=source_alias)
+        high = _render_value_expression_to_4x(node.args.get("high"), source_alias=source_alias)
         if left is None or low is None or high is None:
             return None
         return f"{left} BETWEEN [{low},{high}]"
@@ -3910,7 +3959,7 @@ def _render_sql_condition_to_4x(
         if any(isinstance(expr, (exp.Select, exp.Subquery, exp.Union)) for expr in values_nodes):
             return None
         left = _render_boolean_predicate_leaf(node.this, source_alias=source_alias)
-        values = [_render_value_expression_to_4x(expr) for expr in values_nodes]
+        values = [_render_value_expression_to_4x(expr, source_alias=source_alias) for expr in values_nodes]
         if left is None or not values or any(value is None for value in values):
             return None
         return f'{left} IN [{",".join(values)}]'
@@ -3937,7 +3986,7 @@ def _render_sql_condition_to_4x(
         if isinstance(pattern_node, exp.Literal):
             pattern = str(pattern_node.this)
         else:
-            rendered_pattern = _render_value_expression_to_4x(pattern_node)
+            rendered_pattern = _render_value_expression_to_4x(pattern_node, source_alias=source_alias)
             if rendered_pattern and rendered_pattern.startswith('"') and rendered_pattern.endswith('"'):
                 pattern = rendered_pattern[1:-1]
         if left is None or pattern is None:
@@ -4279,12 +4328,12 @@ def _parse_simple_assignment_stage(
                     continue
                 value_node = unwrap_parens(assignment.expression)
                 if isinstance(value_node, exp.Case):
-                    case_translation = _translate_case_to_4x(value_node)
+                    case_translation = _translate_case_to_4x(value_node, source_alias=source_alias)
                     if case_translation is None:
                         break
                     case_translation = _rewrite_business_date_variables(case_translation, entity_name, source_sql=context_sql)
                     return guard, case_translation, assignment.this.name
-                value = _render_value_expression_to_4x(value_node)
+                value = _render_value_expression_to_4x(value_node, source_alias=source_alias)
                 if value is not None:
                     value = _rewrite_business_date_variables(value, entity_name, source_sql=context_sql)
                     if validate_expression(value).valid:
@@ -4320,7 +4369,7 @@ def _parse_simple_assignment_stage(
             except Exception:
                 rhs_tree = None
             if rhs_tree is not None:
-                value = _render_value_expression_to_4x(rhs_tree)
+                value = _render_value_expression_to_4x(rhs_tree, source_alias=source_alias)
                 if value is not None:
                     guard = ""
                     if isinstance(tree, exp.Update):
@@ -6561,7 +6610,23 @@ def _collect_source_reference_inventory(
        column-to-qualifier pairings; and
     2. let the grounding step rewrite a hallucinated qualifier only when
        the source SQL already proves an unambiguous real qualifier exists.
+
+    Memoized (see _collect_source_reference_inventory_cached): called once
+    per column with `text` built from the whole procedure body, so an
+    uncached call re-parses the entire procedure -- for a large procedure
+    that is thousands of redundant full sqlglot parses across its columns.
+    The result is an immutable (frozen dataclass) fact set, so sharing one
+    cached instance across calls with the same input is safe.
     """
+    return _collect_source_reference_inventory_cached(text, dialect, entity_name)
+
+
+@lru_cache(maxsize=256)
+def _collect_source_reference_inventory_cached(
+    text: str,
+    dialect: Dialect,
+    entity_name: str = "",
+) -> _SourceReferenceInventory:
     allowed_qualifiers: set[str] = set()
     qualifiers_by_column: dict[str, set[str]] = {}
 

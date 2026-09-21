@@ -140,8 +140,76 @@ _CROSS_ROW_RE = re.compile(
 )
 _WRITE_TYPES = {"INSERT", "UPDATE", "MERGE", "DELETE", "TRUNCATE", "SELECT"}
 
+# A join condition rendered from the parsed tree can carry an inline
+# comment sqlglot attached to the AST node (e.g. `S.Id = A.Id /* Rule 4: ... */`)
+# -- stripped before checking the shape is a plain equality, not a real
+# part of the join predicate.
+_JOIN_COND_COMMENT_RE = re.compile(r"(?s)/\*.*?\*/|--[^\n]*")
+_EQUALITY_JOIN_COND_RE = re.compile(
+    r'(?is)^[\w."\[\]]+\s*=\s*[\w."\[\]]+(?:\s+AND\s+[\w."\[\]]+\s*=\s*[\w."\[\]]+)*$'
+)
 
-def _classify_write(stmt: StatementInfo, preceding: Iterable[StatementInfo]) -> tuple[WriteKind, ConditionScope, list[str]]:
+
+def _join_is_lookup(stmt: StatementInfo) -> bool:
+    """True when every JOIN in this UPDATE is a lookup -- reached by plain
+    equality on its full key, contributing no aggregate/window/GROUP BY --
+    as opposed to a genuine fan-out join.
+
+    T-SQL routinely expresses a single-row update-with-dimension-lookup as
+    `UPDATE a SET ... FROM t a INNER JOIN dim d ON a.key = d.key`; that is
+    semantically a foreign-key reference (4X's "Entity"."FK_DIM"."Column"),
+    not a relational/set-based write, and must not be classified the same
+    as a genuine multi-row fan-out join.
+    """
+    raw = stmt.raw_text or ""
+    if re.search(r"(?is)\bGROUP\s+BY\b|\bOVER\s*\(|\bHAVING\b", raw):
+        return False
+    if not stmt.join_conditions:
+        return False
+    for cond in stmt.join_conditions:
+        cleaned = _JOIN_COND_COMMENT_RE.sub(" ", cond).strip()
+        if not _EQUALITY_JOIN_COND_RE.match(cleaned):
+            return False
+    return True
+
+
+def _global_temp_merge_sources(statements: list[StatementInfo]) -> set[str]:
+    """`##` global temp tables in this object that a later INSERT/UPDATE/
+    MERGE reads from while writing to a persistent (non-#) table -- i.e.
+    a working copy of an entity that this same procedure merges back into
+    its real table, not session-local scratch space.
+
+    Session-local `#temp` scratch tables are excluded on purpose: a `##`
+    global temp is shared across a whole batch of procedures the way a
+    real entity is, so when one of them is provably the source a
+    persistent write reads from, it is materially different from a
+    disposable `#temp` intermediate and should not be automatically
+    excluded from DD coverage the same way.
+
+    This only sees the merge-back when it happens within this same
+    object's own statements -- a `##` table whose merge into its real
+    table happens in a *different* procedure later in the batch (a real,
+    common pattern in this corpus) isn't detectable from one object's
+    StructuralInfo alone, so it is conservatively left as TEMP_STAGING.
+    """
+    sources: set[str] = set()
+    for stmt in statements:
+        if stmt.statement_type not in {"INSERT", "UPDATE", "MERGE"}:
+            continue
+        targets = stmt.tables_written or []
+        if not any(not _TEMP_RE.match(t) for t in targets):
+            continue
+        for table in stmt.tables_read or []:
+            if table.startswith("##"):
+                sources.add(table.upper())
+    return sources
+
+
+def _classify_write(
+    stmt: StatementInfo,
+    preceding: Iterable[StatementInfo],
+    global_temp_merge_sources: frozenset[str] = frozenset(),
+) -> tuple[WriteKind, ConditionScope, list[str]]:
     notes: list[str] = []
     raw = stmt.raw_text or ""
     target = (stmt.tables_written[0] if stmt.tables_written else "") or ""
@@ -172,7 +240,13 @@ def _classify_write(stmt: StatementInfo, preceding: Iterable[StatementInfo]) -> 
         return WriteKind.PROCEDURE_BRANCH, ConditionScope.PROCEDURE, notes
 
     if _TEMP_RE.match(target):
-        return WriteKind.TEMP_STAGING, ConditionScope.ROW, notes + ["temporary table write"]
+        if target.startswith("##") and target.upper() in global_temp_merge_sources:
+            notes = notes + [
+                "global temp table, but this procedure later merges it into a persistent "
+                "table -- treated as the entity's working copy, not disposable scratch space"
+            ]
+        else:
+            return WriteKind.TEMP_STAGING, ConditionScope.ROW, notes + ["temporary table write"]
 
     if _STATUS_RE.search(target):
         return WriteKind.PROCESS_STATUS, ConditionScope.PROCEDURE, notes + ["process-status bookkeeping"]
@@ -187,6 +261,11 @@ def _classify_write(stmt: StatementInfo, preceding: Iterable[StatementInfo]) -> 
         return WriteKind.SET_BASED_DELETE, ConditionScope.ROW, notes + [f"set-based {stmt.statement_type}"]
     if stmt.statement_type == "UPDATE":
         if stmt.join_tables or re.search(r"(?is)\bJOIN\b", raw):
+            if _join_is_lookup(stmt):
+                return WriteKind.ROW_FORMULA, ConditionScope.ROW, notes + [
+                    "UPDATE…FROM/JOIN on a plain equality key — dimension/reference lookup, "
+                    "expressible as a per-row formula"
+                ]
             return WriteKind.CROSS_ROW, ConditionScope.ROW, notes + [
                 "UPDATE…FROM/JOIN — relational write; requires workflow or manual mapping"
             ]
@@ -233,6 +312,7 @@ def reconcile_write_inventory(source_sql: str, entries: Iterable[WriteLedgerEntr
 def build_coverage_ledger(info: StructuralInfo, source_sql: str = "") -> CoverageLedger:
     ledger = CoverageLedger(object_id=info.object_id)
     statements = list(info.statements or [])
+    global_temp_merge_sources = frozenset(_global_temp_merge_sources(statements))
     for i, stmt in enumerate(statements):
         is_select_into = (
             stmt.statement_type == "SELECT"
@@ -242,7 +322,7 @@ def build_coverage_ledger(info: StructuralInfo, source_sql: str = "") -> Coverag
         if stmt.statement_type not in {"INSERT", "UPDATE", "MERGE", "DELETE", "TRUNCATE"} and not is_select_into:
             continue
         targets = list(stmt.tables_written) or [""]
-        kind, scope, notes = _classify_write(stmt, statements[:i])
+        kind, scope, notes = _classify_write(stmt, statements[:i], global_temp_merge_sources)
         for target in targets:
             columns = list((stmt.set_columns_by_table or {}).get(target, []))
             if not columns and stmt.set_columns_by_table:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
+from functools import lru_cache
 
 import sqlglot
 from sqlglot import exp
@@ -79,7 +80,26 @@ def collect_table_aliases(text: str, dialect: Dialect) -> dict[str, tuple[str, .
     Only real base-table aliases are included. Ambiguous aliases that map
     to more than one distinct table reference across the provided text are
     dropped rather than guessed.
+
+    Memoized: this is called once per DD column being generated (see
+    dd_generation_engine.py), each time re-running split_statements plus a
+    sqlglot.parse_one per statement over the SAME whole-procedure text --
+    for a large procedure (hundreds of written columns, dozens of
+    statements) that is tens of thousands of redundant full parses and was
+    measured to make procedure-scale generation not finish in any
+    reasonable time. The same (text, dialect) pair recurs constantly
+    across columns of the same object, so caching this pure function (no
+    logic change, same result every time for the same input) is a direct,
+    safe fix for that -- verified end-to-end: >1500s (did not finish) ->
+    267s on the procedure that originally triggered this. maxsize is
+    bounded so a long-running server process doesn't accumulate unbounded
+    cache entries across many different jobs/procedures over its lifetime.
     """
+    return _collect_table_aliases_cached(text, dialect)
+
+
+@lru_cache(maxsize=256)
+def _collect_table_aliases_cached(text: str, dialect: Dialect) -> dict[str, tuple[str, ...]]:
     if not text:
         return {}
 

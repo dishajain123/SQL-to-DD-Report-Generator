@@ -545,6 +545,27 @@ def test_grounded_source_references_do_not_guess_when_multiple_source_qualifiers
     assert grounded == expr
 
 
+def test_collect_source_reference_inventory_cache_distinguishes_entity_name():
+    # Performance fix: this is called once per column with the same
+    # whole-procedure text and memoized to avoid re-parsing thousands of
+    # times per procedure. entity_name affects the RESULT
+    # (target_entity_name) but not the underlying scan, so the cache key
+    # must include it -- otherwise two columns on different target tables
+    # sharing the same source text would silently get each other's
+    # target_entity_name back.
+    from app.derivation.dd_generation_engine import _collect_source_reference_inventory_cached
+
+    sql = "SELECT A.Col FROM AccountCal A"
+    _collect_source_reference_inventory_cached.cache_clear()
+
+    inv1 = _collect_source_reference_inventory(sql, Dialect.ORACLE, entity_name="EntityOne")
+    inv2 = _collect_source_reference_inventory(sql, Dialect.ORACLE, entity_name="EntityTwo")
+
+    assert inv1.target_entity_name == "ENTITYONE"
+    assert inv2.target_entity_name == "ENTITYTWO"
+    assert _collect_source_reference_inventory_cached.cache_info().currsize == 2
+
+
 def test_alias_resolution_rewrites_final_platform_condition_to_source_table_name():
     inventory = _collect_alias_resolution_inventory(
         "SELECT a.AccountEntityID FROM ACCOUNTCAL a",
@@ -1292,10 +1313,75 @@ def test_translate_case_to_4x_produces_valid_grammar():
     composed = _compose_simple_assignment_expression([site], "T", "RISK_BAND")
 
     assert composed is not None
-    assert 'IF(DPD > 90)THEN("NPA")' in composed
-    assert 'ELSEIF(DPD > 30)THEN("SMA")' in composed
+    # DPD is bare in the source (no alias prefix); qualified with the
+    # statement's own source table ("T") rather than left as an
+    # unresolvable bare token, same as any other bare column reference.
+    assert 'IF("T"."DPD" > 90)THEN("NPA")' in composed
+    assert 'ELSEIF("T"."DPD" > 30)THEN("SMA")' in composed
     assert 'ELSE("STANDARD")' in composed
     assert validate_expression(composed).valid
+
+
+def test_bare_value_side_column_is_qualified_with_source_alias():
+    # Regression: _render_value_expression_to_4x historically left a bare
+    # VALUE-side column (the RHS actually being assigned, as opposed to a
+    # WHERE/guard-side column, which was already qualified) unquoted and
+    # unqualified -- exported as a raw token the platform can't resolve to
+    # any entity, e.g. `SET A.AppGovGur = GovtGtyAmt` composing to the bare
+    # `GovtGtyAmt` instead of `"AccountCal"."GovtGtyAmt"`.
+    from app.derivation.dd_generator import _compose_simple_assignment_expression, _AssignmentSite
+
+    raw = "UPDATE A SET A.AppGovGur = GovtGtyAmt FROM PRO.AccountCal A WHERE A.FacilityType NOT IN ('BP','BD')"
+    site = _AssignmentSite(kind="UPDATE", statement_indices=[1], raw_sql=raw, columns_written=["AppGovGur"])
+    composed = _compose_simple_assignment_expression([site], "AccountCal", "AppGovGur")
+
+    assert composed is not None
+    assert '"AccountCal"."GovtGtyAmt"' in composed
+    assert validate_expression(composed).valid
+
+
+def test_bare_value_side_column_inside_aggregate_is_qualified():
+    from app.derivation.dd_generator import _compose_simple_assignment_expression, _AssignmentSite
+
+    raw = "UPDATE A SET A.Total = MAX(SomeMetric) FROM PRO.Fact A WHERE A.Id = 1"
+    site = _AssignmentSite(kind="UPDATE", statement_indices=[1], raw_sql=raw, columns_written=["Total"])
+    composed = _compose_simple_assignment_expression([site], "Fact", "Total")
+
+    assert composed is not None
+    assert 'MAX("Fact"."SomeMetric")' in composed
+
+
+def test_business_date_variable_stays_rewritten_not_qualified_as_a_column():
+    # Regression: qualifying a bare process-date scalar variable
+    # (v_ProcessDate) as if it were a real column defeats
+    # _rewrite_business_date_variables, which specifically relies on the
+    # name staying unqualified so it can recognize and rewrite it to
+    # "Entity"."var"."BUSINESS_DATE".
+    from app.derivation.dd_generator import _compose_simple_assignment_expression, _AssignmentSite
+
+    raw = "UPDATE A SET A.LastRunDate = v_ProcessDate FROM PRO.Fact A WHERE A.Id = 1"
+    site = _AssignmentSite(kind="UPDATE", statement_indices=[1], raw_sql=raw, columns_written=["LastRunDate"])
+    composed = _compose_simple_assignment_expression([site], "Fact", "LastRunDate")
+
+    assert composed is not None
+    assert '"Fact"."var"."BUSINESS_DATE"' in composed
+    assert "v_ProcessDate" not in composed
+
+
+def test_bare_timekey_parameter_stays_bare_on_value_side_too():
+    # Platform convention (dd_generation.yaml): a rule-versioning threshold
+    # parameter is written as its own bare, unquoted name -- must never be
+    # qualified with a table alias, on the value side any more than the
+    # guard side.
+    from app.derivation.dd_generator import _compose_simple_assignment_expression, _AssignmentSite
+
+    raw = "UPDATE A SET A.SnapshotTimeKey = p_TIMEKEY FROM PRO.Fact A WHERE A.Id = 1"
+    site = _AssignmentSite(kind="UPDATE", statement_indices=[1], raw_sql=raw, columns_written=["SnapshotTimeKey"])
+    composed = _compose_simple_assignment_expression([site], "Fact", "SnapshotTimeKey")
+
+    assert composed is not None
+    assert "THEN(p_TIMEKEY)" in composed
+    assert '"p_TIMEKEY"' not in composed and '"Fact"."p_TIMEKEY"' not in composed
 
 
 def test_translate_case_to_4x_bails_out_on_complex_real_nested_case(dpd_calculation_sql):
