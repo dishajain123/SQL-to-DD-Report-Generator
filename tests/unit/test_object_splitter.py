@@ -38,3 +38,26 @@ def test_sqlserver_bracketed_object_name_is_split_correctly(sma_marking_sql):
     assert len(objs) == 1
     assert objs[0].name == "SMA_MARKING_12122023"
     assert objs[0].object_type == ObjectType.PROCEDURE
+
+
+def test_create_proc_short_form_is_recognized_as_a_procedure():
+    text = (
+        "USE [RBL_MISDB]\nGO\nSET ANSI_NULLS ON\nGO\n"
+        "CREATE PROC PRO.DPD_Calculation AS\nBEGIN\n  SELECT 1;\nEND\n"
+    )
+    objs = split_objects(text, "PRO.DPD_Calculation.StoredProcedure.sql", Dialect.SQLSERVER)
+    assert len(objs) == 1
+    assert objs[0].name == "DPD_Calculation"
+    assert objs[0].object_type == ObjectType.PROCEDURE
+    # The USE/GO/SET ANSI_NULLS preamble must be excluded from raw_sql, same
+    # as it is for the CREATE PROCEDURE long form.
+    assert "USE [RBL_MISDB]" not in objs[0].raw_sql
+    assert objs[0].raw_sql.upper().startswith("CREATE PROC")
+
+
+def test_alter_procedure_is_recognized_without_a_preceding_create():
+    text = "ALTER PROCEDURE PRO.CustAccountMerge AS\nBEGIN\n  SELECT 1;\nEND\n"
+    objs = split_objects(text, "PRO.CustAccountMerge.StoredProcedure.sql", Dialect.SQLSERVER)
+    assert len(objs) == 1
+    assert objs[0].name == "CustAccountMerge"
+    assert objs[0].object_type == ObjectType.PROCEDURE

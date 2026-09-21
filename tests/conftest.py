@@ -51,6 +51,11 @@ class MockLLMClient:
             '"FCT_NPA_PRODUCT"."OverDueSinceDt","d")+1)ELSE(0)'
         )
 
+    def drain_token_usage(self) -> list[dict]:
+        # No real provider call happens here, so there is nothing to
+        # report -- matches LLMClient.drain_token_usage()'s empty-log case.
+        return []
+
 
 class BrokenLLMClient(MockLLMClient):
     """Always returns an invalid expression — used to test the

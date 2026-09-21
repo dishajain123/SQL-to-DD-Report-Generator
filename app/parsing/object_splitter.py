@@ -14,11 +14,15 @@ from app.models.core import Dialect, ObjectType, SQLObject
 _OBJECT_NAME_RE = r'(?:"[^"]+"|\[[^\]]+\]|[A-Za-z0-9_]+)'
 _QUALIFIED_OBJECT_NAME_RE = rf"{_OBJECT_NAME_RE}(?:\s*\.\s*{_OBJECT_NAME_RE})*"
 _OBJECT_START_RE = re.compile(
-    r"CREATE\s+(?:OR\s+(?:REPLACE|ALTER)\s+)?"
-    r"(PROCEDURE|FUNCTION|TRIGGER|VIEW)\s+"
+    r"(?:CREATE|ALTER)\s+(?:OR\s+(?:REPLACE|ALTER)\s+)?"
+    r"(PROCEDURE|PROC|FUNCTION|TRIGGER|VIEW)\s+"
     rf"({_QUALIFIED_OBJECT_NAME_RE})",
     re.IGNORECASE,
 )
+
+# T-SQL's short form for CREATE/ALTER PROCEDURE -- normalized to the
+# ObjectType enum's spelling before constructing SQLObject.
+_OBJECT_TYPE_ALIASES = {"PROC": "PROCEDURE"}
 
 
 def split_objects(sql_text: str, source_file: str, dialect: Dialect) -> list[SQLObject]:
@@ -48,6 +52,7 @@ def split_objects(sql_text: str, source_file: str, dialect: Dialect) -> list[SQL
         body = sql_text[start:end].strip()
 
         obj_type_raw = match.group(1).upper()
+        obj_type_raw = _OBJECT_TYPE_ALIASES.get(obj_type_raw, obj_type_raw)
         name_raw = _normalize_object_name(match.group(2))
         # Strip schema qualifier (PRO.DPD_Calculation -> DPD_Calculation) but
         # keep the full qualified name available in raw_sql for traceability.

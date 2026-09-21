@@ -125,3 +125,41 @@ def test_parse_statement_flags_unparseable_sql():
     info = parse_statement(stmt, 0, Dialect.ORACLE)
     assert not info.parsed_ok
     assert info.parse_error is not None
+
+
+def test_parse_statement_captures_where_clause_as_a_condition():
+    # Regression: a plain UPDATE ... WHERE with no IF/CASE at all is the
+    # overwhelming majority shape in this corpus, and its WHERE clause
+    # *is* the derivation condition -- the IF/CASE-WHEN regex extraction
+    # alone never saw it, so it never reached the chunk/report condition
+    # inventory.
+    stmt = "UPDATE A SET A.X = 1 FROM T A WHERE A.Y = 'Y';"
+    info = parse_statement(stmt, 0, Dialect.SQLSERVER)
+    assert info.parsed_ok
+    assert any("A.Y = 'Y'" in c for c in info.conditions)
+
+
+def test_parse_statement_captures_merge_on_and_when_conditions():
+    stmt = (
+        "MERGE INTO T USING S ON (T.id = S.id)\n"
+        "WHEN MATCHED AND S.flag = 1 THEN UPDATE SET T.x = S.x\n"
+        "WHEN NOT MATCHED THEN INSERT (id) VALUES (S.id);"
+    )
+    info = parse_statement(stmt, 0, Dialect.SQLSERVER)
+    assert info.parsed_ok
+    assert any("T.id" in c and "S.id" in c for c in info.conditions)
+    assert any("S.flag = 1" in c for c in info.conditions)
+
+
+def test_parse_statement_does_not_extract_conditions_from_comments():
+    # Comment-stripping already exists (_mask_comments_only) -- retired
+    # logic left in a comment must not appear as a live condition.
+    stmt = (
+        "/* retired rule\n"
+        "IF B.ProvisionRule IN ('OTHERS/BLANK') THEN X := 1; END IF;\n"
+        "*/\n"
+        "UPDATE T SET Y = CASE WHEN Z = 1 THEN 2 ELSE 0 END;"
+    )
+    info = parse_statement(stmt, 0, Dialect.ORACLE)
+    assert not any("ProvisionRule" in c for c in info.conditions)
+    assert any("Z = 1" in c for c in info.conditions)

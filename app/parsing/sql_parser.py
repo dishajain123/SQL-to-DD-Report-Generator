@@ -621,6 +621,18 @@ def parse_statement(stmt_text: str, index: int, dialect: Dialect) -> StatementIn
     info.set_columns_by_table = _set_columns_by_table(tree, stmt_type, info.tables_written)
     info.join_tables, info.join_conditions = _join_info_from_tree(tree)
     info.conditions = _extract_conditions(stmt_text)
+    # The IF/CASE-WHEN regex extraction above never sees a plain
+    # `UPDATE/DELETE ... WHERE ...` or a MERGE's ON/WHEN guards -- for the
+    # majority of writes in this corpus that only have a WHERE clause (no
+    # IF/CASE at all), that WHERE *is* the derivation condition, so
+    # without this it never reaches SmartChunk.conditions, the LLM's chunk
+    # context, or the report's condition list. Tree-based, so it only runs
+    # when sqlglot actually parsed this statement; appended (not replacing
+    # the regex path) since IF/CASE-WHEN extraction already works and is
+    # left untouched.
+    for extra_condition in _where_and_merge_conditions_from_tree(tree):
+        if extra_condition not in info.conditions:
+            info.conditions.append(extra_condition)
     needs_target = stmt_type in ("INSERT", "UPDATE", "MERGE", "DELETE", "TRUNCATE") or (
         stmt_type == "SELECT" and bool(re.search(r"(?is)\bINTO\s+#", stmt_text))
     )
@@ -906,6 +918,46 @@ def _join_info_from_tree(tree: exp.Expression) -> tuple[list[str], list[str]]:
                 join_conditions.append(cleaned)
 
     return sorted(join_tables), join_conditions
+
+
+def _render_condition_node(node: exp.Expression) -> str:
+    try:
+        rendered = node.sql()
+    except Exception:
+        rendered = str(node)
+    return _clean(rendered)
+
+
+def _where_and_merge_conditions_from_tree(tree: exp.Expression) -> list[str]:
+    """Row-scoping guard conditions a plain WHERE or MERGE ON/WHEN clause
+    expresses, which `_extract_conditions`'s IF/CASE-WHEN regexes never
+    see. Tree-based (only called once sqlglot has parsed the statement),
+    so it reflects the real predicate rather than a regex guess."""
+    out: list[str] = []
+    for where in tree.find_all(exp.Where):
+        predicate = where.this
+        if predicate is not None:
+            cleaned = _render_condition_node(predicate)
+            if cleaned:
+                out.append(cleaned)
+
+    merge_node = tree if isinstance(tree, exp.Merge) else tree.find(exp.Merge)
+    if merge_node is not None:
+        on_clause = merge_node.args.get("on")
+        if on_clause is not None:
+            cleaned = _render_condition_node(on_clause)
+            if cleaned:
+                out.append(cleaned)
+        whens = merge_node.args.get("whens")
+        when_exprs = whens.expressions if whens is not None else []
+        for when in when_exprs:
+            condition = when.args.get("condition")
+            if condition is not None:
+                cleaned = _render_condition_node(condition)
+                if cleaned:
+                    out.append(cleaned)
+
+    return out
 
 
 _CONDITION_KEYWORD_RE = re.compile(r"\b(?:IF|ELSIF|ELSEIF)\b", re.IGNORECASE)

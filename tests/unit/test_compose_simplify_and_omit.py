@@ -2,9 +2,31 @@
 from __future__ import annotations
 
 from app.derivation.dd_generation_engine import (
+    _dedupe_redundant_and_conjuncts,
     _should_omit_passthrough_dd_row,
     _simplify_composed_expression,
 )
+
+
+def test_dedupe_redundant_and_conjuncts_drops_exact_duplicate():
+    # Regression: guards from two different assignment sites AND-merged
+    # into one predicate can leave the same conjunct present twice -- that
+    # is always redundant (A AND A == A), so safe to collapse
+    # unconditionally.
+    expr = 'IF("A"."FlgPNPA" == "Y" AND "A"."FlgPNPA" == "Y" AND ISEMPTY("A"."X"))THEN(1)ELSE(0)'
+    assert _dedupe_redundant_and_conjuncts(expr) == (
+        'IF("A"."FlgPNPA" == "Y" AND ISEMPTY("A"."X"))THEN(1)ELSE(0)'
+    )
+
+
+def test_dedupe_redundant_and_conjuncts_leaves_distinct_conjuncts_alone():
+    expr = 'IF("A"."X" > 0 AND "A"."Y" == "Z")THEN(1)ELSE(0)'
+    assert _dedupe_redundant_and_conjuncts(expr) == expr
+
+
+def test_simplify_composed_expression_dedupes_and_conjuncts():
+    expr = 'IF("A"."X" == "Y" AND "A"."X" == "Y")THEN(1)ELSE(0)'
+    assert _simplify_composed_expression(expr) == 'IF("A"."X" == "Y")THEN(1)ELSE(0)'
 
 
 def test_collapse_tautology_else_branches():

@@ -3,7 +3,11 @@ from datetime import date
 from app.guardrails.input_guardrails import check_input_file, check_job_plan
 from app.guardrails.semantic_validation import check_invented_references
 from app.guardrails.semantic_validation import check_semantic_consistency
-from app.guardrails.output_guardrails import check_dd_row
+from app.guardrails.output_guardrails import (
+    check_contradictory_guard_conjuncts,
+    check_dd_row,
+    check_no_bare_identifiers,
+)
 from app.guardrails.structural_guardrails import check_structural_info
 from app.models.core import (
     CanonicalModel,
@@ -100,6 +104,104 @@ def test_output_guardrail_passes_clean_row():
         data_type="datetime", source_chain_id="c1", confidence=1.0,
     )
     assert check_dd_row(row, model).passed
+
+
+def test_check_no_bare_identifiers_flags_unqualified_column():
+    errs = check_no_bare_identifiers('IF(ISEMPTY(DebitSinceDt))THEN("A"."X")ELSE(0)')
+    assert any("DebitSinceDt" in e for e in errs)
+
+
+def test_check_no_bare_identifiers_allows_fully_quoted_expression():
+    assert check_no_bare_identifiers('IF("A"."X" > 0)THEN(1)ELSE(0)') == []
+
+
+def test_check_no_bare_identifiers_allows_known_functions_and_keywords():
+    assert check_no_bare_identifiers(
+        'IF(ISNOTEMPTY("A"."X") AND NOT(ISEMPTY("A"."Y")))THEN(COALESCE("A"."X", 0))ELSE(NULL)'
+    ) == []
+
+
+def test_check_no_bare_identifiers_allows_documented_timekey_parameter():
+    # Platform convention (dd_generation.yaml): a rule-versioning threshold
+    # parameter (T-SQL @TIMEKEY, Oracle bare p_TIMEKEY) is written as its
+    # own bare, unquoted name -- it is a parameter, not a column, and must
+    # never be flagged.
+    assert check_no_bare_identifiers('IF(p_TIMEKEY > 26267)THEN(1)ELSE(0)') == []
+
+
+def test_check_no_bare_identifiers_flags_unrewritten_exists_subquery_sql():
+    # Regression found while validating this guardrail against the real
+    # sample corpus: EXISTS predicates can carry raw, un-rewritten SQL
+    # (SELECT/FROM/WHERE and bare columns) instead of 4X syntax.
+    expr = 'IF(EXISTS((SELECT 1 FROM "AccountCal" WHERE AssetClass != "STANDARD")))THEN(1)ELSE(0)'
+    errs = check_no_bare_identifiers(expr)
+    assert any("AssetClass" in e for e in errs)
+
+
+def test_check_contradictory_guard_conjuncts_flags_isempty_isnotempty_same_arg():
+    expr = (
+        'IF("A"."FlgPNPA" == "Y" AND ISEMPTY("A"."PNPA_Reason") '
+        'AND ISNOTEMPTY("A"."PNPA_Reason"))THEN(1)ELSE(0)'
+    )
+    errs = check_contradictory_guard_conjuncts(expr)
+    assert errs
+    assert "unreachable" in errs[0]
+
+
+def test_check_contradictory_guard_conjuncts_flags_mutually_exclusive_equality():
+    expr = 'IF("A"."X" == "a" AND "A"."X" == "b")THEN(1)ELSE(0)'
+    errs = check_contradictory_guard_conjuncts(expr)
+    assert errs
+    assert "unreachable" in errs[0]
+
+
+def test_check_contradictory_guard_conjuncts_allows_clean_guard():
+    expr = 'IF("A"."X" > 0 AND "A"."Y" == "Z")THEN(1)ELSE(0)'
+    assert check_contradictory_guard_conjuncts(expr) == []
+
+
+def test_check_contradictory_guard_conjuncts_allows_different_arguments():
+    # ISEMPTY(x) AND ISNOTEMPTY(y) for two DIFFERENT references is a
+    # perfectly normal compound guard, not a contradiction.
+    expr = 'IF(ISEMPTY("A"."X") AND ISNOTEMPTY("A"."Y"))THEN(1)ELSE(0)'
+    assert check_contradictory_guard_conjuncts(expr) == []
+
+
+def test_output_guardrail_demotes_row_with_contradictory_guard():
+    model = CanonicalModel(
+        chain_id="c1", job_id="j1", object_ids=["x"],
+        technical_summary="t", business_summary="b", evidence=["FCT_NPA_PRODUCT"],
+    )
+    row = DDRow(
+        entity_name="FCT_NPA_PRODUCT", column_name="X", column_type=ColumnType.PHYSICAL,
+        derivation_option=DerivationOption.FORMULA_EXPRESSION,
+        display_derivation_expression=(
+            'IF(ISEMPTY("FCT_NPA_PRODUCT"."Y") AND ISNOTEMPTY("FCT_NPA_PRODUCT"."Y"))'
+            'THEN(1)ELSE(0)'
+        ),
+        effective_start_date=date(2026, 1, 1), status=DDStatus.ACTIVE,
+        data_type="number", source_chain_id="c1", confidence=1.0,
+    )
+    result = check_dd_row(row, model)
+    assert not result.passed
+    assert any("unreachable" in e for e in result.errors)
+
+
+def test_output_guardrail_demotes_row_with_bare_identifier():
+    model = CanonicalModel(
+        chain_id="c1", job_id="j1", object_ids=["x"],
+        technical_summary="t", business_summary="b", evidence=["FCT_NPA_PRODUCT"],
+    )
+    row = DDRow(
+        entity_name="FCT_NPA_PRODUCT", column_name="X", column_type=ColumnType.PHYSICAL,
+        derivation_option=DerivationOption.FORMULA_EXPRESSION,
+        display_derivation_expression='IF(ISEMPTY(DebitSinceDt))THEN("FCT_NPA_PRODUCT"."X")ELSE(0)',
+        effective_start_date=date(2026, 1, 1), status=DDStatus.ACTIVE,
+        data_type="number", source_chain_id="c1", confidence=1.0,
+    )
+    result = check_dd_row(row, model)
+    assert not result.passed
+    assert any("DebitSinceDt" in e for e in result.errors)
 
 
 def test_semantic_guardrail_flags_invented_bare_identifier():

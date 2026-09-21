@@ -4905,6 +4905,40 @@ def _expand_truncated_assignment_sql(
     return recovered if recovered and len(recovered) > len(text) else text
 
 
+def _find_snippet_in_procedure(proc: str, snippet: str, start: int = 0) -> int:
+    """Locate `snippet` (or its first ~120 chars) inside `proc`, tolerating
+    whitespace differences between them.
+
+    An assignment site's raw_sql can be reassembled from separately
+    `.strip()`-ped statement fragments joined with a single `\\n` (see
+    `_assignment_sites_from_statements`'s CONTROL_FLOW_BLOCK case, e.g. an
+    "ELSE" header folded onto the UPDATE it guards) -- that reassembly
+    collapses whatever original indentation/whitespace sat between them in
+    `proc`, even though the code itself is unchanged. An exact substring
+    search would then wrongly conclude the snippet isn't in `proc` at all.
+    Tries the cheap exact search first, then falls back to a whitespace-
+    insensitive regex search.
+    """
+    key = snippet[:120] if len(snippet) >= 40 else snippet
+    if not key:
+        return -1
+    idx = proc.find(key, start)
+    if idx >= 0:
+        return idx
+    idx = proc.find(key)
+    if idx >= 0:
+        return idx
+    parts = key.split()
+    if not parts:
+        return -1
+    pattern = re.compile(r"\s+".join(re.escape(part) for part in parts))
+    match = pattern.search(proc, start)
+    if match:
+        return match.start()
+    match = pattern.search(proc)
+    return match.start() if match else -1
+
+
 def _assignment_looks_like_control_flow_else_default(
     stage_raw: str,
     procedure_sql: str,
@@ -4931,10 +4965,11 @@ def _assignment_looks_like_control_flow_else_default(
     if not proc:
         return False
 
-    search_key = snippet.splitlines()[0].strip()
-    idx = proc.find(snippet[:120]) if len(snippet) >= 40 else proc.find(snippet)
-    if idx < 0 and search_key:
-        idx = proc.find(search_key)
+    idx = _find_snippet_in_procedure(proc, snippet)
+    if idx < 0:
+        search_key = snippet.splitlines()[0].strip()
+        if search_key:
+            idx = proc.find(search_key)
     if idx < 0:
         return False
 
@@ -4965,9 +5000,21 @@ def _procedural_then_predicate_4x(
     snippet = (stage_raw or "").strip()
     if not snippet or not proc:
         return None
+    # A CONTROL_FLOW_BLOCK site can fold an "ELSE" or "ELSE IF"/"ELSIF"
+    # header directly onto the front of its own raw_sql (see
+    # _assignment_sites_from_statements). When that happens, the found
+    # `idx` below points at the START of that embedded header -- i.e. the
+    # header sits AFTER idx, inside the matched snippet, not before it --
+    # so the backward window search would instead find whatever unrelated
+    # header happens to precede this stage's real one and wrongly attach
+    # that stage's predicate here. Bail out first; ELSE/ELSE IF arms are
+    # for exclusive-branch compose, not this function, regardless of
+    # whether their header is embedded or sits in a separate statement.
+    if re.match(r"(?is)^\s*(?:ELSE\s+IF|ELSIF|ELSE)\b", snippet):
+        return None
     if _assignment_looks_like_control_flow_else_default(snippet, proc):
         return None
-    idx = proc.find(snippet[:120]) if len(snippet) >= 40 else proc.find(snippet)
+    idx = _find_snippet_in_procedure(proc, snippet)
     if idx < 0:
         return None
     window = proc[max(0, idx - 400) : idx]
@@ -5024,24 +5071,41 @@ def _procedural_exclusive_branch_predicate(
     snippet = (stage_raw or "").strip()
     if not snippet or not proc:
         return None, -1, False
-    key = snippet[:120] if len(snippet) >= 40 else snippet
-    idx = proc.find(key, max(0, search_from))
-    if idx < 0:
-        idx = proc.find(key)
+    idx = _find_snippet_in_procedure(proc, snippet, max(0, search_from))
     if idx < 0:
         return None, -1, False
+
+    # A CONTROL_FLOW_BLOCK assignment site can already fold its own
+    # guarding ELSE/ELSEIF header directly onto the front of the write
+    # (see _assignment_sites_from_statements) -- once that header is part
+    # of the snippet itself, it is no longer part of the *preceding* text
+    # the window search below looks at, so that search alone would miss
+    # it. Mirrors the same check in
+    # _assignment_looks_like_control_flow_else_default.
+    embedded_else_if = re.match(
+        r"(?is)^\s*(?:ELSE\s+IF|ELSIF)\s+(?P<cond>.+?)\s+(?:BEGIN|THEN)\b", snippet
+    )
+    if embedded_else_if:
+        return embedded_else_if.group("cond").strip(), idx, False
+    if re.match(r"(?is)^\s*ELSE\b(?!\s+IF\b)\s*(?:(?:BEGIN|THEN)\s*)?(?:\r?\n|$)", snippet):
+        return "", idx, False
+
     window = proc[max(0, idx - 600) : idx]
     cleaned = "\n".join(line.split("--", 1)[0] for line in window.splitlines())
     upper = cleaned.upper()
-    if re.search(r"\bELSE\b(?!\s+IF\b)\s+BEGIN\s*$", upper):
+    # T-SQL opens a branch body with `BEGIN`; Oracle PL/SQL opens it with
+    # `THEN` and has no BEGIN at all for an IF/ELSIF/ELSE arm (BEGIN there
+    # only wraps the whole procedure/block). Both are accepted so this
+    # detector isn't T-SQL-only.
+    if re.search(r"\bELSE\b(?!\s+IF\b)\s*(?:(?:BEGIN|THEN)\s*)?$", upper):
         return "", idx, False
     else_if = list(
-        re.finditer(r"(?is)\bELSE\s+IF\s+(?P<cond>.+?)\s+BEGIN\b", cleaned)
+        re.finditer(r"(?is)\b(?:ELSE\s+IF|ELSIF)\s+(?P<cond>.+?)\s+(?:BEGIN|THEN)\b", cleaned)
     )
     if else_if:
         return else_if[-1].group("cond").strip(), idx, False
     if_match = list(
-        re.finditer(r"(?is)\bIF\s+(?!OBJECT_ID\b)(?P<cond>.+?)\s+BEGIN\b", cleaned)
+        re.finditer(r"(?is)\bIF\s+(?!OBJECT_ID\b)(?P<cond>.+?)\s+(?:BEGIN|THEN)\b", cleaned)
     )
     if not allow_opening_if:
         return None, idx, bool(if_match)
@@ -5050,8 +5114,12 @@ def _procedural_exclusive_branch_predicate(
     return None, idx, False
 
 
+# `@` is T-SQL's sigil for a parameter/local variable; Oracle PL/SQL
+# parameters (e.g. `p_TIMEKEY`) carry no sigil at all, so it is optional
+# here rather than required -- see dd_generation.yaml's documented
+# platform convention for exactly this shape (`IF p_TIMEKEY > 26267`).
 _SIMPLE_SCALAR_COMPARISON_RE = re.compile(
-    r"(?is)^@(?P<var>[A-Za-z_][\w]*)\s*(?P<op>=|<>|!=|>=|<=|>|<)\s*"
+    r"(?is)^@?(?P<var>[A-Za-z_][\w]*)\s*(?P<op>=|<>|!=|>=|<=|>|<)\s*"
     r"(?P<lit>'[^']*'|-?\d+(?:\.\d+)?)\s*$"
 )
 _COMPARISON_OP_MAP = {"=": "==", "<>": "!=", "!=": "!=", ">=": ">=", "<=": "<=", ">": ">", "<": "<"}
@@ -5141,9 +5209,16 @@ def _compose_exclusive_control_flow_stages(
     # unrelated writes (e.g. CoverShortfallFlag='N' before the fund IF).
     branched: list[tuple[tuple[str, str, str, str], str]] = []
     cursor = 0
-    for position, stage in enumerate(stages):
+    for stage in stages:
+        # A bare IF may open the chain the first time a real branch header
+        # is actually found -- not only when it happens to be the very
+        # first stage in `stages`. A leading unrelated unconditional write
+        # before the chain starts (e.g. an initial reset/seed UPDATE with
+        # no wrapping IF at all, which returns pred=None here without
+        # being disqualified) must not block the chain that follows it
+        # from opening with its own bare IF.
         pred, idx, disqualified = _procedural_exclusive_branch_predicate(
-            stage[3], procedure_sql, search_from=cursor, allow_opening_if=(position == 0)
+            stage[3], procedure_sql, search_from=cursor, allow_opening_if=(not branched)
         )
         if idx >= 0:
             cursor = idx + 1
@@ -5265,7 +5340,7 @@ def _procedural_if_predicate_before_stage(
     snippet = (stage_raw or "").strip()
     if not snippet or not proc:
         return None
-    idx = proc.find(snippet[:120]) if len(snippet) >= 40 else proc.find(snippet)
+    idx = _find_snippet_in_procedure(proc, snippet)
     if idx < 0:
         return None
     window = proc[max(0, idx - 500) : idx]
@@ -5490,6 +5565,81 @@ def _strip_dead_isempty_under_isnotempty(expression: str) -> str:
     return f"IF({guard})THEN({then_part})ELSE({else_part})"
 
 
+def _find_all_if_guards(expression: str) -> list[str]:
+    """Every guard substring inside the expression's IF(...)/ELSEIF(...)
+    headers, at any nesting depth -- used to scan every branch condition
+    in a composed formula, not just the outermost one."""
+    guards = []
+    for m in re.finditer(r"(?i)\b(?:IF|ELSEIF)\(", expression or ""):
+        open_idx = m.end() - 1
+        close_idx = _find_matching_paren(expression, open_idx)
+        if close_idx is not None and close_idx > open_idx:
+            guards.append(expression[open_idx + 1 : close_idx])
+    return guards
+
+
+def _split_top_level_and_conjuncts(guard: str) -> list[str]:
+    """Split a guard on top-level ` AND ` -- not inside parens or quoted
+    string literals -- into its individual conjuncts."""
+    text = guard or ""
+    parts: list[str] = []
+    depth = 0
+    in_quotes = False
+    start = 0
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '"':
+            in_quotes = not in_quotes
+            i += 1
+            continue
+        if in_quotes:
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif depth == 0 and text[i : i + 5].upper() == " AND ":
+            parts.append(text[start:i])
+            i += 5
+            start = i
+            continue
+        i += 1
+    parts.append(text[start:])
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _dedupe_redundant_and_conjuncts(expression: str) -> str:
+    """Drop an exact-duplicate conjunct from every AND-guard in the
+    expression: `A AND A` -> `A`. Composing two different assignment
+    sites' guards by ANDing them together (rather than keeping them as
+    separate, ordered branches) can leave the same conjunct present
+    twice -- always redundant (A AND A == A), so safe to collapse
+    unconditionally rather than just flagging it.
+    """
+    text = expression or ""
+    for guard in sorted(set(_find_all_if_guards(text)), key=len, reverse=True):
+        conjuncts = _split_top_level_and_conjuncts(guard)
+        if len(conjuncts) < 2:
+            continue
+        seen: list[str] = []
+        seen_normalized: set[str] = set()
+        for conjunct in conjuncts:
+            normalized = re.sub(r"\s+", "", conjunct).upper()
+            if normalized in seen_normalized:
+                continue
+            seen_normalized.add(normalized)
+            seen.append(conjunct)
+        if len(seen) == len(conjuncts):
+            continue
+        deduped_guard = " AND ".join(seen)
+        text = text.replace(f"IF({guard})", f"IF({deduped_guard})")
+        text = text.replace(f"ELSEIF({guard})", f"ELSEIF({deduped_guard})")
+    return text
+
+
 def _simplify_composed_expression(expression: str) -> str:
     """Remove dead/contradictory IF nesting left by sequential UPDATE folding."""
     text = (expression or "").strip()
@@ -5497,6 +5647,7 @@ def _simplify_composed_expression(expression: str) -> str:
         return text
     text = _strip_dead_isempty_under_isnotempty(text)
     text = _collapse_tautology_branches(text)
+    text = _dedupe_redundant_and_conjuncts(text)
     return text
 
 
@@ -6113,6 +6264,96 @@ def _repair_trailing_self_reference(expression: str, entity_name: str, column: s
     return candidate if candidate != expression else expression
 
 
+def _self_reference_pattern(entity_name: str, column: str) -> re.Pattern[str]:
+    return re.compile(
+        rf'"{re.escape(entity_name.upper())}"\s*\.\s*"{re.escape(column.upper())}"',
+        re.IGNORECASE,
+    )
+
+
+def _split_outer_if_then_else(expression: str) -> tuple[str, str, str] | None:
+    """If `expression` is exactly one outer IF(<guard>)THEN(<then>)ELSE(<else>)
+    -- no ELSEIF, nothing before or after -- return its three parenthesized
+    parts. Otherwise None (composed expressions with ELSEIF chains or extra
+    wrapping are left to _repair_self_referential_guard's caller to reject
+    the self-reference outright rather than guessing at a substitution)."""
+    text = expression.strip()
+    head = re.match(r"(?i)^IF\(", text)
+    if not head:
+        return None
+    guard_close = _find_matching_paren(text, head.end() - 1)
+    if guard_close < 0:
+        return None
+    after_guard = text[guard_close + 1:]
+    then_head = re.match(r"(?i)^THEN\(", after_guard)
+    if not then_head:
+        return None
+    then_close = _find_matching_paren(after_guard, then_head.end() - 1)
+    if then_close < 0:
+        return None
+    after_then = after_guard[then_close + 1:]
+    else_head = re.match(r"(?i)^ELSE\(", after_then)
+    if not else_head:
+        return None
+    else_close = _find_matching_paren(after_then, else_head.end() - 1)
+    if else_close < 0 or else_close != len(after_then) - 1:
+        return None
+    guard = text[head.end() : guard_close]
+    then_branch = after_guard[then_head.end() : then_close]
+    else_branch = after_then[else_head.end() : else_close]
+    return guard, then_branch, else_branch
+
+
+def _repair_self_referential_guard(expression: str, entity_name: str, column: str) -> tuple[str, bool]:
+    """A 4X row Formula Expression's `"entity"."column"` reference always
+    resolves to that column's currently STORED value -- a single-pass row
+    formula has no way to see a value its own IF/THEN/ELSE has just
+    computed. Sequential source SQL commonly clamps a freshly computed
+    value with a trailing `UPDATE ... SET col = 0 WHERE col < 0`-style
+    statement; composed as a row formula this becomes
+    `IF(COALESCE(self, 0) < 0)THEN(0)ELSE(<real derivation>)`, whose guard
+    is circular (it reads yesterday's stored value, not what the ELSE arm
+    itself computes) even though the source SQL is perfectly valid
+    imperative code.
+
+    Fix: since the ELSE arm already holds this column's real (self-
+    reference-free) derivation, substitute it into the guard in place of
+    the self-reference -- the guard then evaluates against the value this
+    same formula computes, matching the clamp's actual intent.
+
+    This deliberately targets only that one shape. A self-reference deep
+    inside a branch of a larger nested chain (e.g. a genuinely recursive-
+    style lineage formula spanning several ELSE arms) is left untouched --
+    existing advisory-only handling for that broader, harder-to-resolve
+    case is intentional elsewhere in this pipeline and out of scope here.
+
+    Returns (expression, blocked_unsafe). `blocked_unsafe` is True only in
+    the one case this repair recognizes but cannot resolve: the outer
+    guard self-references, and the branch that would replace it in the
+    guard is itself self-referential too -- there the guard is provably
+    circular with nothing safe to substitute, so the caller must not
+    export that expression as ACTIVE. Every other case (no self-reference,
+    a shape this repair doesn't target, or a successful substitution)
+    returns `blocked_unsafe=False`.
+    """
+    pattern = _self_reference_pattern(entity_name, column)
+    if not pattern.search(expression):
+        return expression, False
+
+    parts = _split_outer_if_then_else(expression)
+    if parts is None:
+        return expression, False
+    guard, then_branch, else_branch = parts
+    if not pattern.search(guard):
+        return expression, False
+    if pattern.search(then_branch) or pattern.search(else_branch):
+        return expression, True
+
+    new_guard = pattern.sub(f"({else_branch})", guard)
+    repaired = f"IF({new_guard})THEN({then_branch})ELSE({else_branch})"
+    return repaired, False
+
+
 def _expression_should_be_rejected(validation_errors: list[str]) -> bool:
     """Return True when the generated formula is not safe to export.
 
@@ -6631,6 +6872,7 @@ def _generate_for_column(
         procedure_sql=obj.raw_sql,
         entity_name_map=entity_name_map,
     )
+    deterministic_self_reference_blocked = False
     if deterministic_expression:
         deterministic_expression = _finalize_platform_expression(
             deterministic_expression,
@@ -6639,11 +6881,14 @@ def _generate_for_column(
             alias_resolution_inventory=alias_resolution_inventory,
             source_sql=obj.raw_sql,
         )
+        deterministic_expression, self_reference_blocked = _repair_self_referential_guard(
+            deterministic_expression, entity_name, column
+        )
         grammar_result = validate_expression(deterministic_expression)
         semantic_result = check_semantic_consistency(
             deterministic_expression, column, entity_name, relevant_chunks, obj.raw_sql, source_statement_sql
         )
-        if grammar_result.valid:
+        if grammar_result.valid and not self_reference_blocked:
             # Prefer a grammar-valid deterministic composition over LLM.
             # Semantic caveats (self-ref in process-status ELSE, sequential
             # order, etc.) become advisory notes — they must not discard a
@@ -6661,13 +6906,29 @@ def _generate_for_column(
             if dt_payload is not None:
                 derivation_option = DerivationOption.DECISION_TABLE
                 decision_table_json = json.dumps(dt_payload)
+        elif grammar_result.valid and self_reference_blocked:
+            # A self-reference survived composition and could not be safely
+            # resolved (see _repair_self_referential_guard) -- this must
+            # never ship ACTIVE with only an advisory footnote, since the
+            # guard would silently read a stale/circular value. Route
+            # straight to PENDING_REVIEW instead of trying the LLM path,
+            # which has no better way to see a value this formula itself
+            # would compute either.
+            deterministic_self_reference_blocked = True
+            deterministic_expression = None
+            row_advisory_seed_early = []
+            validation_errors = [
+                f'"{column}" formula reads its own value ("{entity_name}"."{column}") in a way '
+                "automated composition could not safely resolve into a non-circular condition. "
+                "Do not approve without rewriting this condition manually."
+            ]
         else:
             deterministic_expression = None
             row_advisory_seed_early = []
     else:
         row_advisory_seed_early = []
 
-    if expression is None:
+    if expression is None and not deterministic_self_reference_blocked:
         grounded_source_sql_excerpt = _append_allowed_reference_context(
             source_sql_excerpt, source_reference_inventory
         )
