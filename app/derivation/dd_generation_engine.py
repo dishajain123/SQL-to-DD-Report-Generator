@@ -7295,133 +7295,207 @@ def _split_top_level_and(condition: str) -> list[str]:
     return parts or ([condition.strip()] if condition.strip() else [])
 
 
+_PURE_REFERENCE_RE = re.compile(
+    r'^(?:"[^"]+"(?:\s*\.\s*"[^"]+")*|[A-Za-z_][A-Za-z0-9_]*)$'
+)
+_COALESCE_REFERENCE_RE = re.compile(r'(?is)^COALESCE\s*\(\s*(.+?)\s*,\s*[^,()]+\)$')
+_QUOTED_LITERAL_RE = re.compile(r'^"[^"]*"$')
+
+
+def _strip_outer_parens(text: str) -> str:
+    """Peel parentheses that wrap the whole of `text` -- `("A"."X")` ->
+    `"A"."X"` -- but never the parens of `(a) OP (b)`, whose first `(`
+    closes before the end of the string."""
+    text = (text or "").strip()
+    while text.startswith("(") and text.endswith(")"):
+        depth = 0
+        in_quotes = False
+        closes_at_end = False
+        for idx, ch in enumerate(text):
+            if ch == '"':
+                in_quotes = not in_quotes
+            elif not in_quotes:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        closes_at_end = idx == len(text) - 1
+                        break
+        if not closes_at_end:
+            break
+        text = text[1:-1].strip()
+    return text
+
+
+def _reference_operand(text: str) -> str | None:
+    """The column reference a condition operand is *about*, or None when the
+    operand is a computed expression (arithmetic, nested calls, an OR group)
+    that a single column link cannot faithfully describe. `COALESCE(ref,
+    literal)` counts as its `ref`, matching how the platform links it."""
+    stripped = _strip_outer_parens(text)
+    if _PURE_REFERENCE_RE.match(stripped):
+        return stripped
+    coalesce = _COALESCE_REFERENCE_RE.match(stripped)
+    if coalesce:
+        inner = _strip_outer_parens(coalesce.group(1))
+        if _PURE_REFERENCE_RE.match(inner):
+            return inner
+    return None
+
+
 def _column_link_name(expr: str) -> tuple[str, str, str]:
-    """Return (columnName, qualifierName, type) from a 4X column reference."""
-    text = (expr or "").strip()
+    """Return (columnName, name, type) from a 4X column reference, using the
+    platform's own Conditional/Decision Table link conventions (verified
+    against samples/derivations/sample_derivations.csv):
+
+    - `"Entity"."Col"`            -> name == Col,  type ENT   (direct column)
+    - `"Entity"."var"."Col"`      -> name "var",   type TEMP  (temporary column)
+    - `"Entity"."FK"."Col"`       -> name FK,      type REL   (related entity)
+    """
+    text = _strip_outer_parens(expr)
     parts = re.findall(r'"([^"]+)"', text)
     if not parts:
         bare = re.sub(r"[^A-Za-z0-9_]", "", text) or "VALUE"
         return bare, bare, "ENT"
     column = parts[-1]
-    if len(parts) >= 2:
+    if len(parts) >= 3:
         qualifier = parts[-2]
         link_type = "TEMP" if qualifier.upper() == "VAR" else "REL"
         return column, qualifier, link_type
+    if len(parts) == 2 and parts[0].upper() == "VAR":
+        return column, parts[0], "TEMP"
     return column, column, "ENT"
 
 
-def _parse_condition_link(condition: str, entity_name: str) -> dict | None:
-    text = (condition or "").strip()
-    if not text:
-        return None
-
-    empty = re.match(r'(?is)^ISEMPTY\s*\(\s*(.+?)\s*\)$', text)
-    if empty:
-        col, name, link_type = _column_link_name(empty.group(1))
-        return {
-            "columnName": col,
-            "operator": "ISEMPTY",
-            "rangeFrom": "",
-            "rangeTo": "",
-            "value": "",
-            "name": name or entity_name,
-            "type": link_type,
-            "isFilterSet": "",
-        }
-    not_empty = re.match(r'(?is)^ISNOTEMPTY\s*\(\s*(.+?)\s*\)$', text)
-    if not_empty:
-        col, name, link_type = _column_link_name(not_empty.group(1))
-        return {
-            "columnName": col,
-            "operator": "ISNOTEMPTY",
-            "rangeFrom": "",
-            "rangeTo": "",
-            "value": "",
-            "name": name or entity_name,
-            "type": link_type,
-            "isFilterSet": "",
-        }
-
-    between = re.match(
-        r'(?is)^(.+?)\s+BETWEEN\s*\[\s*([^,\]]+)\s*,\s*([^\]]+)\s*\]\s*$',
-        text,
-    )
-    if between:
-        col, name, link_type = _column_link_name(between.group(1))
-        return {
-            "columnName": col,
-            "operator": "BETWEEN",
-            "rangeFrom": between.group(2).strip().strip('"'),
-            "rangeTo": between.group(3).strip().strip('"'),
-            "value": "",
-            "name": name or entity_name,
-            "type": link_type,
-            "isFilterSet": "",
-        }
-
-    membership = re.match(
-        r'(?is)^(.+?)\s+(IN|NOTIN|CONTAINS|BEGINSWITH|ENDSWITH|DOESNOTCONTAINS|HRCHYIN|HRCHYNOTIN)\s*'
-        r'\[\s*(.*?)\s*\]\s*$',
-        text,
-    )
-    if membership:
-        col, name, link_type = _column_link_name(membership.group(1))
-        values = [
-            item.strip().strip('"')
-            for item in membership.group(3).split(",")
-            if item.strip()
-        ]
-        return {
-            "columnName": col,
-            "operator": membership.group(2).upper(),
-            "rangeFrom": "",
-            "rangeTo": "",
-            "value": ",".join(values),
-            "name": name or entity_name,
-            "type": link_type,
-            "isFilterSet": "",
-        }
-
-    compare = re.match(
-        r'(?is)^(.+?)\s*(==|!=|>=|<=|>|<)\s*(.+?)\s*$',
-        text,
-    )
-    if compare:
-        col, name, link_type = _column_link_name(compare.group(1))
-        raw_value = compare.group(3).strip()
-        value = raw_value.strip('"')
-        return {
-            "columnName": col,
-            "operator": compare.group(2),
-            "rangeFrom": "",
-            "rangeTo": "",
-            "value": value,
-            "name": name or entity_name,
-            "type": link_type,
-            "isFilterSet": "",
-        }
-
-    # Fallback: keep the expression text so nothing is lost.
+def _link(column: str, operator: str, name: str, link_type: str, *, value: str = "",
+          range_from: str = "", range_to: str = "") -> dict:
     return {
-        "columnName": "",
-        "operator": "EXPR",
-        "rangeFrom": "",
-        "rangeTo": "",
-        "value": text,
-        "name": entity_name,
-        "type": "ENT",
+        "columnName": column,
+        "operator": operator,
+        "rangeFrom": range_from,
+        "rangeTo": range_to,
+        "value": value,
+        "name": name,
+        "type": link_type,
         "isFilterSet": "",
     }
 
 
+def _expr_link(text: str, entity_name: str) -> dict:
+    """A condition a single column link cannot describe (an OR group, a
+    computed operand) -- keep its text intact instead of guessing a column."""
+    return _link("", "EXPR", entity_name, "ENT", value=" ".join((text or "").split()))
+
+
+def _literal_value(raw: str) -> str:
+    raw = raw.strip()
+    return raw[1:-1] if _QUOTED_LITERAL_RE.match(raw) else raw
+
+
+def _parse_condition_link(condition: str, entity_name: str) -> dict | None:
+    """One *atomic* condition (no top-level AND/OR) -> one platform link."""
+    text = (condition or "").strip()
+    if not text:
+        return None
+
+    for keyword in ("ISEMPTY", "ISNOTEMPTY"):
+        match = re.match(rf'(?is)^{keyword}\s*\(\s*(.+?)\s*\)$', text)
+        if match:
+            ref = _reference_operand(match.group(1))
+            if ref is None:
+                return _expr_link(text, entity_name)
+            col, name, link_type = _column_link_name(ref)
+            return _link(col, keyword, name, link_type)
+
+    between = re.match(
+        r'(?is)^(.+?)\s+BETWEEN\s*\[\s*([^,\]]+)\s*,\s*([^\]]+)\s*\]\s*$', text
+    )
+    if between:
+        ref = _reference_operand(between.group(1))
+        if ref is None:
+            return _expr_link(text, entity_name)
+        col, name, link_type = _column_link_name(ref)
+        return _link(
+            col, "BETWEEN", name, link_type,
+            range_from=_literal_value(between.group(2)),
+            range_to=_literal_value(between.group(3)),
+        )
+
+    membership = re.match(
+        r'(?is)^(.+?)\s*\b(IN|NOTIN|CONTAINS|BEGINSWITH|ENDSWITH|DOESNOTCONTAINS|HRCHYIN|HRCHYNOTIN)\s*'
+        r'\[\s*(.*?)\s*\]\s*$',
+        text,
+    )
+    if membership:
+        ref = _reference_operand(membership.group(1))
+        if ref is None:
+            return _expr_link(text, entity_name)
+        col, name, link_type = _column_link_name(ref)
+        values = [_literal_value(item) for item in membership.group(3).split(",") if item.strip()]
+        return _link(col, membership.group(2).upper(), name, link_type, value=",".join(values))
+
+    compare = re.match(r'(?is)^(.+?)\s*(==|!=|>=|<=|>|<)\s*(.+?)\s*$', text)
+    if compare:
+        ref = _reference_operand(compare.group(1))
+        if ref is None:
+            return _expr_link(text, entity_name)
+        col, name, link_type = _column_link_name(ref)
+        return _link(col, compare.group(2), name, link_type, value=_literal_value(compare.group(3)))
+
+    return _expr_link(text, entity_name)
+
+
+def _and_leaf_conditions(condition: str) -> list[tuple[str, bool]] | None:
+    """Flatten a guard into its atomic conditions using the real 4X grammar.
+
+    `AND(a,b,c)`, infix `a AND b AND c`, parenthesised groups and any nesting
+    of the two all flatten to the same [a, b, c] -- the grammar, not text
+    splitting, decides where one condition ends. Each entry is
+    (condition_text, is_or_group); an OR group is one atomic entry because a
+    platform link list is an implicit AND and has no OR connector.
+
+    Returns None when the guard cannot be parsed, so the caller can fall back
+    to the legacy text splitter instead of losing the conditions.
+    """
+    from lark import Tree
+
+    try:
+        tree = _get_boolean_grouping_parser().parse(condition)
+    except Exception:
+        return None
+
+    leaves: list[tuple[str, bool]] = []
+
+    def visit(node) -> bool:
+        while isinstance(node, Tree) and node.data == "membership" and len(node.children) == 1:
+            node = node.children[0]
+        if isinstance(node, Tree) and node.data in ("and_op", "and_call"):
+            return all(visit(child) for child in node.children)
+        text = _node_span_text(node, condition)
+        if not text:
+            return False
+        leaves.append((text, isinstance(node, Tree) and node.data in ("or_op", "or_call")))
+        return True
+
+    return leaves if visit(tree) else None
+
+
 def _condition_links_from_guard(condition: str, entity_name: str) -> list[dict]:
+    leaves = _and_leaf_conditions((condition or "").strip())
+    if leaves is None:
+        # Unparseable guard: legacy top-level ` AND ` split, still better than
+        # dropping the conditions.
+        leaves = []
+        for part in _split_top_level_and(condition):
+            cleaned = part.strip()
+            if cleaned.upper().startswith("AND(") and cleaned.endswith(")"):
+                cleaned = cleaned[4:-1]
+            leaves.append((cleaned, False))
+
     links: list[dict] = []
-    for part in _split_top_level_and(condition):
-        # Drop leading AND()/OR() wrappers for simple cases.
-        cleaned = part.strip()
-        if cleaned.upper().startswith("AND(") and cleaned.endswith(")"):
-            cleaned = cleaned[4:-1]
-        link = _parse_condition_link(cleaned, entity_name)
+    for text, is_or_group in leaves:
+        link = _expr_link(text, entity_name) if is_or_group else _parse_condition_link(text, entity_name)
         if link:
             links.append(link)
     return links

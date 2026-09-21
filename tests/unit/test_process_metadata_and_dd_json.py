@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 
 from app.derivation.dd_generation_engine import (
+    _condition_links_from_guard,
     _conditional_json_from_formula,
     _decision_table_from_formula_if_categorical,
     _infer_data_type,
@@ -48,6 +49,72 @@ def test_conditional_json_for_formula_rows():
     payload = json.loads(raw)
     links = payload["conditionalDetails"][0]["conditionalLinksInfo"]
     assert {link["operator"] for link in links} == {">", "=="}
+
+
+def _link_summary(guard: str, entity: str = "T"):
+    return [
+        (l["name"], l["columnName"], l["operator"], l["value"], l["type"])
+        for l in _condition_links_from_guard(guard, entity)
+    ]
+
+
+def test_and_call_and_infix_and_produce_identical_links():
+    infix = '"T"."A" == "Y" AND "T"."B" > 5 AND ISNOTEMPTY("T"."C")'
+    call = 'AND("T"."A" == "Y","T"."B" > 5,ISNOTEMPTY("T"."C"))'
+    nested = 'AND("T"."A" == "Y",AND("T"."B" > 5,ISNOTEMPTY("T"."C")))'
+    expected = [
+        ("A", "A", "==", "Y", "ENT"),
+        ("B", "B", ">", "5", "ENT"),
+        ("C", "C", "ISNOTEMPTY", "", "ENT"),
+    ]
+    assert _link_summary(infix) == expected
+    assert _link_summary(call) == expected
+    assert _link_summary(nested) == expected
+
+
+def test_parenthesised_and_groups_are_flattened_not_left_as_one_garbled_link():
+    guard = (
+        '("D"."FromKey" <= p_TIMEKEY AND "D"."ToKey" >= p_TIMEKEY '
+        'AND COALESCE("D"."Scheme", "N") == "Y") AND ("F"."Id" == 7)'
+    )
+    links = _link_summary(guard)
+    assert [l[1] for l in links] == ["FromKey", "ToKey", "Scheme", "Id"]
+    # No link may swallow the rest of the condition text into its value.
+    assert all("AND" not in l[3] and "(" not in l[3] for l in links)
+
+
+def test_or_group_stays_one_intact_link_and_does_not_split_the_and():
+    guard = 'AND("T"."A" == "Y",OR(ISEMPTY("T"."B"),"T"."B" == "N"))'
+    links = _condition_links_from_guard(guard, "T")
+    assert [l["operator"] for l in links] == ["==", "EXPR"]
+    assert links[1]["value"] == 'OR(ISEMPTY("T"."B"),"T"."B" == "N")'
+    # Same for the infix spelling of the OR.
+    infix = _condition_links_from_guard('"T"."A" == "Y" AND (ISEMPTY("T"."B") OR "T"."B" == "N")', "T")
+    assert [l["operator"] for l in infix] == ["==", "EXPR"]
+
+
+def test_link_name_and_type_follow_platform_conventions():
+    links = _link_summary('AND("E"."Direct" == 1,("E"."var"."Tmp") == 2,("E"."FK_AGG"."MaxDpd") > 0)', "E")
+    assert links == [
+        ("Direct", "Direct", "==", "1", "ENT"),
+        ("var", "Tmp", "==", "2", "TEMP"),
+        ("FK_AGG", "MaxDpd", ">", "0", "REL"),
+    ]
+
+
+def test_computed_operand_becomes_expr_link_instead_of_a_wrong_column():
+    links = _condition_links_from_guard('("E"."End" - "E"."Start") >= 90', "E")
+    assert len(links) == 1
+    assert links[0]["operator"] == "EXPR"
+    assert links[0]["columnName"] == ""
+
+
+def test_conditional_json_for_and_call_formula_has_one_link_per_condition():
+    raw = _conditional_json_from_formula(
+        'IF(AND("A"."X" > 1,"A"."Y" == "Y",ISEMPTY("A"."Z")))THEN(1)ELSE(0)', "A"
+    )
+    links = json.loads(raw)["conditionalDetails"][0]["conditionalLinksInfo"]
+    assert [l["operator"] for l in links] == [">", "==", "ISEMPTY"]
 
 
 def test_infer_data_type_uses_expression_and_name():
