@@ -74,10 +74,8 @@ class ChromaStore:
         # function, so caching by that key is always correct as long as the
         # cache is cleared whenever a collection's contents change -- see
         # add_documents(). This matters because the same query_text is
-        # frequently repeated: app/derivation/dd_generator.py's per-column
-        # RAG lookup issues the same domain-collection query (derived from
-        # the chain's business_summary, which is constant for every column
-        # in that chain) once per column, so without this cache a chain
+        # frequently repeated across per-column RAG lookups for the same
+        # chain business_summary, so without this cache a chain
         # with N columns does N redundant embed+search round trips for a
         # single distinct query.
         self._query_cache: dict[tuple[str, str, int], list[str]] = {}

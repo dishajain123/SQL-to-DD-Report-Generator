@@ -326,14 +326,14 @@ def _write_dd_xlsx(merged: list[dict], output_path: Path) -> Path:
 def export_dd_rows(
     dd_rows: list[DDRow], output_path: str | Path, existing_dd_path: str | Path | None = None
 ) -> Path:
-    from app.derivation.dd_generation_engine import _should_omit_dd_row_from_presentation
+    from app.derivation.dd_postprocess import should_omit_dd_row_from_presentation
 
     presentable = [
         row
         for row in dd_rows
         if row.review_state in {ReviewState.GENERATED, ReviewState.APPROVED}
         and not row.validation_errors
-        and not _should_omit_dd_row_from_presentation(row.display_derivation_expression or "")
+        and not should_omit_dd_row_from_presentation(row.display_derivation_expression or "")
     ]
     if existing_dd_path is not None:
         existing = read_existing_dd_excel(existing_dd_path)

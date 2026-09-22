@@ -82,7 +82,7 @@ def collect_table_aliases(text: str, dialect: Dialect) -> dict[str, tuple[str, .
     dropped rather than guessed.
 
     Memoized: this is called once per DD column being generated (see
-    dd_generation_engine.py), each time re-running split_statements plus a
+    # Each time re-running split_statements plus a
     sqlglot.parse_one per statement over the SAME whole-procedure text --
     for a large procedure (hundreds of written columns, dozens of
     statements) that is tens of thousands of redundant full parses and was

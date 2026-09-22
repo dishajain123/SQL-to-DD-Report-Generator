@@ -510,7 +510,7 @@ def _row_known_reference_names(row: DDRow, objects: dict[str, SQLObject]) -> fro
 
 
 def _build_rule_groups(dd_rows: list[DDRow], objects: dict[str, SQLObject]) -> list[_RuleGroup]:
-    from app.derivation.dd_generation_engine import _should_omit_dd_row_from_presentation
+    from app.derivation.dd_postprocess import should_omit_dd_row_from_presentation
 
     grouped_rows = _group_dd_rows_for_report(dd_rows)
     rule_groups: list[_RuleGroup] = []
@@ -518,7 +518,7 @@ def _build_rule_groups(dd_rows: list[DDRow], objects: dict[str, SQLObject]) -> l
     for rows in grouped_rows:
         first = rows[0]
         formula = first.display_derivation_expression or ""
-        if _should_omit_dd_row_from_presentation(formula):
+        if should_omit_dd_row_from_presentation(formula):
             continue
         rule_id = f"BR-{counter:03d}"
         counter += 1

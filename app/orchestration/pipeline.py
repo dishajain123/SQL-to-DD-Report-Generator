@@ -11,8 +11,9 @@ from typing import Any, Optional, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from app.derivation.canonical_model import build_canonical_model
-from app.derivation.dd_generator import flag_duplicate_dd_rows, generate_dd_rows_for_chains
+from app.derivation.dd_postprocess import flag_duplicate_dd_rows
 from app.derivation.llm_client import LLMClient
+from app.derivation.v2.pipeline import generate_dd_rows_for_chains
 from app.guardrails.output_guardrails import check_dd_row
 from app.guardrails.structural_guardrails import check_structural_info
 from app.lineage.dependency_graph import build_graph, find_chains
@@ -189,7 +190,7 @@ def node_dd_generation(
 
     # Every column-generation job across every chain is batched into a
     # single worker pool here (see
-    # app/derivation/dd_generator.py::generate_dd_rows_for_chains) instead
+    # app/derivation/v2/pipeline.py::generate_dd_rows_for_chains) instead
     # of looping chain-by-chain with a separate pool per chain -- a chain
     # with fewer columns than the worker limit no longer leaves workers
     # idle while later chains wait their turn.
@@ -324,7 +325,7 @@ def _requires_dd_generation(state: PipelineState) -> str:
 
 def _build_default_rag_store() -> Optional[ChromaStore]:
     """RAG is a targeting aid layered on top of the existing full-reference
-    behavior (see app/derivation/dd_generator.py::_retrieve_rag_context),
+    behavior (see RAG retrieval in the orchestration / chroma path),
     not a hard dependency -- if Chroma can't be initialized for any reason
     (no persist directory yet, environment issue, etc.), the pipeline must
     keep working exactly as it did before RAG was wired in, just without

@@ -29,7 +29,7 @@ def silence_noisy_third_party_loggers() -> None:
     supports) and logs a WARNING via `logging.getLogger("sqlglot")` when it
     does. That fallback is expected and already handled by the calling
     code's own logic (see the DML-only guards in
-    app/derivation/dd_generation_engine.py and app/parsing/sql_parser.py) --
+    app/parsing/sql_parser.py) --
     it doesn't need to also print a warning on every occurrence. Call this
     once, at process start-up, before any sqlglot usage.
     """

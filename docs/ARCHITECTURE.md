@@ -15,7 +15,7 @@ doc is a terse code-to-concept index, not a repeat of that discussion.
 | Context Building | `app/rag/chroma_store.py`, `app/rag/ingest.py` | Domain RAG + Platform RAG (4X grammar doc) |
 | AI Understanding | `app/derivation/llm_client.py::technical_reasoning/business_reasoning` | Per lineage chain |
 | Canonical Understanding Model | `app/derivation/canonical_model.py` | One per chain, not per object |
-| DD Generation | `app/derivation/dd_generator.py` | Chain collapse, grammar targeting, retry-on-failure, TIMEKEY versioning |
+| DD Generation | `app/derivation/v2/pipeline.py` | v2 4-phase AST pipeline (lineage → mutation fold → JSON AST → compile + validate) |
 | Grammar validation | `app/grammar/fourx_grammar.lark`, `app/grammar/validator.py` | Real formal grammar, not a heuristic |
 | AI Output Guardrails | `app/guardrails/output_guardrails.py` | Grammar validity + evidence/hallucination check |
 | Human Review | `app/review/review_store.py`, `app/review/streamlit_app.py` | SQLite-backed queue |
@@ -39,11 +39,8 @@ SQLObject (per split unit)
 ## Where the real engineering risk still lives
 
 Everything above `DD Generation` in the table is deterministic and fully
-tested. `DD Generation` itself depends on an LLM call whose *correctness*
-(not just syntactic validity) can't be unit-tested the same way — that's
-why `app/derivation/dd_generator.py` validates every output against the
-real grammar and retries once, and why low-confidence/failed rows always
-land in Human Review rather than being silently accepted. Build a golden
-dataset (expected DD rows for a few real procs, starting with simple
-single-CASE columns) before trusting this stage unattended — see the
-"Known limitations" section of the README.
+tested. `DD Generation` (v2 AST pipeline) is also deterministic for its
+main path: mutations are folded into a JSON AST and compiled to 4X, then
+validated against the real grammar. Build a golden dataset (expected DD
+rows for a few real procs) before trusting deep cascade business logic
+unattended — see the "Known limitations" section of the README.

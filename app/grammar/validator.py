@@ -214,12 +214,31 @@ def _rewrite_date_function(expression: str) -> str:
 
 
 def _rewrite_sql_date_literals(expression: str) -> str:
-    """Rewrite SQL-style date literals into the 4X `TODATE(...)` form."""
-    return re.sub(
-        r'(?i)\bDATE\s*["\']([^"\']+)["\']',
-        lambda match: f'TODATE("{match.group(1).strip()}")',
-        expression,
-    )
+    """Rewrite SQL-style date literals into the 4X `TODATE(...)` form.
+
+    Skips matches inside double-quoted string literals so a mistaken
+    ``"DATE '1900-01-01'"`` value is not rewritten into nested quotes.
+    """
+    result: list[str] = []
+    i = 0
+    n = len(expression or "")
+    in_double = False
+    while i < n:
+        ch = expression[i]
+        if ch == '"':
+            in_double = not in_double
+            result.append(ch)
+            i += 1
+            continue
+        if not in_double:
+            m = re.match(r'(?i)DATE\s*["\']([^"\']+)["\']', expression[i:])
+            if m:
+                result.append(f'TODATE("{m.group(1).strip()}")')
+                i += m.end()
+                continue
+        result.append(ch)
+        i += 1
+    return "".join(result)
 
 
 def _rewrite_sql_not_equal_operator(expression: str) -> str:
@@ -770,7 +789,9 @@ def _contains_string_literal_operand(node) -> bool:
             while hasattr(inner, "children") and len(inner.children) == 1:
                 inner = inner.children[0]
             text = str(inner).strip().strip('"')
-            return not bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", text))
+            return not bool(
+                re.fullmatch(r"@?[A-Za-z_][A-Za-z0-9_]*", text)
+            )
         if data == "path_part":
             break
         cur = cur.children[0]
@@ -779,7 +800,7 @@ def _contains_string_literal_operand(node) -> bool:
         while hasattr(cur, "children") and len(cur.children) == 1:
             cur = cur.children[0]
         text = str(cur).strip().strip('"')
-        return not bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", text))
+        return not bool(re.fullmatch(r"@?[A-Za-z_][A-Za-z0-9_]*", text))
 
     return getattr(cur, "type", None) == "STRING"
 
