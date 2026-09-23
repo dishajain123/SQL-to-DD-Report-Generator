@@ -9,7 +9,8 @@ from app.utils.entity_name_map import resolve_entity_name
 
 
 _STMT_START = re.compile(
-    r"(?is)\b(?:UPDATE|INSERT|DELETE|MERGE|SELECT|CREATE|DROP|TRUNCATE|EXEC|EXECUTE|DECLARE|GO)\b"
+    r"(?is)\b(?:UPDATE|INSERT|DELETE|MERGE|SELECT|CREATE|DROP|TRUNCATE|EXEC|EXECUTE|DECLARE|GO"
+    r"|IF|BEGIN|ELSE)\b"
 )
 
 def strip_sql_comments(sql: str) -> str:
@@ -209,6 +210,15 @@ def extract_if_else_chains(sql: str) -> list[ControlBranchSpan]:
         if not if_match:
             i += 1
             continue
+        # "DROP TABLE IF EXISTS x" / "CREATE TABLE IF NOT EXISTS x" use IF as
+        # part of that fixed idiom, not as a procedural control-flow keyword.
+        # Without this check, its "condition" is misread as "EXISTS <name>"
+        # and the (bogus) single-statement body swallows real statements
+        # that follow, silently corrupting their control-branch grouping.
+        preceding = text[max(0, i - 10) : i].rstrip()
+        if preceding.upper().endswith("TABLE"):
+            i += 1
+            continue
 
         # Parse a full IF … [ELSE IF …]* [ELSE …]? chain starting at i.
         chain_start = i
@@ -360,6 +370,7 @@ def _read_begin_end_body(text: str, start: int) -> tuple[int, int, int]:
         i += len("BEGIN")
         body_start = i
         depth = 1
+        case_depth = 0
         in_single = False
         while i < len(text):
             ch = text[i]
@@ -379,7 +390,17 @@ def _read_begin_end_body(text: str, start: int) -> tuple[int, int, int]:
                 depth += 1
                 i += 5
                 continue
+            if re.match(r"(?is)^CASE\b", text[i:]):
+                # A bare CASE ... END is not a BEGIN block -- its own END
+                # must not be mistaken for this block's terminator below.
+                case_depth += 1
+                i += 4
+                continue
             if re.match(r"(?is)^END\b", text[i:]):
+                if case_depth > 0:
+                    case_depth -= 1
+                    i += 3
+                    continue
                 depth -= 1
                 if depth == 0:
                     body_end = i
@@ -811,6 +832,7 @@ def _read_until_keyword(
     i = start
     n = len(text)
     depth = 0
+    case_depth = 0
     in_single = False
     while i < n:
         ch = text[i]
@@ -841,19 +863,34 @@ def _read_until_keyword(
             continue
         if depth == 0:
             rest = text[i:]
-            for kw in keywords:
-                if re.match(rf"(?is)^{kw}\b", rest):
+            # A bare CASE ... END is not wrapped in parens, so it needs its
+            # own nesting counter — otherwise the CASE's own closing END is
+            # mistaken for the statement/block-terminating END below and the
+            # read stops mid-expression, silently truncating everything after
+            # it (including the real trailing FROM/WHERE clause).
+            case_match = re.match(r"(?is)^CASE\b", rest)
+            if case_match:
+                case_depth += 1
+                buf.append(case_match.group(0))
+                i += len(case_match.group(0))
+                continue
+            end_match = re.match(r"(?is)^END\b", rest)
+            if end_match and case_depth > 0:
+                case_depth -= 1
+                buf.append(end_match.group(0))
+                i += len(end_match.group(0))
+                continue
+            if case_depth == 0:
+                for kw in keywords:
+                    if re.match(rf"(?is)^{kw}\b", rest):
+                        return "".join(buf), i
+                if stop_at_statement and _STMT_START.match(rest):
                     return "".join(buf), i
-            if stop_at_statement and _STMT_START.match(rest):
-                return "".join(buf), i
-            # Also stop before END TRY / END CATCH / END that close batches,
-            # but NOT CASE ... END — CASE depth is tracked via no keyword under depth.
-            # Bare END at depth 0 after a statement is usually procedure END; stop.
-            if stop_at_statement and re.match(r"(?is)^END\b", rest):
-                # Peek: if previous non-space in buf is CASE branch closer we
-                # already consumed CASE END inside depth/parens. A top-level END
-                # ends the procedure/block — stop without consuming it.
-                return "".join(buf), i
+                # Bare END at depth 0 (outside any open CASE) is a
+                # procedure/block terminator (END TRY / END CATCH / END) —
+                # stop without consuming it.
+                if stop_at_statement and end_match:
+                    return "".join(buf), i
         buf.append(ch)
         i += 1
     return "".join(buf), i
