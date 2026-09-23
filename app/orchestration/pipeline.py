@@ -73,6 +73,7 @@ class PipelineState(TypedDict, total=False):
     dd_rows: list[Any]
     function_reference: str
     entity_name_map: dict[str, str]
+    timekey_map: dict[int, Any]
     report_path: str
     csv_path: str
     excel_path: str
@@ -202,6 +203,7 @@ def node_dd_generation(
         llm_client=llm_client,
         function_reference=state.get("function_reference", ""),
         entity_name_map=state.get("entity_name_map"),
+        timekey_map=state.get("timekey_map"),
         rag_store=rag_store,
     )
     _persist_llm_token_usage(job_id, llm_client)
@@ -263,12 +265,23 @@ def node_report_and_export(state: PipelineState) -> PipelineState:
     )
     state["report_path"] = str(report_path)
 
+    from app.report.source_workflow import write_source_workflow
+    write_source_workflow(state["objects"], state.get("structural_infos") or {}, output_dir)
+
     from app.parsing.coverage_ledger import build_coverage_ledger
     from app.guardrails.dd_row_coverage import mark_ledger_coverage
     from app.report.dd_export import write_qa_coverage_report
 
     coverage_parts: list[str] = []
     blockers: list[str] = []
+    # structural_errors is computed in node_structural_analysis but was
+    # never read again anywhere -- an object could fail structural
+    # analysis and the pipeline would still generate and export DD rows
+    # for it with no trace of the failure anywhere in the output. Surface
+    # it as a blocker so it isn't silently invisible to reviewers.
+    for object_id, errors in (state.get("structural_errors") or {}).items():
+        if errors:
+            blockers.append(f"{object_id}: structural analysis failed: " + "; ".join(errors))
     for object_id, info in (state.get("structural_infos") or {}).items():
         obj = state["objects"][object_id]
         ledger = build_coverage_ledger(info, source_sql=obj.raw_sql)

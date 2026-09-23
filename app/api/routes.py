@@ -40,6 +40,7 @@ def _execute_job(job_id: str, request_payload: dict[str, Any]) -> None:
                 "uploaded_files": request.files,
                 "function_reference": request.function_reference,
                 "entity_name_map": merge_entity_overrides(request.entity_name_map),
+                "timekey_map": request.timekey_map,
             }
         )
         db.update_job_status(

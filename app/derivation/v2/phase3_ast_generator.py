@@ -32,6 +32,31 @@ _ALLOWED_TYPES = {
     "LITERAL",
 }
 
+
+def _is_single_quoted_string_literal(text: str) -> bool:
+    """True only when ``text`` is ENTIRELY one quoted string literal, e.g.
+    ``'ACTIVE'`` or ``N'ACTIVE'`` -- not a larger expression that merely
+    happens to start and end with a quote character, like the concatenation
+    ``'%' + A.Col + '%'`` (its trailing ``'%'`` ends in a quote too, but the
+    text as a whole is not a single literal). Honors SQL's ``''`` escaped-
+    quote convention when scanning for the real closing quote.
+    """
+    body = text
+    if body[:2].upper() == "N'":
+        body = body[1:]
+    if len(body) < 2 or body[0] not in ("'", '"'):
+        return False
+    quote = body[0]
+    i = 1
+    while i < len(body):
+        if body[i] == quote:
+            if i + 1 < len(body) and body[i + 1] == quote:
+                i += 2
+                continue
+            return i == len(body) - 1
+        i += 1
+    return False
+
 _AST_SYSTEM_PROMPT = """\
 You convert a chronological sequence of T-SQL UPDATE mutations for ONE
 target column into a single JSON Abstract Syntax Tree for the 4X platform.
@@ -186,41 +211,17 @@ def build_ast_from_mutations(
     if not mutations:
         return _column_ref(target_entity, target_column)
 
-    # Identical assignment expressions across multiple UPDATEs (WHERE only
-    # selects rows, e.g. TRY/CATCH both do COUNT = ISNULL(COUNT,0)+1) → emit
-    # the assignment alone. Do NOT apply this to a single guarded mutation.
-    if (
-        len(mutations) > 1
-        and not any(m.control_branch_group for m in mutations)
-        and len({(m.assigned_expression or "").strip().upper() for m in mutations}) == 1
-    ):
-        then_node = parse_sql_expression_to_ast(
-            mutations[0].assigned_expression,
-            default_entity=target_entity,
-            target_column=target_column,
-        )
-        then_node = _sanitize_addday_misuse(then_node, target_column)
-        then_node = _unwrap_false_assignment_comparison(then_node, target_entity, target_column)
-        _assert_value_not_predicate(then_node, target_column)
-        return then_node
-
-    # Default prior value: NULL when every write is conditional (no unguarded
-    # base assignment), otherwise self-ref for pass-through.
-    has_unguarded = any(
-        not m.effective_condition and m.control_branch_kind != "ELSE"
-        for m in mutations
-    )
-    # ELSE arms count as covering defaults inside control groups.
-    has_else_arm = any(m.control_branch_kind == "ELSE" for m in mutations)
-    if has_unguarded or has_else_arm:
-        ast: dict[str, Any] = _column_ref(target_entity, target_column)
-    else:
-        ast = {"type": "LITERAL", "value_type": "NULL", "value": None}
+    # Default prior value: a row not matched by ANY guard keeps whatever
+    # value the column already had -- an UPDATE with a WHERE clause never
+    # touches non-matching rows, it does not null them out. Self-ref
+    # (pass-through) is therefore always the correct base, whether every
+    # write in this fold is conditional or not.
+    ast: dict[str, Any] = _column_ref(target_entity, target_column)
 
     for segment in _segment_mutations_by_control_flow(mutations):
         group_id = segment[0].control_branch_group if segment else None
         if group_id and all(m.control_branch_group == group_id for m in segment):
-            ast = _fold_control_branch_group(segment, target_entity, target_column)
+            ast = _fold_control_branch_group(segment, target_entity, target_column, ast)
             continue
 
         for mutation in segment:
@@ -237,6 +238,7 @@ def build_ast_from_mutations(
             if _is_self_column_ref(then_node, target_entity, target_column):
                 continue
 
+            then_node = _substitute_prior_value(then_node, ast, target_entity, target_column)
             cond_sql = mutation.effective_condition
             if cond_sql:
                 cond = parse_sql_expression_to_ast(
@@ -245,6 +247,7 @@ def build_ast_from_mutations(
                     target_column=target_column,
                     as_condition=True,
                 )
+                cond = _substitute_prior_value(cond, ast, target_entity, target_column)
                 ast = {
                     "type": "IF_THEN_ELSE",
                     "condition": cond,
@@ -279,73 +282,46 @@ def _segment_mutations_by_control_flow(
     return segments
 
 
-def _fold_control_branch_group(
-    mutations: list[MutationPass],
-    target_entity: str,
-    target_column: str,
-) -> dict[str, Any]:
-    """Fold IF / ELSEIF / ELSE siblings into one IF_THEN_ELSE tree.
+def _substitute_prior_value(node, prior, entity, column):
+    """Resolve reads of the target against the state BEFORE this statement."""
+    if isinstance(node, dict):
+        if _is_self_column_ref(node, entity, column):
+            return prior
+        return {k: _substitute_prior_value(v, prior, entity, column) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_substitute_prior_value(v, prior, entity, column) for v in node]
+    return node
 
-    Evaluation order matches T-SQL: first IF condition, then ELSEIF arms,
-    then ELSE default. A trailing unguarded ELSE assignment becomes the
-    default branch — it must NOT chronologically overwrite earlier arms.
+
+def _fold_control_branch_group(mutations, target_entity, target_column, prior=None):
+    """Choose a procedural arm first, then apply its row-filtered updates.
+
+    A false WHERE inside a selected IF arm must not execute the ELSE arm.
+    Every arm starts from the same pre-branch column state.
     """
-    ordered = sorted(
-        mutations,
-        key=lambda m: (
-            m.control_branch_index if m.control_branch_index is not None else m.ordinal
-        ),
-    )
-
-    else_muts = [m for m in ordered if m.control_branch_kind == "ELSE"]
-    if_muts = [m for m in ordered if m.control_branch_kind != "ELSE"]
-
-    if else_muts:
-        # Last ELSE assignment wins within the ELSE arm.
-        default = parse_sql_expression_to_ast(
-            else_muts[-1].assigned_expression,
-            default_entity=target_entity,
-            target_column=target_column,
-        )
-        default = _sanitize_addday_misuse(default, target_column)
-        default = _unwrap_false_assignment_comparison(default, target_entity, target_column)
-        _assert_value_not_predicate(default, target_column)
-    else:
-        # Column not written in ELSE → unset / NULL (not self-equality pass-through).
-        default = {"type": "LITERAL", "value_type": "NULL", "value": None}
-
-    ast = default
-    for mutation in reversed(if_muts):
-        then_node = parse_sql_expression_to_ast(
-            mutation.assigned_expression,
-            default_entity=target_entity,
-            target_column=target_column,
-        )
-        then_node = _sanitize_addday_misuse(then_node, target_column)
-        then_node = _unwrap_false_assignment_comparison(
-            then_node, target_entity, target_column
-        )
-        _assert_value_not_predicate(then_node, target_column)
-        if _is_self_column_ref(then_node, target_entity, target_column):
+    from dataclasses import replace
+    base = prior if prior is not None else _column_ref(target_entity, target_column)
+    arms = {}
+    for mutation in mutations:
+        arms.setdefault(mutation.control_branch_index, []).append(mutation)
+    result = base
+    for _, arm in sorted(arms.items(), key=lambda item: item[0] or 0, reverse=True):
+        local = [replace(m, control_branch_group=None, control_branch_kind=None,
+                         outer_condition=None) for m in arm]
+        value = build_ast_from_mutations(local, target_entity, target_column)
+        value = _substitute_prior_value(value, base, target_entity, target_column)
+        if arm[0].control_branch_kind == "ELSE":
+            result = value
             continue
-        cond_sql = mutation.effective_condition
-        if not cond_sql:
-            # IF arm with no usable predicate — treat as unconditional then.
-            ast = then_node
-            continue
-        cond = parse_sql_expression_to_ast(
-            cond_sql,
-            default_entity=target_entity,
-            target_column=target_column,
-            as_condition=True,
-        )
-        ast = {
-            "type": "IF_THEN_ELSE",
-            "condition": cond,
-            "then_branch": then_node,
-            "else_branch": ast,
-        }
-    return ast
+        predicate = arm[0].outer_condition
+        if not predicate:
+            return _fallback_tautology()
+        cond = parse_sql_expression_to_ast(predicate, default_entity=target_entity,
+                                          target_column=target_column, as_condition=True)
+        cond = _substitute_prior_value(cond, base, target_entity, target_column)
+        result = {"type": "IF_THEN_ELSE", "condition": cond,
+                  "then_branch": value, "else_branch": result}
+    return result
 
 
 _ASSIGNMENT_VALUE_NODE_TYPES = {"LITERAL", "COLUMN_REF", "FUNCTION_CALL", "VARIABLE_REF"}
@@ -587,29 +563,31 @@ def parse_sql_expression_to_ast(
     if case_ast is not None:
         return case_ast
 
-    # BETWEEN must be tried before AND — otherwise
-    # ``col BETWEEN 61 AND 90`` is wrongly split on AND.
-    between = re.match(r"(?is)^(.+?)\s+BETWEEN\s+(.+?)\s+AND\s+(.+)$", text)
-    if between:
-        col = parse_sql_expression_to_ast(
-            between.group(1), default_entity=default_entity, target_column=target_column
-        )
-        low = parse_sql_expression_to_ast(
-            between.group(2), default_entity=default_entity, target_column=target_column
-        )
-        high = parse_sql_expression_to_ast(
-            between.group(3), default_entity=default_entity, target_column=target_column
-        )
-        return {
-            "type": "BINARY_OP",
-            "operator": "AND",
-            "left": {"type": "BINARY_OP", "operator": ">=", "left": col, "right": low},
-            "right": {"type": "BINARY_OP", "operator": "<=", "left": col, "right": high},
-        }
+    # Unit arguments are literals, not columns. 4X reverses SQL Server's
+    # DATEDIFF / DATEPART argument order (see the bundled function reference).
+    date_fn = re.match(r"(?is)^(DATEDIFF|DATEPART|DAY|MONTH|YEAR|EOMONTH)\s*\((.*)\)$", text)
+    if date_fn and _balanced(date_fn.group(2)):
+        name = date_fn.group(1).upper()
+        parts = _split_top_level(date_fn.group(2), ",")
+        parse = lambda value: parse_sql_expression_to_ast(value, default_entity=default_entity, target_column=target_column)
+        literal = lambda value: {"type": "LITERAL", "value_type": "STRING", "value": value.strip().upper()}
+        args = None
+        if name == "DATEDIFF" and len(parts) == 3:
+            args = [parse(parts[1]), parse(parts[2]), literal(parts[0])]
+        elif name == "DATEPART" and len(parts) == 2:
+            args = [parse(parts[1]), literal(parts[0])]
+        elif name in {"DAY", "MONTH", "YEAR"} and len(parts) == 1:
+            args = [parse(parts[0]), literal(name)]
+            name = "DATEPART"
+        elif name == "EOMONTH" and len(parts) == 1:
+            args = [parse(parts[0])]
+            name = "EOM"
+        if args is not None:
+            return {"type": "FUNCTION_CALL", "function_name": name, "arguments": args}
 
     # OR / AND (top-level)
     for op in (" OR ", " AND "):
-        parts = _split_top_level(text, op.strip())
+        parts = _split_logical(text, op.strip())
         if len(parts) > 1:
             node = parse_sql_expression_to_ast(
                 parts[0],
@@ -630,6 +608,33 @@ def parse_sql_expression_to_ast(
                     ),
                 }
             return node
+
+
+    negate = re.match(r"(?is)^NOT\s*(\(.*\)|EXISTS\b.*)$", text)
+    if negate:
+        return {"type": "FUNCTION_CALL", "function_name": "NOT", "arguments": [
+            parse_sql_expression_to_ast(negate.group(1), default_entity=default_entity,
+                                        target_column=target_column, as_condition=True)
+        ]}
+
+    # The logical splitter preserves the AND belonging to BETWEEN.
+    between = re.match(r"(?is)^(.+?)\s+BETWEEN\s+(.+?)\s+AND\s+(.+)$", text)
+    if between:
+        col = parse_sql_expression_to_ast(
+            between.group(1), default_entity=default_entity, target_column=target_column
+        )
+        low = parse_sql_expression_to_ast(
+            between.group(2), default_entity=default_entity, target_column=target_column
+        )
+        high = parse_sql_expression_to_ast(
+            between.group(3), default_entity=default_entity, target_column=target_column
+        )
+        return {
+            "type": "BINARY_OP",
+            "operator": "AND",
+            "left": {"type": "BINARY_OP", "operator": ">=", "left": col, "right": low},
+            "right": {"type": "BINARY_OP", "operator": "<=", "left": col, "right": high},
+        }
 
     # IS NOT NULL / IS NULL
     isnull = re.match(r"(?is)^(.+?)\s+IS\s+NOT\s+NULL\s*$", text)
@@ -669,6 +674,7 @@ def parse_sql_expression_to_ast(
         if re.match(r"(?is)^SELECT\b", inner_list):
             from app.derivation.v2.sql_text import in_subquery_to_row_predicate
 
+            is_negated = bool(membership.group(2))
             lhs = membership.group(1).strip()
             pred, deps = in_subquery_to_row_predicate(lhs, inner_list)
             if pred:
@@ -678,6 +684,19 @@ def parse_sql_expression_to_ast(
                     target_column=target_column,
                     as_condition=True,
                 )
+                # `node` encodes the positive membership condition (a
+                # matching row exists in the subquery). NOT IN is the
+                # logical negation of that whole condition, not the same
+                # predicate reused as-is -- reusing it silently drops the
+                # negation and NOT IN/IN become indistinguishable. The
+                # grammar has no bare NOT keyword, only the NOT(...)
+                # function form, so wrap rather than string-prefix.
+                if is_negated:
+                    node = {
+                        "type": "FUNCTION_CALL",
+                        "function_name": "NOT",
+                        "arguments": [node],
+                    }
                 if deps:
                     node = {**node, "_dependency_refs": deps}
                 return node
@@ -836,57 +855,19 @@ def parse_sql_expression_to_ast(
     if re.match(r"(?is)^(?:ERROR_MESSAGE|ERROR_NUMBER|ERROR_LINE)\s*\(\s*\)\s*$", text):
         return {"type": "VARIABLE_REF", "name": "@ErrorMessage"}
 
-    # Arithmetic + - * /  — numeric increments stay BINARY_OP; date + N → ADDDAY
-    # only when the operand/target is date-like (never for COUNT/DPD/amounts).
-    for op in ("+", "-", "*", "/"):
-        parts = _split_top_level(text, op)
-        if len(parts) == 2 and parts[0].strip() and parts[1].strip():
-            left = parse_sql_expression_to_ast(
-                parts[0], default_entity=default_entity, target_column=target_column
-            )
-            right = parse_sql_expression_to_ast(
-                parts[1], default_entity=default_entity, target_column=target_column
-            )
-            # Guard: never let ISNULL/COALESCE(+N) become ADDDAY/ISEMPTY.
-            if op in {"+", "-"} and _should_use_addday_for_arithmetic(
-                left, right, target_column
-            ):
-                # date ± N  →  ADDDAY(date, ±N)
-                offset = right
-                if op == "-" and offset.get("type") == "LITERAL":
-                    try:
-                        offset = {
-                            "type": "LITERAL",
-                            "value_type": "NUMBER",
-                            "value": -1 * float(offset.get("value")),
-                        }
-                        if float(offset["value"]) == int(offset["value"]):
-                            offset["value"] = int(offset["value"])
-                    except (TypeError, ValueError):
-                        offset = {
-                            "type": "BINARY_OP",
-                            "operator": "*",
-                            "left": {"type": "LITERAL", "value_type": "NUMBER", "value": -1},
-                            "right": right,
-                        }
-                elif op == "-":
-                    offset = {
-                        "type": "BINARY_OP",
-                        "operator": "*",
-                        "left": {"type": "LITERAL", "value_type": "NUMBER", "value": -1},
-                        "right": right,
-                    }
-                return {
-                    "type": "FUNCTION_CALL",
-                    "function_name": "ADDDAY",
-                    "arguments": [left, offset],
-                }
-            return {
-                "type": "BINARY_OP",
-                "operator": op,
-                "left": left,
-                "right": right,
-            }
+    # SQL + / - share precedence, as do * / /. Split at the LAST
+    # top-level operator in each group to preserve left associativity.
+    arithmetic = _split_arithmetic(text)
+    if arithmetic:
+        lhs, op, rhs = arithmetic
+        left = parse_sql_expression_to_ast(lhs, default_entity=default_entity, target_column=target_column)
+        right = parse_sql_expression_to_ast(rhs, default_entity=default_entity, target_column=target_column)
+        if op in {"+", "-"} and _should_use_addday_for_arithmetic(left, right, target_column):
+            if op == "-":
+                right = {"type": "BINARY_OP", "operator": "*",
+                         "left": {"type": "LITERAL", "value_type": "NUMBER", "value": -1}, "right": right}
+            return {"type": "FUNCTION_CALL", "function_name": "ADDDAY", "arguments": [left, right]}
+        return {"type": "BINARY_OP", "operator": op, "left": left, "right": right}
 
     # Unary minus / plus (``-A.OverdueDays``, ``-DAY(@ProcessDate)``) — tried
     # only after the binary arithmetic loop above has already had first
@@ -926,9 +907,7 @@ def parse_sql_expression_to_ast(
     # mistaken for COLUMN_REF(entity="1", column="10").
     if re.match(r"^-?\d+(\.\d+)?$", text):
         return _literal_from_sql_token(text)
-    if (text.startswith("'") and text.endswith("'")) or (
-        text.startswith("N'") and text.endswith("'")
-    ) or (text.startswith('"') and text.endswith('"')):
+    if _is_single_quoted_string_literal(text):
         return _literal_from_sql_token(text)
     if text.upper() in {"NULL", "NONE"}:
         return _literal_from_sql_token(text)
@@ -966,12 +945,25 @@ def _fallback_tautology(
     *,
     dependency_refs: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Grammar-valid ``1 == 1`` when a subquery cannot be projected further."""
+    """Sentinel for an EXISTS/IN subquery that cannot be safely projected
+    into a row-level predicate.
+
+    This used to emit a grammar-valid ``1 == 1`` tautology -- syntactically
+    fine, but semantically it makes the guard always true, silently
+    broadening eligibility to every row (e.g. a correlated EXISTS against an
+    empty table should mean "never applies", not "always applies"). Emit the
+    same kind of compile-time-raising sentinel already used for value/
+    predicate mixing instead, so the pipeline records a validation error and
+    lowers confidence rather than shipping a plausible-looking wrong guard.
+    """
     node: dict[str, Any] = {
-        "type": "BINARY_OP",
-        "operator": "==",
-        "left": {"type": "LITERAL", "value_type": "NUMBER", "value": 1},
-        "right": {"type": "LITERAL", "value_type": "NUMBER", "value": 1},
+        "type": "FUNCTION_CALL",
+        "function_name": "__UNRESOLVED_SUBQUERY_PREDICATE__",
+        "arguments": [],
+        "_validation_error": (
+            "EXISTS/IN subquery could not be projected into a row-level "
+            "predicate; refusing to fall back to an always-true guard"
+        ),
     }
     if dependency_refs:
         node["_dependency_refs"] = list(dependency_refs)
@@ -1690,19 +1682,57 @@ def _column_ref(
     }
 
 
+def _expression_tokens(text):
+    return re.finditer(r"'(?:''|[^'])*'|\[(?:[^\]])*\]|[A-Za-z_][A-Za-z0-9_]*|[()+*/-]", text)
+
+
+def _split_logical(text, operator):
+    depth = 0
+    between = False
+    cuts = []
+    for token in _expression_tokens(text):
+        word = token.group().upper()
+        if word == "(": depth += 1
+        elif word == ")": depth -= 1
+        elif depth == 0:
+            if word == "BETWEEN": between = True
+            elif word == "AND" and between: between = False
+            elif word == operator: cuts.append((token.start(), token.end()))
+    parts = []; start = 0
+    for a, b in cuts:
+        parts.append(text[start:a]); start = b
+    return parts + [text[start:]]
+
+
+def _split_arithmetic(text):
+    depth = 0; choices = []
+    for token in _expression_tokens(text):
+        word = token.group()
+        if word == "(": depth += 1
+        elif word == ")": depth -= 1
+        elif depth == 0 and word in {"+", "-", "*", "/"}:
+            left = text[:token.start()].rstrip()
+            if left and left[-1] not in "+-*/(<>=,":
+                choices.append((token.start(), word))
+    for operators in ({"+", "-"}, {"*", "/"}):
+        matches = [(i, op) for i, op in choices if op in operators]
+        if matches:
+            i, op = matches[-1]
+            return text[:i], op, text[i+1:]
+    return None
+
+
 def _literal_from_sql_token(token: str) -> dict[str, Any]:
     text = token.strip()
     if text.upper() in {"NULL", "NONE"}:
         return {"type": "LITERAL", "value_type": "NULL", "value": None}
     if re.match(r"^@[A-Za-z_][A-Za-z0-9_]*$", text):
         return {"type": "VARIABLE_REF", "name": text}
-    if (text.startswith("'") and text.endswith("'")) or (
-        text.startswith("N'") and text.endswith("'")
-    ):
+    if _is_single_quoted_string_literal(text) and text[0] != '"':
         inner = text[2:-1] if text.upper().startswith("N'") else text[1:-1]
         inner = inner.replace("''", "'")
         return {"type": "LITERAL", "value_type": "STRING", "value": inner}
-    if (text.startswith('"') and text.endswith('"')):
+    if _is_single_quoted_string_literal(text) and text[0] == '"':
         return {"type": "LITERAL", "value_type": "STRING", "value": text[1:-1]}
     if re.match(r"^-?\d+(\.\d+)?$", text):
         number: Any = float(text) if "." in text else int(text)
@@ -1710,7 +1740,8 @@ def _literal_from_sql_token(token: str) -> dict[str, Any]:
     # Bare word → string literal (e.g. STANDARD without quotes in some dialects)
     if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", text):
         return {"type": "LITERAL", "value_type": "STRING", "value": text}
-    return {"type": "LITERAL", "value_type": "STRING", "value": text}
+    return {"type": "FUNCTION_CALL", "function_name": "__UNSUPPORTED_SQL__",
+            "arguments": [], "_validation_error": f"Untranslated SQL expression: {text}"}
 
 
 def _try_map_like_to_membership(

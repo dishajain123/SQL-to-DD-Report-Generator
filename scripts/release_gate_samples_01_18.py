@@ -7,6 +7,7 @@ Job completion ≠ ready to present.
 from __future__ import annotations
 
 import json
+import re
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -99,8 +100,19 @@ def evaluate_sample_file(path: Path) -> FileGateResult:
     result.qa_ready = (
         qa_path.exists()
         and qa_path.stat().st_mtime >= max(path.stat().st_mtime, latest_code_mtime)
-        and "Ready to present: **yes**" in qa_path.read_text(encoding="utf-8")
+        and bool(re.search(r"^Ready to present: \*\*yes\*\*$",
+                           qa_path.read_text(encoding="utf-8").split("| Entity", 1)[0], re.M))
     )
+    # A regenerated timestamp alone does not establish that the report belongs
+    # to these source bytes and this generator. Check the generation manifest.
+    from scripts.generate_sample_dd_demo import source_fingerprint
+    manifest_path = qa_path.with_name("generation_summary.json")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest_current = manifest.get("source_fingerprint") == source_fingerprint(path)
+    except (OSError, ValueError):
+        manifest_current = False
+    result.qa_ready = result.qa_ready and manifest_current
 
     result.missing_targets = sorted(set(result.missing_targets + missing))
     result.inventory_complete = not result.missing_targets

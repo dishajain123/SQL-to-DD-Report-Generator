@@ -14,6 +14,7 @@ from app.derivation.v2.phase1_lineage import LineageMap, build_lineage_map
 from app.derivation.v2.phase2_mutation_folder import MutationPass, fold_column_mutations
 from app.derivation.v2.phase3_ast_generator import generate_ast
 from app.derivation.v2.phase4_metadata import build_metadata, metadata_to_dd_row
+from app.derivation.v2.semantic_checks import mutation_semantic_errors
 from app.models.core import (
     CanonicalModel,
     DDRow,
@@ -153,6 +154,7 @@ def generate_for_sql(
         mutation_sql_fragments=[m.raw_sql for m in mutations if m.raw_sql],
         mutation_dependency_refs=mutation_deps,
     )
+    meta.validation_errors.extend(mutation_semantic_errors(mutations, sql_text))
     if compile_error:
         meta.validation_errors.append(f"AST compile error: {compile_error}")
         meta.confidence = min(meta.confidence, 0.2)
@@ -240,9 +242,6 @@ def _run_column_job(
         mutations = fold_column_mutations(
             obj.raw_sql, entity, column, lineage, entity_name_map
         )
-        if not mutations:
-            # No UPDATE sites found for this column — skip silently.
-            return []
 
         ast = generate_ast(
             mutations,
@@ -271,6 +270,7 @@ def _run_column_job(
                 ref for m in mutations for ref in (m.dependency_refs or [])
             ],
         )
+        meta.validation_errors.extend(mutation_semantic_errors(mutations, obj.raw_sql))
         if compile_error:
             meta.validation_errors.append(f"AST compile error: {compile_error}")
             meta.confidence = min(meta.confidence, 0.2)
@@ -278,7 +278,7 @@ def _run_column_job(
         row = metadata_to_dd_row(
             meta,
             source_chain_id=chain.chain_id,
-            source_object_ids=list(chain.object_ids),
+            source_object_ids=[obj.object_id],
             source_statement_refs=[
                 f"{obj.source_file} stmt #{m.statement_index} (ordinal={m.ordinal})"
                 for m in mutations
@@ -295,7 +295,11 @@ def _run_column_job(
             obj.object_id,
             exc,
         )
-        return []
+        meta = build_metadata(target_entity=entity, target_column=column,
+                              formula="", source_sql=obj.raw_sql)
+        meta.validation_errors.append(f"Generation failed: {exc}")
+        return [metadata_to_dd_row(meta, source_chain_id=chain.chain_id,
+                                   source_object_ids=[obj.object_id])]
 
 
 def _is_non_derivation_table(entity: str) -> bool:

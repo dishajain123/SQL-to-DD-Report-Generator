@@ -60,6 +60,8 @@ class MutationPass:
     raw_sql: str = ""
     statement_index: int = 0
     guarded: bool = True
+    source_position: int = 0
+    operation: str = "UPDATE"
     # Procedural IF / ELSE IF / ELSE metadata (mutually exclusive siblings).
     control_branch_group: str | None = None
     control_branch_index: int | None = None
@@ -96,6 +98,8 @@ class MutationPass:
     def as_dict(self) -> dict[str, Any]:
         return {
             "ordinal": self.ordinal,
+            "source_position": self.source_position,
+            "operation": self.operation,
             "target_entity": self.target_entity,
             "target_column": self.target_column,
             "assigned_expression": self.assigned_expression,
@@ -188,8 +192,8 @@ def fold_column_mutations(
             dep_refs: list[str] = []
             if branch and branch.condition:
                 dep_refs.extend(extract_subquery_dependency_refs(branch.condition))
-                row_pred = exists_condition_to_row_predicate(branch.condition)
-                if row_pred and not re.match(r"(?is)^EXISTS\b", row_pred.strip()):
+                row_pred = branch.condition
+                if row_pred:
                     outer_cond = _resolve_expression_tables(
                         row_pred,
                         alias_map,
@@ -219,6 +223,7 @@ def fold_column_mutations(
                     alias_map=alias_map,
                     raw_sql=raw_sql,
                     statement_index=stmt_index,
+                    source_position=stmt_start,
                     guarded=guarded,
                     control_branch_group=branch.group_id if branch else None,
                     control_branch_index=branch.index if branch else None,
@@ -281,7 +286,7 @@ def fold_column_mutations(
                 "YEAR",
                 "HOUR",
                 "MINUTE",
-                "SECOND",
+                "SECOND", "END", "NULL", "TRUE", "FALSE",
             }:
                 expr = alias_strip.group(1).strip()
 
@@ -300,8 +305,8 @@ def fold_column_mutations(
         dep_refs: list[str] = []
         if branch and branch.condition:
             dep_refs.extend(extract_subquery_dependency_refs(branch.condition))
-            row_pred = exists_condition_to_row_predicate(branch.condition)
-            if row_pred and not re.match(r"(?is)^EXISTS\b", row_pred.strip()):
+            row_pred = branch.condition
+            if row_pred:
                 outer_cond = _resolve_expression_tables(
                     row_pred, alias_map, lineage, entity_map, target_entity_norm
                 )
@@ -324,6 +329,8 @@ def fold_column_mutations(
                 alias_map=alias_map,
                 raw_sql=(ins.get("raw_sql") or "").strip(),
                 statement_index=update_stmt_count + ins_index,
+                source_position=stmt_start,
+                operation="INSERT",
                 guarded=guarded,
                 control_branch_group=branch.group_id if branch else None,
                 control_branch_index=branch.index if branch else None,
@@ -424,6 +431,8 @@ def fold_column_mutations(
                     alias_map=alias_map,
                     raw_sql=(merge.get("raw_sql") or "").strip(),
                     statement_index=prior_stmt_count + merge_index,
+                    source_position=int(merge.get("start") or 0),
+                    operation="MERGE",
                     guarded=bool(resolved_on),
                     dependency_refs=_dedupe_refs(dep_refs),
                 )
@@ -435,6 +444,9 @@ def fold_column_mutations(
         target_col,
         len(mutations),
     )
+    mutations.sort(key=lambda m: m.source_position)
+    for ordinal, mutation in enumerate(mutations, 1):
+        mutation.ordinal = ordinal
     return mutations
 
 
@@ -659,13 +671,18 @@ def _resolve_expression_tables(
             and (ref.entity.startswith("##") or str(table).startswith("##") or
                  resolve_entity_name(str(table), entity_map).upper() != default_entity.upper())
         ):
-            # Encode cross-entity join path; prefer ## root interface spelling.
+            # Encode cross-entity join path using the real joined table from
+            # the procedure. A ## prefix is only correct when the actual
+            # source table has one (a genuine global temp interface entity)
+            # -- fabricating "##" on a plain physical/dimension table (e.g.
+            # DimProduct) invents a relationship name that never existed in
+            # the SQL.
             if str(table).startswith("##"):
                 rel = str(table)
             elif ref.source_table.startswith("##"):
                 rel = ref.source_table
             else:
-                rel = ref.entity if ref.entity.startswith("##") else f"##{ref.entity}"
+                rel = ref.entity
             if resolve_entity_name(str(table), entity_map).upper() != default_entity.upper():
                 return f"{default_entity}::{rel}::{ref.column}"
         if relationship:

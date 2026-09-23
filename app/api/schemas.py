@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Optional
+from datetime import date
 
 from pydantic import BaseModel, Field
 
@@ -13,6 +14,7 @@ class JobSubmitRequest(BaseModel):
     intent: Intent
     function_reference: str = ""
     entity_name_map: dict[str, str] = Field(default_factory=dict)
+    timekey_map: dict[int, date] = Field(default_factory=dict)
     files: dict[str, str]  # filename -> raw SQL content
 
 

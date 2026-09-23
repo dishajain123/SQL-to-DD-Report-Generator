@@ -84,26 +84,9 @@ class DerivationMetadata:
 
 def extract_timekey_thresholds(sql_text: str) -> list[VersionThreshold]:
     """Pull @TIMEKEY / p_TIMEKEY comparisons from SQL for versioning."""
-    thresholds: list[VersionThreshold] = []
-    seen: set[tuple[str, str, str]] = set()
-    for match in _TIMEKEY_RE.finditer(sql_text or ""):
-        op = match.group("op")
-        if op == "==":
-            op = "="
-        value = match.group("value")
-        key = ("TIMEKEY", op, value)
-        if key in seen:
-            continue
-        seen.add(key)
-        thresholds.append(
-            VersionThreshold(
-                variable="TIMEKEY",
-                operator=op,
-                value=value,
-                raw_condition=match.group(0),
-            )
-        )
-    return thresholds
+    from app.parsing.structural_analysis import _find_version_thresholds
+    return _find_version_thresholds(sql_text)
+
 
 
 def _collect_dependency_refs(
@@ -224,9 +207,9 @@ def metadata_to_dd_row(
     # Valid formulas ship as ACTIVE/GENERATED. Only grammar failures go pending.
     status = DDStatus.ACTIVE if valid else DDStatus.PENDING_REVIEW
     review_state = ReviewState.GENERATED if valid else ReviewState.NEEDS_REVIEW
-    if meta.synthetic_date and valid:
-        # Date alone is synthetic — keep GENERATED; do not force HITL.
-        pass
+    if meta.synthetic_date:
+        status = DDStatus.PENDING_REVIEW
+        review_state = ReviewState.NEEDS_REVIEW
 
     sql_frags = list(meta.mutation_sql_fragments or source_statement_sql or [])
 
@@ -342,7 +325,11 @@ def _resolve_effective_start(
     if not thresholds:
         return _DEFAULT_START, False
     values = sorted({int(t.value) for t in thresholds})
-    return resolve_timekey_to_date(values[0], timekey_map)
+    # resolve_timekey_to_date returns (date, is_real_mapping) -- the second
+    # element is True when this IS a real SysDayMatrix-backed date. Callers
+    # here want the opposite: whether the date is synthetic (unmapped).
+    resolved_date, is_real_mapping = resolve_timekey_to_date(values[0], timekey_map)
+    return resolved_date, not is_real_mapping
 
 
 def _infer_column_type(entity_name: str) -> ColumnType:

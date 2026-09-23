@@ -480,14 +480,14 @@ def _parse_select_list(
                 alias = bare_ident(alias_m.group("alias"))
             results.append((None, None, alias, chunk))
             continue
-        match = _COL_AS_RE.search(chunk)
+        match = _COL_AS_RE.fullmatch(chunk)
         if not match:
             results.append((None, None, None, chunk))
             continue
         qual = match.group("qual")
         col = bare_ident(match.group("col"))
         alias = bare_ident(match.group("alias")) if match.group("alias") else None
-        if col.upper() in {"AS", "FROM", "INTO"}:
+        if col.upper() in {"AS", "FROM", "INTO", "NULL", "CASE", "WHEN", "END", "TRUE", "FALSE"}:
             results.append((None, None, None, chunk))
             continue
         results.append((qual, col, alias, chunk))

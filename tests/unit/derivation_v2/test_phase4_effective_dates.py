@@ -15,7 +15,7 @@ def test_synthetic_date_false_when_timekey_map_has_a_real_mapping():
         source_sql=sql,
         timekey_map={25233: date(2021, 1, 1)},
     )
-    assert meta.effective_start == date(2021, 1, 1)
+    assert meta.effective_start_date == date(2021, 1, 1)
     assert meta.synthetic_date is False
 
 

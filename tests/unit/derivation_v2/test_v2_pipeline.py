@@ -137,6 +137,58 @@ def test_phase2_collects_final_asset_class_updates():
     assert any(m.where_clause for m in mutations) or len(mutations) >= 1
 
 
+def test_join_to_plain_table_uses_its_real_name_as_relationship():
+    """Regression: a JOIN to a plain physical/dimension table (no ## prefix
+    in the source SQL, e.g. DimProduct) must keep that real name as the
+    COLUMN_REF relationship -- not get a fabricated "##" prefix invented
+    just because other joins in this codebase's sample corpus happen to
+    target genuine ## global-temp entities."""
+    sql = """
+    UPDATE A
+    SET A.ASSET_NORM = 'CONDI_STD'
+    FROM ##ACCOUNTCAL A
+    INNER JOIN DimProduct P ON P.ProductAlt_Key = A.ProductAlt_Key
+    WHERE P.ProductGroup = 'FDSEC'
+    """
+    _, debug = generate_for_sql(sql, "##ACCOUNTCAL", "ASSET_NORM", llm_client=None)
+    formula = debug["formula"]
+    assert '"ACCOUNTCAL"."DimProduct"."ProductGroup"' in formula
+    assert "##DimProduct" not in formula
+    assert validate_expression(formula).valid
+
+
+def test_join_to_global_temp_keeps_its_prefix_and_local_temp_traces_to_root():
+    """A join to a genuine global temp table (##CUSTOMERCAL) keeps that
+    ## spelling as the relationship. A join to a LOCAL temp table
+    (#CustRisk) must NOT surface the throwaway local name at all -- Phase 1
+    lineage traces it back to the real physical table it was built from
+    (PRO.CustomerMaster) and that's what appears as the relationship."""
+    sql_global = """
+    UPDATE A
+    SET A.ASSET_NORM = 'CONDI_STD'
+    FROM ##ACCOUNTCAL A
+    INNER JOIN ##CUSTOMERCAL B ON A.CustomerID = B.CustomerID
+    WHERE B.RiskFlag = 'Y'
+    """
+    _, d_global = generate_for_sql(sql_global, "##ACCOUNTCAL", "ASSET_NORM", llm_client=None)
+    assert '"ACCOUNTCAL"."##CUSTOMERCAL"."RiskFlag"' in d_global["formula"]
+    assert validate_expression(d_global["formula"]).valid
+
+    sql_local = """
+    SELECT CustomerID, RiskFlag INTO #CustRisk FROM PRO.CustomerMaster WHERE Active = 'Y'
+
+    UPDATE A
+    SET A.ASSET_NORM = 'CONDI_STD'
+    FROM ##ACCOUNTCAL A
+    INNER JOIN #CustRisk C ON A.CustomerID = C.CustomerID
+    WHERE C.RiskFlag = 'Y'
+    """
+    _, d_local = generate_for_sql(sql_local, "##ACCOUNTCAL", "ASSET_NORM", llm_client=None)
+    assert '"ACCOUNTCAL"."CustomerMaster"."RiskFlag"' in d_local["formula"]
+    assert "#CustRisk" not in d_local["formula"]
+    assert validate_expression(d_local["formula"]).valid
+
+
 def test_phase3_between_not_split_on_and():
     node = parse_sql_expression_to_ast(
         "AccountCal::DaysPastDue BETWEEN 61 AND 90",
@@ -254,7 +306,10 @@ def test_dpd_bucket_classification_verification_formulas():
     _, grace = generate_for_sql(sql, "LoanAccountCal", "GracePeriodApplied")
     g = grace["formula"]
     assert 'THEN("Y")' in g
-    assert "ELSE(NULL)" in g
+    # The ELSEIF/ELSE arms of this IF/ELSE chain never assign
+    # GracePeriodApplied at all, so those code paths must preserve the
+    # column's existing value rather than null it out.
+    assert 'ELSE("LoanAccountCal"."GracePeriodApplied")' in g
     assert '"@GraceWindowStart"' in g
     assert "LoanAccountCal\".\"@GraceWindowStart\"" not in g
     assert 'GracePeriodApplied" == "Y"' not in g
@@ -262,9 +317,14 @@ def test_dpd_bucket_classification_verification_formulas():
 
     _, count = generate_for_sql(sql, "ACLRUNNINGPROCESSSTATUS", "COUNT")
     c = count["formula"]
-    assert c == 'COALESCE("ACLRUNNINGPROCESSSTATUS"."COUNT", 0) + 1' or (
-        c.startswith("COALESCE(") and "+ 1" in c and "ISEMPTY" not in c and "ADDDAY" not in c
-    )
+    # ACLRUNNINGPROCESSSTATUS is a shared table with one row per process
+    # name; both the TRY and CATCH increments guard on
+    # RUNNINGPROCESSNAME = 'DPD_Bucket_Classification', and that guard must
+    # survive folding -- collapsing it away would increment every process's
+    # counter, not just this one.
+    assert 'RUNNINGPROCESSNAME" == "DPD_Bucket_Classification"' in c
+    assert 'COALESCE("ACLRUNNINGPROCESSSTATUS"."COUNT", 0) + 1' in c
+    assert 'ELSE("ACLRUNNINGPROCESSSTATUS"."COUNT")' in c
     assert validate_expression(c).valid
 
 
@@ -356,6 +416,28 @@ def test_in_select_projects_predicate_as_complete_formula():
     meta = debug["metadata"]
     assert "Review Required" not in meta
     assert meta.get("Mutation SQL Fragments")
+
+
+def test_not_in_subquery_negates_the_projected_predicate():
+    """Regression: ``NOT IN (SELECT ...)`` and ``IN (SELECT ...)`` were
+    generating the exact same condition -- the projected row predicate was
+    reused as-is regardless of the NOT, silently dropping the negation."""
+    in_node = parse_sql_expression_to_ast(
+        "ID IN (SELECT ID FROM Rules WHERE Enabled = 1)",
+        default_entity="Accounts",
+        as_condition=True,
+    )
+    not_in_node = parse_sql_expression_to_ast(
+        "ID NOT IN (SELECT ID FROM Rules WHERE Enabled = 1)",
+        default_entity="Accounts",
+        as_condition=True,
+    )
+    in_formula = compile_ast_to_4x_string(in_node)
+    not_in_formula = compile_ast_to_4x_string(not_in_node)
+    assert in_formula != not_in_formula
+    assert not_in_formula.startswith("NOT(")
+    assert validate_expression(in_formula).valid
+    assert validate_expression(not_in_formula).valid
 
 
 def test_merge_when_matched_creates_mutations():
@@ -485,6 +567,28 @@ def test_not_like_with_literal_pattern_maps_to_doesnotcontains():
     assert validate_expression(formula).valid, formula
 
 
+def test_three_operand_string_concatenation_folds_left_associatively():
+    """Regression: a chain with more than one operator of the same kind
+    (e.g. ``'%' + A.Col + '%'``, two '+' signs / three operands) must fold
+    left-associatively into nested BINARY_OP nodes -- not fall through to
+    the final "give up" fallback that wraps the whole raw SQL text
+    (quotes, column reference and all) as a single opaque STRING literal."""
+    node = parse_sql_expression_to_ast(
+        "'%' + A.NPA_Reason + '%'",
+        default_entity="CustomerCal",
+    )
+    assert node["type"] == "BINARY_OP"
+    assert node["operator"] == "+"
+    # Outer node's right operand is the trailing '%' literal; its left
+    # operand is itself the inner ('%' + A.NPA_Reason) BINARY_OP.
+    assert node["right"] == {"type": "LITERAL", "value_type": "STRING", "value": "%"}
+    inner = node["left"]
+    assert inner["type"] == "BINARY_OP"
+    assert inner["operator"] == "+"
+    assert inner["right"]["type"] == "COLUMN_REF"
+    assert inner["right"]["column"] == "NPA_Reason"
+
+
 def test_like_with_dynamic_pattern_falls_back_honestly():
     """A LIKE pattern built from column concatenation has no valid 4X
     representation — it must surface as a grammar-validation failure, not
@@ -523,6 +627,37 @@ def test_membership_op_preserves_contains_operator_in_compiler():
     assert validate_expression(formula).valid
 
 
+def test_membership_op_value_that_is_a_column_ref_node_compiles_recursively():
+    """Regression: a MEMBERSHIP_OP whose ``values`` list contains an
+    uncompiled AST node dict (e.g. from a JSON-authored/LLM AST, or an
+    ``IN (col, 'lit')`` mixed list) must compile that node through the real
+    compiler, not fall through to str(dict) and quote the resulting Python
+    repr as a bogus string literal."""
+    node = {
+        "type": "MEMBERSHIP_OP",
+        "operator": "IN",
+        "column": {
+            "type": "COLUMN_REF",
+            "entity": "CoBorrowerCal",
+            "relationship": None,
+            "column": "DegradeReason",
+        },
+        "values": [
+            {
+                "type": "COLUMN_REF",
+                "entity": "ACCOUNTCAL",
+                "relationship": None,
+                "column": "NPA_Reason",
+            },
+            "CO_OBLIGANT",
+        ],
+    }
+    formula = compile_ast_to_4x_string(node)
+    assert "{'type':" not in formula
+    assert '"ACCOUNTCAL"."NPA_Reason"' in formula
+    assert formula == '"CoBorrowerCal"."DegradeReason" IN ["ACCOUNTCAL"."NPA_Reason", "CO_OBLIGANT"]'
+
+
 def test_plain_scalar_subquery_resolves_to_column_ref():
     """A non-aggregate scalar lookup subquery must resolve to the real
     target column instead of collapsing into a STRING literal of the raw
@@ -540,6 +675,23 @@ def test_plain_scalar_subquery_resolves_to_column_ref():
     formula = compile_ast_to_4x_string(node)
     assert formula == '"DimAssetClass"."AssetClassAlt_Key"'
     assert validate_expression(formula).valid
+
+
+def test_unresolvable_exists_subquery_raises_instead_of_always_true():
+    """Regression: an EXISTS(...) whose subquery can't be projected into a
+    row-level predicate used to silently fall back to a grammar-valid
+    ``1 == 1`` tautology -- broadening eligibility to every row instead of
+    surfacing that the guard couldn't be resolved. It must now raise at
+    compile time so the pipeline records a validation error."""
+    node = parse_sql_expression_to_ast(
+        "EXISTS (SELECT COUNT(*) FROM Rules GROUP BY RuleType HAVING COUNT(*) > 5)",
+        default_entity="Accounts",
+        as_condition=True,
+    )
+    assert node["type"] == "FUNCTION_CALL"
+    assert node["function_name"] == "__UNRESOLVED_SUBQUERY_PREDICATE__"
+    with pytest.raises(ValueError, match="EXISTS/IN subquery"):
+        compile_ast_to_4x_string(node)
 
 
 def test_plain_scalar_subquery_inside_case_else_branch():

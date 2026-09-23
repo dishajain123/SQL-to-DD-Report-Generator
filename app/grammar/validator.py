@@ -722,6 +722,11 @@ def _normalize_expression(expression: str) -> str:
 
 
 def validate_expression(expression: str) -> ValidationResult:
+    # Chronological substitution can expand a compact SQL procedure into an
+    # enormous formula. Do not let Earley's parse forest exhaust a worker.
+    # Withhold the candidate and require smaller ordered workflow steps.
+    if len(expression or "") > 8000:
+        return ValidationResult(valid=False, error="Expression exceeds 8000-character validation budget; split into ordered workflow steps")
     expression = _normalize_expression(expression)
     if not expression.strip():
         return ValidationResult(valid=False, error="Empty expression")

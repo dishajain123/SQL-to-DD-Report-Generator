@@ -44,7 +44,6 @@ membership: arith
 
 ?atom: function_call
      | column_ref
-     | STRING
      | NUMBER
      | if_expr
      | "(" expr ")"
@@ -52,6 +51,9 @@ membership: arith
 function_call: FUNC_NAME "(" [arg_list] ")"
 arg_list: expr ("," expr)*
 
+// STRING is already accepted by a single-part column_ref. Listing it again
+// as an atom gives every quoted token two parses and makes nested formulas
+// exponentially expensive in Earley's ambiguity resolver.
 path_part: STRING
          | NAME
 

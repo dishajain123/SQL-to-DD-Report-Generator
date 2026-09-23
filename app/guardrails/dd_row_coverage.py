@@ -13,6 +13,7 @@ from collections.abc import Iterable
 
 from app.models.core import DDRow, DDStatus, ReviewState, StructuralInfo
 from app.parsing.coverage_ledger import CoverageLedger, WriteKind, build_coverage_ledger
+from app.derivation.v2.sql_text import strip_sql_comments
 
 _COLUMN_REF = re.compile(r'"([^"]+)"\s*\.\s*"([^"]+)"')
 
@@ -35,6 +36,9 @@ def mark_ledger_coverage(
         and not row.validation_errors
         and row.review_state in {ReviewState.GENERATED, ReviewState.APPROVED}
     ]
+    def source_key(sql):
+        return re.sub(r"\s+", "", strip_sql_comments(sql or "")).strip(";").upper()
+
     for entry in ledger.entries:
         if entry.kind not in {WriteKind.ROW_FORMULA, WriteKind.DECISION_TABLE}:
             continue
@@ -44,6 +48,9 @@ def mark_ledger_coverage(
             any(
                 _name(row.entity_name) == entity
                 and _name(row.column_name) == _name(column)
+                and bool(source_key(entry.source_sql))
+                and any(source_key(entry.source_sql) == source_key(fragment)
+                        for fragment in row.source_statement_sql)
                 for row in valid_rows
             )
             for column in entry.columns

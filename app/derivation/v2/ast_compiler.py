@@ -111,16 +111,32 @@ def compile_ast_to_4x_string(node: dict[str, Any] | None) -> str:
 
         left = compile_ast_to_4x_string(node["left"])
         right = compile_ast_to_4x_string(node["right"])
+        # Preserve the AST's grouping; dropping parentheses changes both
+        # arithmetic and mixed AND/OR expressions on the target platform.
+        if node["left"].get("type") == "BINARY_OP":
+            left = f"({left})"
+        if node["right"].get("type") == "BINARY_OP":
+            right = f"({right})"
         return f"{left} {operator} {right}"
 
     if node_type == "FUNCTION_CALL":
         func = str(node.get("function_name") or "").strip().upper()
         args = node.get("arguments") or []
+        if func == "__UNSUPPORTED_SQL__":
+            raise ValueError(node.get("_validation_error") or "Unsupported SQL expression")
         if func == "__VALUE_PREDICATE_MIXING__":
             # Sentinel from phase3's value/predicate-mixing guard — raise here
             # so the pipeline's existing compile-error handling records a
             # validation error instead of the caller silently dropping the row.
             raise ValueError(node.get("_validation_error") or "value/predicate mixing detected")
+        if func == "__UNRESOLVED_SUBQUERY_PREDICATE__":
+            # Sentinel from phase3's EXISTS/IN-subquery fallback — raise here
+            # instead of ever compiling an always-true "1 == 1" guard, which
+            # would silently broaden eligibility to every row.
+            raise ValueError(
+                node.get("_validation_error")
+                or "EXISTS/IN subquery could not be projected into a row-level predicate"
+            )
         if func == "ADDDAY" and len(args) != 2:
             # Fail loud instead of emitting invalid grammar (ADDDAY(x) with a
             # dropped offset argument, or extra args the grammar rejects).
@@ -389,6 +405,13 @@ def _compile_if_then_else(node: dict[str, Any]) -> str:
 
 
 def _compile_membership_value(value: Any) -> str:
+    if isinstance(value, dict):
+        # A MEMBERSHIP_OP value can itself be an uncompiled AST node (e.g. a
+        # COLUMN_REF from a JSON-authored AST, or an ``IN (col, 'lit')``
+        # mixed list) -- recurse through the real compiler instead of
+        # falling through to str(value), which would emit the node's raw
+        # Python dict repr as a quoted string literal.
+        return compile_ast_to_4x_string(value)
     if isinstance(value, bool):
         return f'"{str(value).upper()}"'
     if isinstance(value, (int, float)) and not isinstance(value, bool):

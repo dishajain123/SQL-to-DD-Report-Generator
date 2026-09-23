@@ -47,6 +47,7 @@ class WriteLedgerEntry:
     parsed_ok: bool = True
     parse_error: str | None = None
     source_excerpt: str = ""
+    source_sql: str = ""
     notes: list[str] = field(default_factory=list)
     covered_by_dd: bool = False
 
@@ -340,6 +341,7 @@ def build_coverage_ledger(info: StructuralInfo, source_sql: str = "") -> Coverag
                 parsed_ok=stmt.parsed_ok,
                 parse_error=stmt.parse_error,
                 source_excerpt=(stmt.raw_text or "")[:240].replace("\n", " "),
+                source_sql=stmt.raw_text or "",
                 notes=list(notes),
                 covered_by_dd=False,
             )

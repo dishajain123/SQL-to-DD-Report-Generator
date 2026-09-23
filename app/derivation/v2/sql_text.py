@@ -144,6 +144,9 @@ def extract_update_statements(sql: str) -> list[dict[str, str | None]]:
     for match in pattern.finditer(text):
         start = match.start()
         i = match.end()
+        # MERGE's UPDATE SET has no target here; handled by the MERGE extractor.
+        if re.match(r"(?is)\s+SET\b", text[i:]):
+            continue
         # head until SET
         set_match = re.search(r"(?is)\bSET\b", text[i:])
         if not set_match:
@@ -861,7 +864,9 @@ def _read_until_keyword(
             buf.append(ch)
             i += 1
             continue
-        if depth == 0:
+        if depth == 0 and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] in "_@#")):
+            if ch == ";" and stop_at_statement:
+                return "".join(buf), i
             rest = text[i:]
             # A bare CASE ... END is not wrapped in parens, so it needs its
             # own nesting counter — otherwise the CASE's own closing END is
