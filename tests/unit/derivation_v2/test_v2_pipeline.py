@@ -401,3 +401,162 @@ def test_error_message_maps_to_variable_token():
     assert validate_expression(debug["formula"]).valid
     # Valid formula → GENERATED, not NEEDS_REVIEW
     assert row.review_state == ReviewState.GENERATED
+
+
+def test_select_distinct_projection_parses_column_name():
+    """``SELECT DISTINCT col`` must not capture DISTINCT as the column name."""
+    from app.derivation.v2.phase1_lineage import _parse_select_list
+
+    projections = _parse_select_list("DISTINCT UcifEntityID")
+    assert len(projections) == 1
+    src_qual, src_col, alias, raw = projections[0]
+    assert src_col == "UcifEntityID"
+    assert src_col != "DISTINCT"
+
+    # TOP n and ALL are handled the same way.
+    assert _parse_select_list("TOP 10 AccountId")[0][1] == "AccountId"
+    assert _parse_select_list("TOP (5) AccountId")[0][1] == "AccountId"
+    assert _parse_select_list("ALL AccountId")[0][1] == "AccountId"
+
+
+def test_select_distinct_cte_lineage_resolves_correctly():
+    """A CTE built from ``SELECT DISTINCT col`` must trace to the real column."""
+    sql = """
+    CREATE PROCEDURE PRO.Test_CTE_Distinct @TIMEKEY INT AS
+    BEGIN
+        ;WITH CTE_NPA_UCIFID_CUST AS (
+            SELECT DISTINCT UcifEntityID FROM ##CUSTOMERCAL
+            WHERE SysAssetClassAlt_Key > 1
+            GROUP BY UcifEntityID
+        )
+        UPDATE A SET A.ASSET_NORM = 'CONDI_STD'
+        FROM ##ACCOUNTCAL A
+        INNER JOIN CTE_NPA_UCIFID_CUST B ON A.UcifEntityID = B.UcifEntityID
+        WHERE A.ASSET_NORM = 'ALWYS_STD'
+    END
+    """
+    lineage = build_lineage_map(sql)
+    ref = lineage.resolve_column("CTE_NPA_UCIFID_CUST", "UcifEntityID")
+    assert ref.column == "UcifEntityID"
+    assert ref.column != "DISTINCT"
+    assert "CUSTOMERCAL" in ref.entity.upper()
+
+
+def test_like_with_literal_pattern_maps_to_membership_op():
+    """A fixed-literal LIKE pattern must map onto the grammar's native
+    CONTAINS/BEGINSWITH/ENDSWITH — the 4X grammar has no LIKE token."""
+    contains_node = parse_sql_expression_to_ast(
+        "ReviewReason LIKE '%UNDERCOVER%'",
+        default_entity="ProvisionCoverageSummary",
+        as_condition=True,
+    )
+    assert contains_node["type"] == "MEMBERSHIP_OP"
+    assert contains_node["operator"] == "CONTAINS"
+    assert contains_node["values"] == ["UNDERCOVER"]
+    formula = compile_ast_to_4x_string(contains_node)
+    assert "CONTAINS" in formula
+    assert validate_expression(formula).valid, formula
+
+    begins_node = parse_sql_expression_to_ast(
+        "Reason LIKE 'SEVERE%'", default_entity="CollectionsQueue", as_condition=True
+    )
+    assert begins_node["type"] == "MEMBERSHIP_OP"
+    assert begins_node["operator"] == "BEGINSWITH"
+    assert validate_expression(compile_ast_to_4x_string(begins_node)).valid
+
+    ends_node = parse_sql_expression_to_ast(
+        "Reason LIKE '%OVERDUE'", default_entity="CollectionsQueue", as_condition=True
+    )
+    assert ends_node["type"] == "MEMBERSHIP_OP"
+    assert ends_node["operator"] == "ENDSWITH"
+    assert validate_expression(compile_ast_to_4x_string(ends_node)).valid
+
+
+def test_not_like_with_literal_pattern_maps_to_doesnotcontains():
+    node = parse_sql_expression_to_ast(
+        "ReviewReason NOT LIKE '%UNDERCOVER%'",
+        default_entity="ProvisionCoverageSummary",
+        as_condition=True,
+    )
+    assert node["type"] == "MEMBERSHIP_OP"
+    assert node["operator"] == "DOESNOTCONTAINS"
+    formula = compile_ast_to_4x_string(node)
+    assert "DOESNOTCONTAINS" in formula
+    assert validate_expression(formula).valid, formula
+
+
+def test_like_with_dynamic_pattern_falls_back_honestly():
+    """A LIKE pattern built from column concatenation has no valid 4X
+    representation — it must surface as a grammar-validation failure, not
+    silently collapse into a wrong string literal."""
+    node = parse_sql_expression_to_ast(
+        "B.DegradeReason LIKE '%' + A.NPA_Reason + '%'",
+        default_entity="CustomerCal",
+        as_condition=True,
+    )
+    assert node["type"] == "BINARY_OP"
+    assert node["operator"] == "LIKE"
+    # The LHS/RHS must still resolve to real column refs, not be swallowed
+    # into a raw string blob.
+    assert node["left"]["type"] == "COLUMN_REF"
+    formula = compile_ast_to_4x_string(node)
+    assert not validate_expression(formula).valid
+
+
+def test_membership_op_preserves_contains_operator_in_compiler():
+    """Regression: the compiler used to force any non-IN/NOTIN operator
+    back to bare IN, silently discarding CONTAINS/BEGINSWITH/etc."""
+    node = {
+        "type": "MEMBERSHIP_OP",
+        "operator": "CONTAINS",
+        "column": {
+            "type": "COLUMN_REF",
+            "entity": "CollectionsQueue",
+            "relationship": None,
+            "column": "Reason",
+        },
+        "values": ["OVERDUE"],
+    }
+    formula = compile_ast_to_4x_string(node)
+    assert "CONTAINS" in formula
+    assert formula != '"CollectionsQueue"."Reason" IN ["OVERDUE"]'
+    assert validate_expression(formula).valid
+
+
+def test_plain_scalar_subquery_resolves_to_column_ref():
+    """A non-aggregate scalar lookup subquery must resolve to the real
+    target column instead of collapsing into a STRING literal of the raw
+    SQL text."""
+    node = parse_sql_expression_to_ast(
+        "(SELECT AssetClassAlt_Key FROM DimAssetClass "
+        "WHERE AssetClassShortName='STD' AND EffectiveFromTimeKey<=@TIMEKEY "
+        "AND EffectiveToTimeKey>=@TIMEKEY)",
+        default_entity="CustomerCal",
+        target_column="FinalAssetClassAlt_Key",
+    )
+    assert node["type"] == "COLUMN_REF"
+    assert node["entity"] == "DimAssetClass"
+    assert node["column"] == "AssetClassAlt_Key"
+    formula = compile_ast_to_4x_string(node)
+    assert formula == '"DimAssetClass"."AssetClassAlt_Key"'
+    assert validate_expression(formula).valid
+
+
+def test_plain_scalar_subquery_inside_case_else_branch():
+    """The lookup subquery shape from PRO.Final_AssetClass_Npadate: a CASE
+    ELSE branch falling back to a DimAssetClass key lookup."""
+    case_sql = (
+        "CASE WHEN A.Asset_Norm <> 'ALWYS_STD' THEN A.SysAssetClassAlt_Key "
+        "ELSE (SELECT AssetClassAlt_Key FROM DimAssetClass "
+        "WHERE AssetClassShortName='STD' AND EffectiveFromTimeKey<=@TIMEKEY "
+        "AND EffectiveToTimeKey>=@TIMEKEY) END"
+    )
+    node = parse_sql_expression_to_ast(
+        case_sql, default_entity="AccountCal", target_column="FinalAssetClassAlt_Key"
+    )
+    assert node["type"] == "IF_THEN_ELSE"
+    assert node["else_branch"]["type"] == "COLUMN_REF"
+    assert node["else_branch"]["entity"] == "DimAssetClass"
+    formula = compile_ast_to_4x_string(node)
+    assert '"DimAssetClass"."AssetClassAlt_Key"' in formula
+    assert validate_expression(formula).valid, formula

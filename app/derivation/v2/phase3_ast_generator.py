@@ -13,7 +13,11 @@ import re
 from typing import Any, Optional
 
 from app.derivation.v2.phase2_mutation_folder import MutationPass
-from app.derivation.v2.sql_text import bare_ident, extract_subquery_dependency_refs
+from app.derivation.v2.sql_text import (
+    bare_ident,
+    extract_subquery_dependency_refs,
+    normalize_table_name,
+)
 from app.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -133,12 +137,31 @@ def generate_ast(
             raw = _call_llm_for_ast(llm_client, mutations, target_entity, target_column)
             node = _parse_json_ast(raw)
             if node and _validate_ast_shape(node):
-                return _sanitize_addday_misuse(node, target_column)
+                node = _sanitize_addday_misuse(node, target_column)
+                return _apply_value_predicate_guard(node, target_entity, target_column)
             logger.warning("phase3 LLM AST failed shape validation; using deterministic fold")
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("phase3 LLM AST generation failed: %s", exc)
 
-    return build_ast_from_mutations(mutations, target_entity, target_column)
+    try:
+        return build_ast_from_mutations(mutations, target_entity, target_column)
+    except _ValuePredicateMixingError as exc:
+        # Surface through the existing compile-error channel (ast_compiler
+        # raises on this sentinel) rather than letting the exception bubble
+        # past the caller and silently drop the whole DD row — the pipeline
+        # only records validation_errors around compile_ast_to_4x_string.
+        logger.warning(
+            "phase3 value/predicate validation failed for %s.%s: %s",
+            target_entity,
+            target_column,
+            exc,
+        )
+        return {
+            "type": "FUNCTION_CALL",
+            "function_name": "__VALUE_PREDICATE_MIXING__",
+            "arguments": [],
+            "_validation_error": str(exc),
+        }
 
 
 def _llm_can_generate_ast(llm_client: Any) -> bool:
@@ -178,6 +201,7 @@ def build_ast_from_mutations(
         )
         then_node = _sanitize_addday_misuse(then_node, target_column)
         then_node = _unwrap_false_assignment_comparison(then_node, target_entity, target_column)
+        _assert_value_not_predicate(then_node, target_column)
         return then_node
 
     # Default prior value: NULL when every write is conditional (no unguarded
@@ -209,6 +233,7 @@ def build_ast_from_mutations(
             then_node = _unwrap_false_assignment_comparison(
                 then_node, target_entity, target_column
             )
+            _assert_value_not_predicate(then_node, target_column)
             if _is_self_column_ref(then_node, target_entity, target_column):
                 continue
 
@@ -284,6 +309,7 @@ def _fold_control_branch_group(
         )
         default = _sanitize_addday_misuse(default, target_column)
         default = _unwrap_false_assignment_comparison(default, target_entity, target_column)
+        _assert_value_not_predicate(default, target_column)
     else:
         # Column not written in ELSE → unset / NULL (not self-equality pass-through).
         default = {"type": "LITERAL", "value_type": "NULL", "value": None}
@@ -299,6 +325,7 @@ def _fold_control_branch_group(
         then_node = _unwrap_false_assignment_comparison(
             then_node, target_entity, target_column
         )
+        _assert_value_not_predicate(then_node, target_column)
         if _is_self_column_ref(then_node, target_entity, target_column):
             continue
         cond_sql = mutation.effective_condition
@@ -321,15 +348,40 @@ def _fold_control_branch_group(
     return ast
 
 
+_ASSIGNMENT_VALUE_NODE_TYPES = {"LITERAL", "COLUMN_REF", "FUNCTION_CALL", "VARIABLE_REF"}
+
+
+def _looks_like_assignment_value(node: dict[str, Any]) -> bool:
+    """True for node shapes that can legitimately BE an assigned value.
+
+    Broader than "LITERAL only" — a value can just as validly be another
+    column's contents (``SET AccountId = Source.AccountId``), a function
+    call, or a T-SQL variable. Arithmetic (``+``/``-``/``*``/``/``) is also
+    value-shaped. A comparison/logical BINARY_OP is deliberately excluded —
+    that shape can never be a legitimate assigned value.
+    """
+    if not isinstance(node, dict):
+        return False
+    if node.get("type") in _ASSIGNMENT_VALUE_NODE_TYPES:
+        return True
+    if node.get("type") == "BINARY_OP" and node.get("operator") in {"+", "-", "*", "/"}:
+        return True
+    return False
+
+
 def _unwrap_false_assignment_comparison(
     node: dict[str, Any],
     target_entity: str,
     target_column: str,
 ) -> dict[str, Any]:
-    """Rewrite mistaken ``col == 'Y'`` assignment values to the literal ``'Y'``.
+    """Rewrite mistaken ``col == value`` assignment values to bare ``value``.
 
-    SET Target = 'Y' must yield LITERAL("Y") in THEN/ELSE — never a
-    self-equality predicate used as a value.
+    ``SET Target = value`` must yield ``value`` directly in THEN/ELSE — never
+    a self-equality predicate used as a value. ``value`` may be a literal
+    (``'Y'``), but just as often another column reference (e.g.
+    ``SET AccountId = Source.AccountId`` folding to a marker that later
+    parses as ``AccountId == ##LoanAccountCal.AccountId``) — any
+    non-predicate node shape on the non-target-column side qualifies.
     """
     if not isinstance(node, dict):
         return node
@@ -348,11 +400,109 @@ def _unwrap_false_assignment_comparison(
             return False
         return str(n.get("column") or "").upper() == str(target_column or "").upper()
 
-    if _is_target_col(left) and right.get("type") == "LITERAL":
+    if _is_target_col(left) and _looks_like_assignment_value(right):
         return right
-    if _is_target_col(right) and left.get("type") == "LITERAL":
+    if _is_target_col(right) and _looks_like_assignment_value(left):
         return left
     return node
+
+
+def _apply_value_predicate_guard(
+    node: Any,
+    target_entity: str,
+    target_column: str,
+) -> Any:
+    """Recursively unwrap ``col == value`` mixing anywhere in an AST tree.
+
+    The deterministic fold path (``build_ast_from_mutations``) already calls
+    ``_unwrap_false_assignment_comparison`` at each then/else construction
+    site. The LLM-generated path does not — an LLM response can just as
+    easily produce ``THEN(TargetCol == Value)`` — so this walker re-applies
+    the same guard everywhere a THEN/ELSE value slot appears, regardless of
+    which producer built the tree.
+    """
+    if not isinstance(node, dict):
+        return node
+    node_type = node.get("type")
+    if node_type == "IF_THEN_ELSE":
+        then_b = _unwrap_false_assignment_comparison(
+            node.get("then_branch") or {}, target_entity, target_column
+        )
+        else_b = _unwrap_false_assignment_comparison(
+            node.get("else_branch") or {}, target_entity, target_column
+        )
+        return {
+            **node,
+            "condition": _apply_value_predicate_guard(
+                node.get("condition"), target_entity, target_column
+            ),
+            "then_branch": _apply_value_predicate_guard(
+                then_b, target_entity, target_column
+            ),
+            "else_branch": _apply_value_predicate_guard(
+                else_b, target_entity, target_column
+            ),
+        }
+    if node_type == "BINARY_OP":
+        return {
+            **node,
+            "left": _apply_value_predicate_guard(
+                node.get("left"), target_entity, target_column
+            ),
+            "right": _apply_value_predicate_guard(
+                node.get("right"), target_entity, target_column
+            ),
+        }
+    if node_type == "FUNCTION_CALL":
+        return {
+            **node,
+            "arguments": [
+                _apply_value_predicate_guard(a, target_entity, target_column)
+                for a in (node.get("arguments") or [])
+            ],
+        }
+    if node_type == "MEMBERSHIP_OP":
+        return {
+            **node,
+            "column": _apply_value_predicate_guard(
+                node.get("column"), target_entity, target_column
+            ),
+        }
+    return node
+
+
+_ORDERING_COMPARISON_OPS = {">", ">=", "<", "<="}
+
+
+def _assert_value_not_predicate(node: dict[str, Any], target_column: str) -> None:
+    """Enforce ``UPDATE SET Col = Value WHERE Condition`` value/predicate separation.
+
+    The assigned ``Value`` must always fold into the AST's THEN node; the
+    ``WHERE`` clause (row-level inequalities, join predicates, …) must always
+    fold into the IF/ELSEIF condition node — never the other way round. A
+    bare ordering comparison (``>``/``>=``/``<``/``<=``) as the *entire*
+    assigned value is not a legitimate literal/expression assignment (a
+    boolean-from-comparison flag would be wrapped in a CASE, which folds to
+    IF_THEN_ELSE, not a raw BINARY_OP) — it is a strong, generalizable signal
+    that WHERE-clause boolean logic leaked into the value payload. Fail loud
+    here so it surfaces as a validation error instead of silently compiling
+    to a boolean where a value belongs.
+    """
+    if not isinstance(node, dict) or node.get("type") != "BINARY_OP":
+        return
+    operator = str(node.get("operator") or "").strip()
+    if operator not in _ORDERING_COMPARISON_OPS:
+        return
+    raise _ValuePredicateMixingError(
+        f"Value/predicate mixing detected for column '{target_column}': "
+        f"assigned expression folded to a bare '{operator}' comparison instead "
+        "of a literal/value — WHERE-clause logic must fold into the IF "
+        "condition, not the THEN value."
+    )
+
+
+class _ValuePredicateMixingError(ValueError):
+    """Raised when an assigned value folds to a bare row-level comparison."""
 
 
 def _is_self_column_ref(node: dict[str, Any], entity: str, column: str) -> bool:
@@ -381,6 +531,13 @@ def parse_sql_expression_to_ast(
     # Strip wrapping parentheses.
     while text.startswith("(") and text.endswith(")") and _balanced(text[1:-1]):
         text = text[1:-1].strip()
+
+    # CAST(expr AS type) — 4X has no explicit cast; drop the type and parse
+    # the inner expression (tried early so a cast wrapping a CASE/DATEADD/
+    # arithmetic expression still resolves that inner shape correctly).
+    cast_node = _try_parse_cast(text, default_entity, target_column)
+    if cast_node is not None:
+        return cast_node
 
     # Explicit DATEADD → ADDDAY (only date-offset form we promote to ADDDAY).
     dateadd = _try_parse_dateadd(text, default_entity, target_column)
@@ -548,6 +705,55 @@ def parse_sql_expression_to_ast(
             "values": lit_values,
         }
 
+    # LIKE / NOT LIKE pattern matching — tried before the arithmetic loop
+    # below, since the pattern side is very often a concatenation
+    # (``col LIKE '%' + Other + '%'``); splitting on LIKE first leaves a
+    # clean sub-expression for the recursive call to hand to arithmetic.
+    # The 4X grammar has no LIKE token at all — pattern matching is native
+    # only via MEMBERSHIP_OP CONTAINS/BEGINSWITH/ENDSWITH/DOESNOTCONTAINS,
+    # which take a literal value list, not an arbitrary expression. So a
+    # LIKE with a genuinely dynamic pattern (e.g. concatenated with a
+    # column) has no valid 4X representation at all; a fixed-literal
+    # pattern (the common case) maps onto those operators cleanly.
+    not_like_split = _split_top_level_keyword(text, r"NOT\s+LIKE")
+    if len(not_like_split) == 2 and not_like_split[0].strip():
+        lhs_sql, rhs_sql = not_like_split
+        mapped = _try_map_like_to_membership(
+            lhs_sql.strip(), rhs_sql.strip(), negate=True,
+            default_entity=default_entity, target_column=target_column,
+        )
+        if mapped is not None:
+            return mapped
+        return {
+            "type": "BINARY_OP",
+            "operator": "NOT LIKE",
+            "left": parse_sql_expression_to_ast(
+                lhs_sql.strip(), default_entity=default_entity, target_column=target_column
+            ),
+            "right": parse_sql_expression_to_ast(
+                rhs_sql.strip(), default_entity=default_entity, target_column=target_column
+            ),
+        }
+    like_split = _split_top_level_keyword(text, "LIKE")
+    if len(like_split) == 2 and like_split[0].strip():
+        lhs_sql, rhs_sql = like_split
+        mapped = _try_map_like_to_membership(
+            lhs_sql.strip(), rhs_sql.strip(), negate=False,
+            default_entity=default_entity, target_column=target_column,
+        )
+        if mapped is not None:
+            return mapped
+        return {
+            "type": "BINARY_OP",
+            "operator": "LIKE",
+            "left": parse_sql_expression_to_ast(
+                lhs_sql.strip(), default_entity=default_entity, target_column=target_column
+            ),
+            "right": parse_sql_expression_to_ast(
+                rhs_sql.strip(), default_entity=default_entity, target_column=target_column
+            ),
+        }
+
     # Comparisons
     for sql_op, fourx_op in (
         ("<>", "!="),
@@ -572,8 +778,9 @@ def parse_sql_expression_to_ast(
                 ),
             }
 
-    # ISNULL(a,b) / COALESCE(a,b) / NVL(a,b) — never ISEMPTY; keep as COALESCE.
-    isnull_fn = re.match(r"(?is)^(?:ISNULL|COALESCE|NVL)\s*\((.+)\)$", text)
+    # ISNULL(a,b) / COALESCE(a,b) / NVL(a,b) / IFNULL(a,b) (MySQL) — never
+    # ISEMPTY; keep as COALESCE.
+    isnull_fn = re.match(r"(?is)^(?:ISNULL|COALESCE|NVL|IFNULL)\s*\((.+)\)$", text)
     if isnull_fn:
         args = [
             parse_sql_expression_to_ast(
@@ -582,6 +789,21 @@ def parse_sql_expression_to_ast(
             for a in _split_top_level(isnull_fn.group(1), ",")
         ]
         return {"type": "FUNCTION_CALL", "function_name": "COALESCE", "arguments": args}
+
+    # LEAST(...)/GREATEST(...) (Oracle/MySQL) — semantically identical to
+    # MIN/MAX applied to the same argument list; map onto those so the
+    # platform-recognized function names are used instead of falling
+    # through to a raw string literal.
+    least_greatest_fn = re.match(r"(?is)^(?P<fn>LEAST|GREATEST)\s*\((?P<args>.*)\)$", text)
+    if least_greatest_fn:
+        mapped_fn = "MIN" if least_greatest_fn.group("fn").upper() == "LEAST" else "MAX"
+        args = [
+            parse_sql_expression_to_ast(
+                a, default_entity=default_entity, target_column=target_column
+            )
+            for a in _split_top_level(least_greatest_fn.group("args"), ",")
+        ]
+        return {"type": "FUNCTION_CALL", "function_name": mapped_fn, "arguments": args}
 
     # Generic known functions: MIN/MAX/SUM/COUNT/ABS/ROUND/CONCAT/...
     gen_fn = re.match(
@@ -666,6 +888,36 @@ def parse_sql_expression_to_ast(
                 "right": right,
             }
 
+    # Unary minus / plus (``-A.OverdueDays``, ``-DAY(@ProcessDate)``) — tried
+    # only after the binary arithmetic loop above has already had first
+    # crack at any top-level operator (so ``-A.OverdueDays + 1`` still
+    # splits as BINARY_OP "+" first, recursing into "-A.OverdueDays" for
+    # this branch). A pure negative number literal (``-15``) is excluded
+    # here and handled by the numeric-literal check below instead. Without
+    # this, a leading unary minus falls through every remaining check and
+    # silently becomes a STRING literal of the raw SQL text.
+    unary = re.match(r"(?is)^([+-])\s*(\S.*)$", text)
+    if unary and not re.match(r"^-?\d+(\.\d+)?$", text):
+        sign, operand_sql = unary.group(1), unary.group(2).strip()
+        operand = parse_sql_expression_to_ast(
+            operand_sql, default_entity=default_entity, target_column=target_column
+        )
+        if sign == "+":
+            return operand
+        if operand.get("type") == "LITERAL" and operand.get("value_type") == "NUMBER":
+            try:
+                value = -1 * float(operand["value"])
+                operand["value"] = int(value) if value == int(value) else value
+            except (TypeError, ValueError):
+                pass
+            return operand
+        return {
+            "type": "BINARY_OP",
+            "operator": "*",
+            "left": {"type": "LITERAL", "value_type": "NUMBER", "value": -1},
+            "right": operand,
+        }
+
     # T-SQL scalar variables (@GraceWindowStart) — before string/column fallback.
     if re.match(r"^@[A-Za-z_][A-Za-z0-9_]*$", text):
         return {"type": "VARIABLE_REF", "name": text}
@@ -724,6 +976,72 @@ def _fallback_tautology(
     if dependency_refs:
         node["_dependency_refs"] = list(dependency_refs)
     return node
+
+
+def _find_top_level_as(text: str) -> int | None:
+    """Index of the first ``AS`` keyword at paren-depth 0 (word-boundary aware)."""
+    depth = 0
+    in_single = False
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if in_single:
+            if ch == "'":
+                if i + 1 < n and text[i + 1] == "'":
+                    i += 2
+                    continue
+                in_single = False
+            i += 1
+            continue
+        if ch == "'":
+            in_single = True
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+            i += 1
+            continue
+        if ch == ")":
+            depth = max(0, depth - 1)
+            i += 1
+            continue
+        if depth == 0 and text[i : i + 2].upper() == "AS":
+            before_ok = i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")
+            after_idx = i + 2
+            after_ok = after_idx >= n or not (text[after_idx].isalnum() or text[after_idx] == "_")
+            if before_ok and after_ok:
+                return i
+        i += 1
+    return None
+
+
+def _try_parse_cast(
+    text: str,
+    default_entity: str,
+    target_column: str,
+) -> dict[str, Any] | None:
+    """``CAST(expr AS type)`` -> the inner expr's AST.
+
+    4X has no explicit cast operator; the target SQL type carries no
+    derivation-relevant information, so it is dropped and the wrapped
+    expression is parsed on its own. Without this, the entire cast
+    (including the type/precision) fell through to the final fallback and
+    became a STRING literal of the raw SQL text.
+    """
+    m = re.match(r"(?is)^CAST\s*\((?P<inner>.*)\)\s*$", text)
+    if not m or not _balanced(m.group("inner")):
+        return None
+    inner = m.group("inner")
+    split_at = _find_top_level_as(inner)
+    if split_at is None:
+        return None
+    expr_sql = inner[:split_at].strip()
+    if not expr_sql:
+        return None
+    return parse_sql_expression_to_ast(
+        expr_sql, default_entity=default_entity, target_column=target_column
+    )
 
 
 def _try_parse_dateadd(
@@ -937,6 +1255,30 @@ def _try_parse_scalar_subquery(
             ],
         }
 
+    # Plain (non-aggregate) single-column lookup: SELECT col FROM table
+    # [alias] [WHERE ...] — e.g. a DimAssetClass/lookup-table key fetch.
+    # Unlike the aggregate cases above, this has no natural tie to
+    # ``default_entity`` (the subquery's real source is a *different*
+    # table), so it resolves against that source table directly — still
+    # not entity-map-aware here (phase3 has no entity_map), but far better
+    # than the previous behaviour of collapsing the whole subquery,
+    # including a typed lookup key, into an opaque STRING literal.
+    plain_m = re.match(
+        r"(?is)^SELECT\s+(?:(?:\[?#?#?[A-Za-z_][A-Za-z0-9_]*\]?\.)?(?P<col>\[?[A-Za-z_][A-Za-z0-9_]*\]?))"
+        r"\s+FROM\s+(?P<table>\[?#?#?[A-Za-z_][A-Za-z0-9_]*\]?)"
+        r"(?:\s+(?:AS\s+)?(?!WHERE\b|GROUP\b|ORDER\b|JOIN\b|HAVING\b)[A-Za-z_][A-Za-z0-9_]*)?"
+        r"(?:\s+WHERE\s.*)?$",
+        body,
+    )
+    if plain_m and not re.search(r"(?is)\bGROUP\s+BY\b|\bJOIN\b", body):
+        return {
+            "type": "COLUMN_REF",
+            "entity": normalize_table_name(plain_m.group("table")),
+            "relationship": None,
+            "column": bare_ident(plain_m.group("col")),
+            "_dependency_refs": extract_subquery_dependency_refs(body),
+        }
+
     return None
 
 
@@ -1083,42 +1425,172 @@ def _column_name_from_node(node: dict[str, Any] | None) -> str | None:
 
 
 
+def _extract_matching_case_body(text: str) -> tuple[str, bool]:
+    """Return the text between a leading ``CASE`` and ITS matching ``END``.
+
+    Depth-aware over nested ``CASE ... END`` pairs (and string literals) —
+    unlike a ``$``-anchored regex, this correctly stops at the END that
+    closes THIS CASE, not wherever the next END substring happens to be.
+    """
+    m = re.match(r"(?is)^CASE\b", text)
+    if not m:
+        return "", False
+    i = m.end()
+    n = len(text)
+    depth = 1
+    in_single = False
+    while i < n:
+        ch = text[i]
+        if in_single:
+            if ch == "'":
+                if i + 1 < n and text[i + 1] == "'":
+                    i += 2
+                    continue
+                in_single = False
+            i += 1
+            continue
+        if ch == "'":
+            in_single = True
+            i += 1
+            continue
+        if re.match(r"(?is)^CASE\b", text[i:]):
+            depth += 1
+            i += 4
+            continue
+        if re.match(r"(?is)^END\b", text[i:]):
+            depth -= 1
+            if depth == 0:
+                return text[m.end() : i].strip(), True
+            i += 3
+            continue
+        i += 1
+    return "", False
+
+
+def _scan_case_top_level_markers(body: str) -> list[tuple[int, str]]:
+    """Positions of ``WHEN``/``THEN``/``ELSE`` at CASE-depth 0, paren-depth 0.
+
+    Keywords belonging to a nested ``CASE ... END`` (inside a THEN/ELSE
+    value) are excluded — the nested CASE's own depth tracking absorbs them,
+    so they never register here and stay embedded verbatim in the outer
+    branch's captured text for a later recursive parse.
+    """
+    markers: list[tuple[int, str]] = []
+    n = len(body)
+    i = 0
+    depth = 0
+    paren_depth = 0
+    in_single = False
+    while i < n:
+        ch = body[i]
+        if in_single:
+            if ch == "'":
+                if i + 1 < n and body[i + 1] == "'":
+                    i += 2
+                    continue
+                in_single = False
+            i += 1
+            continue
+        if ch == "'":
+            in_single = True
+            i += 1
+            continue
+        if ch == "(":
+            paren_depth += 1
+            i += 1
+            continue
+        if ch == ")":
+            paren_depth = max(0, paren_depth - 1)
+            i += 1
+            continue
+        if re.match(r"(?is)^CASE\b", body[i:]):
+            depth += 1
+            i += 4
+            continue
+        if re.match(r"(?is)^END\b", body[i:]):
+            depth = max(0, depth - 1)
+            i += 3
+            continue
+        if depth == 0 and paren_depth == 0:
+            km = re.match(r"(?is)^(WHEN|THEN|ELSE)\b", body[i:])
+            if km:
+                markers.append((i, km.group(1).upper()))
+                i += len(km.group(1))
+                continue
+        i += 1
+    return markers
+
+
 def _try_parse_case(
     text: str,
     default_entity: str,
     target_column: str = "",
 ) -> dict[str, Any] | None:
-    if not re.match(r"(?is)^CASE\b", text):
-        return None
-    # CASE WHEN c THEN t WHEN c2 THEN t2 ELSE e END
-    body = re.sub(r"(?is)^CASE\s+", "", text)
-    body = re.sub(r"(?is)\s+END\s*$", "", body)
-    else_node: dict[str, Any] = {"type": "LITERAL", "value_type": "NULL", "value": None}
-    else_match = re.search(r"(?is)\bELSE\b(.+)$", body)
-    if else_match:
-        else_node = parse_sql_expression_to_ast(
-            else_match.group(1).strip(),
-            default_entity=default_entity,
-            target_column=target_column,
-        )
-        body = body[: else_match.start()]
+    """Parse a ``CASE`` expression: searched, simple, and nested forms.
 
-    whens = re.findall(r"(?is)\bWHEN\b(.+?)\bTHEN\b(.+?)(?=\bWHEN\b|\bELSE\b|$)", body)
+    Searched: ``CASE WHEN cond1 THEN r1 ... [ELSE e] END``
+    Simple:   ``CASE operand WHEN v1 THEN r1 ... [ELSE e] END`` — each WHEN
+              value folds to an equality against ``operand``.
+    Nested:   a THEN/ELSE value that is itself a full CASE expression —
+              handled by depth-aware marker scanning, so an inner CASE's own
+              WHEN/THEN/ELSE never get mistaken for the outer CASE's.
+    """
+    body, matched = _extract_matching_case_body(text)
+    if not matched:
+        return None
+
+    markers = _scan_case_top_level_markers(body)
+    first_when_idx = next((i for i, (_, k) in enumerate(markers) if k == "WHEN"), None)
+    if first_when_idx is None:
+        return None
+
+    # Simple-CASE operand: any text before the first top-level WHEN.
+    operand_sql = body[: markers[first_when_idx][0]].strip() or None
+
+    else_node: dict[str, Any] = {"type": "LITERAL", "value_type": "NULL", "value": None}
+    whens: list[tuple[str, str]] = []
+    idx = first_when_idx
+    n_markers = len(markers)
+    while idx < n_markers:
+        pos, kind = markers[idx]
+        if kind == "WHEN" and idx + 1 < n_markers and markers[idx + 1][1] == "THEN":
+            cond_end = markers[idx + 1][0]
+            then_start = markers[idx + 1][0] + 4
+            then_end = markers[idx + 2][0] if idx + 2 < n_markers else len(body)
+            cond_sql = body[pos + 4 : cond_end].strip()
+            then_sql = body[then_start:then_end].strip()
+            whens.append((cond_sql, then_sql))
+            idx += 2
+            continue
+        if kind == "ELSE":
+            else_start = pos + 4
+            else_end = markers[idx + 1][0] if idx + 1 < n_markers else len(body)
+            else_node = parse_sql_expression_to_ast(
+                body[else_start:else_end].strip(),
+                default_entity=default_entity,
+                target_column=target_column,
+            )
+            idx += 1
+            continue
+        idx += 1  # stray THEN with no preceding WHEN
+
     if not whens:
         return None
 
     ast = else_node
     for cond_sql, then_sql in reversed(whens):
+        if operand_sql:
+            cond_sql = f"({operand_sql}) = ({cond_sql})"
         ast = {
             "type": "IF_THEN_ELSE",
             "condition": parse_sql_expression_to_ast(
-                cond_sql.strip(),
+                cond_sql,
                 default_entity=default_entity,
                 target_column=target_column,
                 as_condition=True,
             ),
             "then_branch": parse_sql_expression_to_ast(
-                then_sql.strip(),
+                then_sql,
                 default_entity=default_entity,
                 target_column=target_column,
             ),
@@ -1239,6 +1711,112 @@ def _literal_from_sql_token(token: str) -> dict[str, Any]:
     if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", text):
         return {"type": "LITERAL", "value_type": "STRING", "value": text}
     return {"type": "LITERAL", "value_type": "STRING", "value": text}
+
+
+def _try_map_like_to_membership(
+    lhs_sql: str,
+    pattern_sql: str,
+    *,
+    negate: bool,
+    default_entity: str,
+    target_column: str,
+) -> dict[str, Any] | None:
+    """Map a LIKE/NOT LIKE with a fixed-literal pattern onto MEMBERSHIP_OP.
+
+    The 4X grammar's only native pattern-matching is MEMBERSHIP_OP
+    CONTAINS/BEGINSWITH/ENDSWITH/DOESNOTCONTAINS, which take a literal
+    value — not an arbitrary expression. This only fires when the pattern
+    resolves to a plain string literal (optionally wrapped in ``%``
+    wildcards); a dynamic pattern (e.g. concatenated with a column) has no
+    valid 4X representation and returns None so the caller falls back to
+    the honest-failure BINARY_OP shape instead.
+    """
+    pattern_node = parse_sql_expression_to_ast(
+        pattern_sql, default_entity=default_entity, target_column=target_column
+    )
+    if pattern_node.get("type") != "LITERAL" or pattern_node.get("value_type") != "STRING":
+        return None
+    raw = str(pattern_node.get("value") or "")
+    starts = raw.startswith("%")
+    ends = raw.endswith("%")
+    needle = raw
+    if starts:
+        needle = needle[1:]
+    if ends and needle:
+        needle = needle[:-1]
+    lhs_node = parse_sql_expression_to_ast(
+        lhs_sql, default_entity=default_entity, target_column=target_column
+    )
+
+    if not starts and not ends:
+        # No wildcard at all — LIKE degenerates to exact equality.
+        op = "!=" if negate else "=="
+        return {
+            "type": "BINARY_OP",
+            "operator": op,
+            "left": lhs_node,
+            "right": {"type": "LITERAL", "value_type": "STRING", "value": needle},
+        }
+
+    if starts and ends:
+        operator = "DOESNOTCONTAINS" if negate else "CONTAINS"
+    elif ends:  # 'needle%' — starts-with
+        if negate:
+            return None  # no native "NOT BEGINSWITH" token in the grammar
+        operator = "BEGINSWITH"
+    else:  # '%needle' — ends-with
+        if negate:
+            return None  # no native "NOT ENDSWITH" token in the grammar
+        operator = "ENDSWITH"
+
+    return {
+        "type": "MEMBERSHIP_OP",
+        "operator": operator,
+        "column": lhs_node,
+        "values": [needle],
+    }
+
+
+def _split_top_level_keyword(text: str, keyword_pattern: str) -> list[str]:
+    """Split ``text`` on the first top-level (paren/string-depth 0) keyword.
+
+    ``keyword_pattern`` is a regex fragment (word-boundary wrapped, e.g.
+    ``r"NOT\\s+LIKE"``), matched case-insensitively. Returns ``[text]``
+    unmatched, or ``[before, after]`` on the first depth-0 match.
+    """
+    pattern = re.compile(rf"(?is)\b(?:{keyword_pattern})\b")
+    depth = 0
+    in_single = False
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if in_single:
+            if ch == "'":
+                if i + 1 < n and text[i + 1] == "'":
+                    i += 2
+                    continue
+                in_single = False
+            i += 1
+            continue
+        if ch == "'":
+            in_single = True
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+            i += 1
+            continue
+        if ch == ")":
+            depth = max(0, depth - 1)
+            i += 1
+            continue
+        if depth == 0:
+            m = pattern.match(text, i)
+            if m:
+                return [text[:i], text[m.end():]]
+        i += 1
+    return [text]
 
 
 def _split_top_level(text: str, separator: str) -> list[str]:

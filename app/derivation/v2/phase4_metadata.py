@@ -177,10 +177,12 @@ def build_metadata(
 
     dependency_refs = _collect_dependency_refs(ast, mutation_dependency_refs)
 
-    description = business_summary.strip() or (
-        f"v2 AST derivation for {target_entity}.{target_column} "
-        f"from {mutation_count} UPDATE pass(es)."
-    )
+    # NOTE: ``business_summary`` is a whole-procedure summary (one string per
+    # CanonicalModel / chain) — it must never be used as the description
+    # here, or every column derived from the same procedure ends up with an
+    # identical, duplicated "Business Purpose". Always derive a description
+    # scoped to this specific target_entity/target_column instead.
+    description = _describe_column_derivation(target_entity, target_column, ast, mutation_count)
 
     if errors:
         logger.info(
@@ -253,6 +255,46 @@ def metadata_to_dd_row(
         conditional_json=None,
         decision_table_json=None,
     )
+
+
+def _describe_column_derivation(
+    target_entity: str,
+    target_column: str,
+    ast: dict[str, Any] | None,
+    mutation_count: int,
+) -> str:
+    """Column-specific derivation description.
+
+    Never falls back to a whole-procedure summary — that field is shared
+    across every column derived from the same chain and would otherwise
+    duplicate verbatim across unrelated rows. Every branch here is scoped to
+    this specific ``target_entity``/``target_column`` pair.
+    """
+    node_type = (ast or {}).get("type") if isinstance(ast, dict) else None
+
+    if node_type == "COLUMN_REF" and mutation_count <= 1:
+        src_entity = str(ast.get("entity") or target_entity)
+        src_col = str(ast.get("column") or target_column)
+        if src_entity.upper() != target_entity.upper() or src_col.upper() != target_column.upper():
+            return f"Derives {target_column} for {target_entity} by copying {src_col} from {src_entity}."
+
+    if node_type == "IF_THEN_ELSE":
+        return (
+            f"Derives {target_column} for {target_entity} by evaluating conditional "
+            f"business logic across {mutation_count} UPDATE pass(es)."
+        )
+    if node_type == "MEMBERSHIP_OP":
+        return f"Derives {target_column} for {target_entity} based on a membership (IN / NOT IN) check."
+    if node_type == "FUNCTION_CALL":
+        func = str((ast or {}).get("function_name") or "").strip()
+        if func:
+            return f"Derives {target_column} for {target_entity} using {func}(...) logic."
+    if mutation_count > 1:
+        return (
+            f"Derives {target_column} for {target_entity} by folding {mutation_count} "
+            "chronological UPDATE pass(es)."
+        )
+    return f"Derives {target_column} for {target_entity} based on execution logic."
 
 
 def _infer_derivation_type(

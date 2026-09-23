@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Any
+
+from app.utils.entity_name_map import resolve_entity_name
 
 
 _STMT_START = re.compile(
@@ -896,6 +899,207 @@ def extract_select_into(sql: str) -> list[dict[str, str]]:
             }
         )
     return results
+
+
+def extract_cte_definitions(sql: str) -> list[dict[str, str]]:
+    """Find ``[;]WITH name [(cols)] AS (body)`` common table expressions.
+
+    Only single, non-recursive CTEs are extracted — enough to register the
+    CTE name as a virtual lineage source for the statement that follows it
+    (the common real-world shape: one CTE feeding one UPDATE/INSERT/SELECT),
+    not full multi-CTE or recursive-CTE support. Without this, a CTE alias
+    reference (``FROM CTE A ... A.SomeAggCol``) resolves through no lineage
+    at all — the engine would treat the literal string ``CTE`` as if it
+    were a real database table.
+    """
+    text = strip_sql_comments(sql or "")
+    results: list[dict[str, str]] = []
+    for m in re.finditer(
+        r"(?is);?\s*\bWITH\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*"
+        r"(?:\((?P<cols>[^)]*)\))?\s*AS\s*\(",
+        text,
+    ):
+        name = m.group("name")
+        cols = m.group("cols") or ""
+        body_start = m.end()
+        depth = 1
+        i = body_start
+        n = len(text)
+        in_single = False
+        while i < n and depth > 0:
+            ch = text[i]
+            if in_single:
+                if ch == "'":
+                    if i + 1 < n and text[i + 1] == "'":
+                        i += 2
+                        continue
+                    in_single = False
+                i += 1
+                continue
+            if ch == "'":
+                in_single = True
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        if depth != 0:
+            continue
+        body = text[body_start:i]
+        if not re.match(r"(?is)^\s*SELECT\b", body):
+            continue
+        results.append(
+            {
+                "name": name,
+                "cols": cols.strip(),
+                "body": body.strip(),
+                "start": str(m.start()),
+                "end": str(i + 1),
+            }
+        )
+    return results
+
+
+def split_select_from(select_sql: str) -> tuple[str, str]:
+    """Split ``SELECT <list> FROM <rest>`` into ``(select_list, from_body)``.
+
+    ``from_body`` has the leading ``FROM`` stripped and stops before any
+    top-level ``WHERE``/``GROUP BY``/``ORDER BY``/``HAVING`` — the same
+    shape ``extract_select_into``/``extract_insert_select`` already produce,
+    so callers can feed it straight into ``parse_from_join_clause``.
+    """
+    m = re.match(r"(?is)^SELECT\s+(?P<rest>.+)$", (select_sql or "").strip())
+    if not m:
+        return "", ""
+    rest = m.group("rest")
+    depth = 0
+    in_single = False
+    i = 0
+    n = len(rest)
+    while i < n:
+        ch = rest[i]
+        if in_single:
+            if ch == "'":
+                if i + 1 < n and rest[i + 1] == "'":
+                    i += 2
+                    continue
+                in_single = False
+            i += 1
+            continue
+        if ch == "'":
+            in_single = True
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+            i += 1
+            continue
+        if ch == ")":
+            depth = max(0, depth - 1)
+            i += 1
+            continue
+        if depth == 0 and re.match(r"(?is)^FROM\b", rest[i:]):
+            select_list = rest[:i]
+            rest_from = rest[i + 4 :]
+            stop = re.search(r"(?is)\b(WHERE|GROUP\s+BY|ORDER\s+BY|HAVING)\b", rest_from)
+            from_body = rest_from[: stop.start()] if stop else rest_from
+            return select_list.strip(), from_body.strip()
+        i += 1
+    return rest.strip(), ""
+
+
+def iter_set_assignments(set_clause: str) -> list[dict[str, str]]:
+    """Split an ``UPDATE ... SET`` clause into column/alias/expr parts.
+
+    Shared by phase2 (target-column mutation folding) and phase1 (temp-table
+    mutation-checkpoint capture) so both phases parse ``SET`` identically.
+    """
+    assignments: list[dict[str, str]] = []
+    for part in split_csv_respecting_parens(set_clause or ""):
+        match = re.match(
+            r"(?is)^\s*(?:(?P<alias>[#A-Za-z_][A-Za-z0-9_]*)\.)?"
+            r"(?P<column>\[?[A-Za-z_][A-Za-z0-9_]*\]?)\s*=\s*(?P<expr>.+?)\s*$",
+            part.strip(),
+        )
+        if not match:
+            continue
+        assignments.append(
+            {
+                "alias": (match.group("alias") or "").strip(),
+                "column": bare_ident(match.group("column")),
+                "expr": match.group("expr").strip(),
+            }
+        )
+    return assignments
+
+
+def resolve_expression_column_refs(
+    expression: str,
+    alias_map: dict[str, str],
+    lineage: Any,
+    entity_map: dict[str, str] | None,
+    default_entity: str,
+) -> str:
+    """Rewrite ``alias.col`` tokens using the given alias map + lineage resolver.
+
+    ``lineage`` is duck-typed (only needs ``resolve_column(table, column,
+    entity_map)``) to avoid a circular import with phase1's ``LineageMap``.
+    When a resolved column carries a ``derived_formula`` (a temp-table
+    mutation checkpoint recorded by phase1), that formula text is spliced in
+    verbatim instead of a flat entity/column marker, so callers inherit the
+    folded expression rather than the pre-mutation root value.
+
+    Important: do **not** rewrite arbitrary ``schema.table`` tokens (e.g.
+    ``PRO.AssetClassMovementHistory``) — those are not column refs.
+    """
+
+    def repl(match: re.Match[str]) -> str:
+        qual = match.group("qual")
+        col = bare_ident(match.group("col"))
+        if qual.startswith("@") or col.startswith("@"):
+            return match.group(0)
+        table = alias_map.get(qual.upper())
+        if table is None:
+            if qual.startswith("#"):
+                table = normalize_table_name(qual)
+            else:
+                return match.group(0)
+        ref = lineage.resolve_column(table, col, entity_map)
+        if getattr(ref, "derived_formula", None):
+            return f"({ref.derived_formula})"
+        relationship = ref.relationship
+        if (
+            relationship is None
+            and ref.entity
+            and default_entity
+            and ref.entity.upper() != default_entity.upper()
+            and (
+                ref.entity.startswith("##")
+                or str(table).startswith("##")
+                or (resolve_entity_name(str(table), entity_map) or "").upper()
+                != default_entity.upper()
+            )
+        ):
+            if str(table).startswith("##"):
+                rel = str(table)
+            elif ref.source_table.startswith("##"):
+                rel = ref.source_table
+            else:
+                rel = ref.entity if ref.entity.startswith("##") else f"##{ref.entity}"
+            if (resolve_entity_name(str(table), entity_map) or "").upper() != default_entity.upper():
+                return f"{default_entity}::{rel}::{ref.column}"
+        if relationship:
+            return f"{ref.entity}::{relationship}::{ref.column}"
+        return f"{ref.entity}::{ref.column}"
+
+    pattern = re.compile(
+        r"(?P<qual>[#A-Za-z_][A-Za-z0-9_]*)\.(?P<col>\[?[A-Za-z_][A-Za-z0-9_]*\]?)"
+    )
+    return pattern.sub(repl, expression or "")
 
 
 def extract_insert_select(

@@ -12,11 +12,16 @@ from typing import Any
 
 from app.derivation.v2.sql_text import (
     bare_ident,
+    extract_cte_definitions,
     extract_insert_select,
     extract_select_into,
+    extract_update_statements,
+    iter_set_assignments,
     normalize_table_name,
     parse_from_join_clause,
+    resolve_expression_column_refs,
     split_csv_respecting_parens,
+    split_select_from,
     strip_sql_comments,
 )
 from app.utils.entity_name_map import resolve_entity_name
@@ -42,6 +47,12 @@ class RootColumnRef:
     column: str
     relationship: str | None = None
     source_table: str = ""
+    # Mutation checkpoint: a resolved 4X-marker-ready expression string when
+    # this temp column was re-derived by its own UPDATE after being written
+    # (e.g. a staging-table markup pass). Downstream consumers that read this
+    # column should inherit this expression instead of the flat entity/column
+    # marker, or they lose the derived transformation entirely.
+    derived_formula: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -49,6 +60,7 @@ class RootColumnRef:
             "column": self.column,
             "relationship": self.relationship,
             "source_table": self.source_table,
+            "derived_formula": self.derived_formula,
         }
 
 
@@ -59,12 +71,17 @@ class LineageMap:
     columns: dict[str, RootColumnRef] = field(default_factory=dict)
     tables: dict[str, str] = field(default_factory=dict)
     root_entities: set[str] = field(default_factory=set)
+    # Column order per local temp table, captured from its CREATE TABLE
+    # definition. Used to fall back to ordinal alignment when a downstream
+    # INSERT ... SELECT into that temp omits an explicit column list.
+    temp_table_columns: dict[str, list[str]] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "columns": {key: ref.as_dict() for key, ref in self.columns.items()},
             "tables": dict(self.tables),
             "root_entities": sorted(self.root_entities),
+            "temp_table_columns": dict(self.temp_table_columns),
         }
 
     def resolve_column(
@@ -119,6 +136,13 @@ def build_lineage_map(
             lineage.tables[target] = entity
         else:
             lineage.tables.setdefault(target, target)
+        col_order = [
+            bare_ident(part.strip().split()[0])
+            for part in split_csv_respecting_parens(match.group("body"))
+            if part.strip()
+        ]
+        if col_order:
+            lineage.temp_table_columns.setdefault(target, col_order)
 
     for item in extract_select_into(text):
         _ingest_select_projection(
@@ -140,6 +164,26 @@ def build_lineage_map(
             explicit_target_columns=col_names or None,
         )
 
+    # Common table expressions: ``;WITH cte(cols) AS (SELECT ...) UPDATE ...
+    # FROM cte alias``. Registered exactly like a local temp table's
+    # projection lineage — without this, a CTE alias reference resolves
+    # through no lineage at all and the engine treats the literal CTE name
+    # as if it were a real database table.
+    for cte in extract_cte_definitions(text):
+        col_names = [bare_ident(c) for c in (cte.get("cols") or "").split(",") if bare_ident(c)]
+        select_list, from_body = split_select_from(cte.get("body") or "")
+        if not select_list:
+            continue
+        _ingest_select_projection(
+            lineage,
+            target=cte["name"],
+            select_list=select_list,
+            from_body=from_body,
+            entity_map=entity_map,
+            explicit_target_columns=col_names or None,
+        )
+
+    _capture_temp_column_mutations(lineage, text, entity_map)
     _expand_transitive(lineage)
     logger.debug(
         "phase1 lineage: %d column(s), %d root entit(y/ies)",
@@ -172,12 +216,23 @@ def _ingest_select_projection(
 
     projections = _parse_select_list(select_list)
     if explicit_target_columns and len(explicit_target_columns) == len(projections):
-        for dest_col, (src_qual, src_col, _) in zip(explicit_target_columns, projections):
+        # Strict zero-indexed ordinal alignment: column Ci pairs ONLY with
+        # projection Ei, even when some Ej in between is a CASE/function
+        # expression with no direct column ref (that slot is simply skipped,
+        # not dropped from the list — dropping it would shift every column
+        # after it out of position).
+        for dest_col, (src_qual, src_col, _alias, _raw) in zip(
+            explicit_target_columns, projections
+        ):
+            if src_qual is None and src_col is None:
+                continue
             _register_projection(
                 lineage, target, dest_col, src_qual, src_col, alias_to_table, entity_map
             )
     else:
-        for src_qual, src_col, dest_alias in projections:
+        for src_qual, src_col, dest_alias, _raw in projections:
+            if src_qual is None and src_col is None:
+                continue
             dest = dest_alias or src_col
             _register_projection(
                 lineage, target, dest, src_qual, src_col, alias_to_table, entity_map
@@ -242,19 +297,130 @@ def _expand_transitive(lineage: LineageMap, max_passes: int = 8) -> None:
                         column=ref.column,
                         relationship=ref.relationship,
                         source_table=ref.source_table,
+                        derived_formula=ref.derived_formula,
                     )
                     changed = True
                 continue
-            if upstream.entity != ref.entity or upstream.column != ref.column:
+            if (
+                upstream.entity != ref.entity
+                or upstream.column != ref.column
+                or upstream.derived_formula
+            ):
                 lineage.columns[key] = RootColumnRef(
                     entity=upstream.entity,
                     column=upstream.column,
                     relationship=upstream.relationship or ref.relationship,
                     source_table=ref.source_table,
+                    # A downstream temp's own mutation checkpoint (if any)
+                    # takes precedence; otherwise inherit the upstream one so
+                    # chained #temp -> #temp2 -> root derivations aren't lost.
+                    derived_formula=ref.derived_formula or upstream.derived_formula,
                 )
                 changed = True
         if not changed:
             break
+
+
+def _capture_temp_column_mutations(
+    lineage: LineageMap,
+    text: str,
+    entity_map: dict[str, str] | None,
+) -> None:
+    """Fold UPDATEs against local ``#temp`` columns into mutation checkpoints.
+
+    Phase 1 otherwise only ever sees a temp column's *initial* INSERT/SELECT
+    INTO projection and immediately strips the temp table, pointing straight
+    at the root entity. When that column is later re-derived by its own
+    UPDATE (a classic staging-table markup pass ahead of a downstream MERGE
+    or UPDATE), that re-derivation must not be silently discarded — record
+    it as ``derived_formula`` so downstream consumers (phase2's expression
+    resolver) inherit the folded expression instead of the pre-mutation
+    root value.
+    """
+    for stmt in extract_update_statements(text):
+        head = (stmt.get("head") or "").strip()
+        set_clause = (stmt.get("set_clause") or "").strip()
+        from_clause = (stmt.get("from_clause") or "").strip()
+        where_clause = (stmt.get("where_clause") or "").strip() or None
+        if not set_clause or not head:
+            continue
+
+        alias_map: dict[str, str] = {}
+        target_tables: list[str] = []
+        head_match = re.match(
+            r"(?is)^(?P<table>\[?#+[A-Za-z0-9_\.]+\]?)"
+            r"(?:\s+(?:AS\s+)?(?P<alias>[A-Za-z_][A-Za-z0-9_]*))?$",
+            head,
+        )
+        if head_match:
+            table = normalize_table_name(head_match.group("table"))
+            alias_map[bare_ident(table).upper()] = table
+            if head_match.group("alias"):
+                alias_map[head_match.group("alias").upper()] = table
+            target_tables.append(table)
+
+        for from_table, from_alias, _on in parse_from_join_clause(from_clause):
+            alias_map[bare_ident(from_table).upper()] = from_table
+            if from_alias:
+                alias_map[from_alias.upper()] = from_table
+            norm_from = normalize_table_name(from_table)
+            # ``UPDATE alias SET ... FROM #Temp alias`` — head is a bare alias
+            # that resolves to the temp table declared in FROM.
+            if (
+                not head_match
+                and not target_tables
+                and re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", head)
+                and from_alias
+                and from_alias.upper() == head.upper()
+            ):
+                target_tables.append(norm_from)
+
+        for table in target_tables:
+            norm = normalize_table_name(table)
+            if not norm.startswith("#") or norm.startswith("##"):
+                continue
+            for assign in iter_set_assignments(set_clause):
+                col = assign["column"]
+                if assign["alias"]:
+                    resolved_alias_tbl = alias_map.get(assign["alias"].upper())
+                    if (
+                        resolved_alias_tbl
+                        and normalize_table_name(resolved_alias_tbl).upper() != norm.upper()
+                    ):
+                        continue
+
+                key = _column_key(norm, col)
+                prior = lineage.columns.get(key)
+                resolved_expr = resolve_expression_column_refs(
+                    assign["expr"], alias_map, lineage, entity_map, norm
+                )
+                if where_clause:
+                    resolved_where = resolve_expression_column_refs(
+                        where_clause, alias_map, lineage, entity_map, norm
+                    )
+                    if prior and prior.derived_formula:
+                        prior_expr = prior.derived_formula
+                    elif prior:
+                        prior_expr = f"{prior.entity}::{prior.column}"
+                    else:
+                        prior_expr = "NULL"
+                    formula = (
+                        f"CASE WHEN {resolved_where} THEN {resolved_expr} "
+                        f"ELSE {prior_expr} END"
+                    )
+                else:
+                    formula = resolved_expr
+
+                if prior:
+                    prior.derived_formula = formula
+                else:
+                    entity = lineage.tables.get(norm, norm)
+                    lineage.columns[key] = RootColumnRef(
+                        entity=entity,
+                        column=col,
+                        source_table=norm,
+                        derived_formula=formula,
+                    )
 
 
 def _alias_map(from_body: str) -> dict[str, str]:
@@ -267,26 +433,64 @@ def _alias_map(from_body: str) -> dict[str, str]:
     return mapping
 
 
-def _parse_select_list(select_list: str) -> list[tuple[str | None, str, str | None]]:
-    results: list[tuple[str | None, str, str | None]] = []
+def _parse_select_list(
+    select_list: str,
+) -> list[tuple[str | None, str | None, str | None, str]]:
+    """Parse a SELECT projection list, preserving one entry per ordinal slot.
+
+    Returns ``(src_qual, src_col, dest_alias, raw_chunk)`` per top-level item.
+    Complex expressions (CASE / function calls / subqueries) cannot resolve
+    to a single ``src_qual``/``src_col`` and are returned as
+    ``(None, None, alias_if_any, raw_chunk)`` — the caller MUST still count
+    this slot (not skip it) so positional alignment with an explicit target
+    column list stays correct for every projection after it.
+    """
+    results: list[tuple[str | None, str | None, str | None, str]] = []
     if not select_list or not select_list.strip() or select_list.strip() == "*":
         return results
+
+    # Strip leading SELECT modifiers (DISTINCT / ALL / TOP n) before
+    # splitting — otherwise the first chunk's own column regex greedily
+    # matches the modifier keyword itself as if it were the column name
+    # (``DISTINCT UcifEntityID`` -> column "DISTINCT").
+    select_list = select_list.strip()
+    for _ in range(3):
+        m = re.match(r"(?is)^(?:DISTINCT|ALL)\s+", select_list)
+        if m:
+            select_list = select_list[m.end():]
+            continue
+        m = re.match(r"(?is)^TOP\s*\(?\s*\d+\s*\)?\s+", select_list)
+        if m:
+            select_list = select_list[m.end():]
+            continue
+        break
 
     for part in split_csv_respecting_parens(select_list):
         chunk = part.strip()
         if not chunk or chunk == "*":
+            results.append((None, None, None, chunk))
             continue
         if "(" in chunk:
+            alias = None
+            alias_m = re.search(
+                r"(?is)\)\s*(?:AS\s+)?(?P<alias>\[?[A-Za-z_][A-Za-z0-9_]*\]?)\s*$",
+                chunk,
+            )
+            if alias_m:
+                alias = bare_ident(alias_m.group("alias"))
+            results.append((None, None, alias, chunk))
             continue
         match = _COL_AS_RE.search(chunk)
         if not match:
+            results.append((None, None, None, chunk))
             continue
         qual = match.group("qual")
         col = bare_ident(match.group("col"))
         alias = bare_ident(match.group("alias")) if match.group("alias") else None
         if col.upper() in {"AS", "FROM", "INTO"}:
+            results.append((None, None, None, chunk))
             continue
-        results.append((qual, col, alias))
+        results.append((qual, col, alias, chunk))
     return results
 
 

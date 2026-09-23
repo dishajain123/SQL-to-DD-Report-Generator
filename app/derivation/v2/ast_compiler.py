@@ -13,8 +13,31 @@ import re
 from typing import Any
 
 
-ALLOWED_BINARY_OPS = {"==", "!=", ">", ">=", "<", "<=", "AND", "OR", "+", "-", "*", "/"}
-ALLOWED_MEMBERSHIP_OPS = {"IN", "NOTIN"}
+# NOTE: "LIKE"/"NOT LIKE" are NOT valid tokens in fourx_grammar.lark (it has
+# no LIKE operator at all — pattern matching is only native via
+# MEMBERSHIP_OP CONTAINS/BEGINSWITH/ENDSWITH/DOESNOTCONTAINS, which phase3
+# maps a fixed-literal LIKE pattern onto directly). They're listed here only
+# because compile_ast_to_4x_string still renders them as an honest-failure
+# fallback for a LIKE whose pattern is genuinely dynamic (e.g. concatenated
+# with a column) and therefore has no valid 4X representation at all — the
+# resulting string deliberately fails grammar validation so it surfaces as
+# a review flag instead of silently compiling to something wrong.
+ALLOWED_BINARY_OPS = {"==", "!=", ">", ">=", "<", "<=", "AND", "OR", "+", "-", "*", "/", "LIKE", "NOT LIKE"}
+# Every MEMBERSHIP_OP token the grammar (fourx_grammar.lark) actually
+# defines — not just IN/NOTIN. CONTAINS/BEGINSWITH/ENDSWITH/
+# DOESNOTCONTAINS are how the platform expresses LIKE-style pattern
+# matching; HRCHYIN/HRCHYNOTIN are hierarchy membership variants.
+ALLOWED_MEMBERSHIP_OPS = {
+    "IN",
+    "NOTIN",
+    "HRCHYIN",
+    "HRCHYNOTIN",
+    "CONTAINS",
+    "BEGINSWITH",
+    "ENDSWITH",
+    "DOESNOTCONTAINS",
+}
+_MEMBERSHIP_OP_TOKENS = ALLOWED_MEMBERSHIP_OPS
 ALLOWED_FUNCTIONS = {
     "ISEMPTY",
     "ISNOTEMPTY",
@@ -62,6 +85,30 @@ def compile_ast_to_4x_string(node: dict[str, Any] | None) -> str:
         elif operator not in {"AND", "OR"}:
             operator = raw_op
 
+        # Malformed producer output: ISEMPTY/ISNOTEMPTY used as an infix
+        # comparison operator (``[Expr] ISEMPTY NULL``) instead of the unary
+        # FUNCTION_CALL form. Recover the intended functional syntax around
+        # whichever operand is the real expression (not a NULL literal).
+        if operator in {"ISEMPTY", "ISNOTEMPTY"}:
+            left_node = node.get("left") or {}
+            right_node = node.get("right") or {}
+            operand = left_node if not _is_null_literal(left_node) else right_node
+            return f"{operator}({compile_ast_to_4x_string(operand)})"
+
+        # NULL comparisons (``col >= NULL`` / ``col == NULL``) are not valid
+        # 4X grammar — the platform has no NULL literal on the RHS/LHS of a
+        # comparison operator. Normalize to ISEMPTY / ISNOTEMPTY on whichever
+        # side is the non-NULL operand.
+        if operator in {"==", "!=", ">", ">=", "<", "<="}:
+            left_node = node.get("left") or {}
+            right_node = node.get("right") or {}
+            left_is_null = _is_null_literal(left_node)
+            right_is_null = _is_null_literal(right_node)
+            if left_is_null or right_is_null:
+                operand = right_node if left_is_null else left_node
+                func = "ISEMPTY" if operator in {"==", "<=", ">="} else "ISNOTEMPTY"
+                return f"{func}({compile_ast_to_4x_string(operand)})"
+
         left = compile_ast_to_4x_string(node["left"])
         right = compile_ast_to_4x_string(node["right"])
         return f"{left} {operator} {right}"
@@ -69,25 +116,35 @@ def compile_ast_to_4x_string(node: dict[str, Any] | None) -> str:
     if node_type == "FUNCTION_CALL":
         func = str(node.get("function_name") or "").strip().upper()
         args = node.get("arguments") or []
+        if func == "__VALUE_PREDICATE_MIXING__":
+            # Sentinel from phase3's value/predicate-mixing guard — raise here
+            # so the pipeline's existing compile-error handling records a
+            # validation error instead of the caller silently dropping the row.
+            raise ValueError(node.get("_validation_error") or "value/predicate mixing detected")
+        if func == "ADDDAY" and len(args) != 2:
+            # Fail loud instead of emitting invalid grammar (ADDDAY(x) with a
+            # dropped offset argument, or extra args the grammar rejects).
+            raise ValueError(
+                f"ADDDAY requires exactly 2 arguments (date, offset), got {len(args)}: {node!r}"
+            )
         rendered = ", ".join(compile_ast_to_4x_string(a) for a in args)
         return f"{func}({rendered})"
 
     if node_type == "MEMBERSHIP_OP":
         operator = str(node.get("operator") or "IN").strip().upper().replace(" ", "")
-        if operator == "NOTIN":
-            pass
-        elif operator == "NOTIN" or operator.replace(" ", "") == "NOTIN":
-            operator = "NOTIN"
-        elif "NOT" in operator and "IN" in operator:
-            operator = "NOTIN"
-        elif operator != "IN":
-            operator = "IN"
+        # Preserve every MEMBERSHIP_OP token the grammar actually defines —
+        # this previously collapsed ANY operator that wasn't exactly IN/
+        # NOTIN-shaped back to bare "IN", silently discarding CONTAINS/
+        # BEGINSWITH/ENDSWITH/DOESNOTCONTAINS/HRCHYIN/HRCHYNOTIN even though
+        # the platform grammar supports them.
+        if operator not in _MEMBERSHIP_OP_TOKENS:
+            operator = "NOTIN" if "NOT" in operator and "IN" in operator else "IN"
         col = compile_ast_to_4x_string(node["column"])
         vals = ", ".join(_compile_membership_value(v) for v in (node.get("values") or []))
         return f"{col} {operator} [{vals}]"
 
     if node_type == "COLUMN_REF":
-        entity = str(node.get("entity") or "").strip()
+        entity = _clean_entity_qualifier(str(node.get("entity") or "").strip())
         column = str(node.get("column") or "").strip()
         relationship = node.get("relationship")
         # Local T-SQL scalar variables (@GraceWindowStart, @ProcessDate) must
@@ -101,8 +158,13 @@ def compile_ast_to_4x_string(node: dict[str, Any] | None) -> str:
         if not relationship and _looks_like_numeric_decimal_parts(entity, column):
             return f"{entity}.{column}"
         if relationship:
-            if _is_at_variable(str(relationship)):
-                return _compile_at_variable(str(relationship))
+            relationship = _clean_entity_qualifier(str(relationship))
+            if _is_at_variable(relationship):
+                return _compile_at_variable(relationship)
+            if relationship.upper() == entity.upper():
+                # Redundant self-relationship (e.g. a join path that folded
+                # back onto its own entity) collapses to a plain column ref.
+                return f'"{entity}"."{column}"'
             return f'"{entity}"."{relationship}"."{column}"'
         return f'"{entity}"."{column}"'
 
@@ -209,6 +271,57 @@ def _format_numeric_literal(value: Any) -> str:
     return str(value).strip()
 
 
+_KNOWN_SCHEMA_PREFIXES = {"PRO", "DBO", "SYS", "TEMPDB"}
+
+
+def _clean_entity_qualifier(text: str) -> str:
+    """Strip redundant/duplicated schema and entity qualifiers.
+
+    Handles both shapes seen from upstream resolution bugs:
+      * a leading SQL schema prefix (``PRO.DpdBucketHistory`` -> ``DpdBucketHistory``)
+      * an immediately duplicated segment (``DpdBucketHistory.DpdBucketHistory``
+        or ``##Foo.##Foo``) collapsing to a single occurrence.
+    Never touches a single bare identifier with no ``.``.
+    """
+    raw = (text or "").strip()
+    if not raw or "." not in raw:
+        return raw
+
+    prefix = ""
+    if raw.startswith("##"):
+        prefix = "##"
+        raw = raw[2:]
+    elif raw.startswith("#"):
+        prefix = "#"
+        raw = raw[1:]
+
+    parts = [p for p in raw.split(".") if p]
+    if not parts:
+        return f"{prefix}{raw}"
+
+    # Drop a leading known SQL schema token (PRO / dbo / …).
+    if len(parts) > 1 and parts[0].upper() in _KNOWN_SCHEMA_PREFIXES:
+        parts = parts[1:]
+
+    # Collapse immediately-repeated identical segments (case-insensitive).
+    deduped: list[str] = []
+    for part in parts:
+        if deduped and deduped[-1].upper() == part.upper():
+            continue
+        deduped.append(part)
+
+    return f"{prefix}{'.'.join(deduped) if deduped else raw}"
+
+
+def _is_null_literal(node: dict[str, Any]) -> bool:
+    if not isinstance(node, dict):
+        return False
+    if node.get("type") != "LITERAL":
+        return False
+    value_type = str(node.get("value_type") or "").strip().upper()
+    return value_type == "NULL" or (node.get("value") is None and value_type != "STRING")
+
+
 def _looks_like_numeric_decimal_parts(entity: str, column: str) -> bool:
     """True when entity.column is really a dotted decimal (1.10), not a path."""
     return bool(
@@ -217,6 +330,31 @@ def _looks_like_numeric_decimal_parts(entity: str, column: str) -> bool:
         and entity.isdigit()
         and column.isdigit()
     )
+
+_SELF_EQUALITY_OPS = {"==", "=", "!=", "<>"}
+
+
+def _repair_value_branch(node: Any) -> Any:
+    """Structural safety net for THEN/ELSE scalar-value slots.
+
+    A bare ``==``/``!=`` comparison is never a legitimate 4X scalar value —
+    the grammar has no boolean value type at that position. This is a
+    context-free backstop (no ``target_column`` is threaded through the
+    compiler) that catches the pattern regardless of which AST producer
+    built it (deterministic fold, or an LLM response that bypassed phase3's
+    own value/predicate guard): in ``col == value`` form the intended value
+    is conventionally the right-hand operand, so that side is kept.
+    """
+    if (
+        isinstance(node, dict)
+        and node.get("type") == "BINARY_OP"
+        and str(node.get("operator") or "").strip() in _SELF_EQUALITY_OPS
+    ):
+        right = node.get("right")
+        if isinstance(right, dict):
+            return right
+    return node
+
 
 def _compile_if_then_else(node: dict[str, Any]) -> str:
     """Flatten nested IF_THEN_ELSE else-branches into ELSEIF clauses.
@@ -229,7 +367,7 @@ def _compile_if_then_else(node: dict[str, Any]) -> str:
 
     while current is not None and current.get("type") == "IF_THEN_ELSE":
         cond = compile_ast_to_4x_string(current["condition"])
-        then_b = compile_ast_to_4x_string(current["then_branch"])
+        then_b = compile_ast_to_4x_string(_repair_value_branch(current["then_branch"]))
         clauses.append((cond, then_b))
         else_branch = current.get("else_branch")
         if isinstance(else_branch, dict) and else_branch.get("type") == "IF_THEN_ELSE":
@@ -246,7 +384,7 @@ def _compile_if_then_else(node: dict[str, Any]) -> str:
     parts = [f"IF({first_cond})THEN({first_then})"]
     for cond, then_b in clauses[1:]:
         parts.append(f"ELSEIF({cond})THEN({then_b})")
-    parts.append(f"ELSE({compile_ast_to_4x_string(default_node)})")
+    parts.append(f"ELSE({compile_ast_to_4x_string(_repair_value_branch(default_node))})")
     return "".join(parts)
 
 

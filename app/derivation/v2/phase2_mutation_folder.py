@@ -72,14 +72,26 @@ class MutationPass:
     def effective_condition(self) -> str | None:
         """Row-level guard used for AST folding.
 
-        Prefer the UPDATE WHERE clause; fall back to the outer IF predicate
-        (EXISTS … WHERE projected to a row predicate when possible).
+        Combines the UPDATE's own WHERE clause with the outer procedural
+        ``IF/ELSEIF EXISTS(...)`` predicate (projected to a row predicate)
+        when BOTH are present and genuinely independent — dropping either
+        one silently would lose a guard the assigned value depends on. When
+        the WHERE clause already restates the outer condition (the common
+        case: an ``EXISTS(... WHERE X)`` guard whose UPDATE repeats ``X`` as
+        one of several ANDed WHERE terms), the outer condition is redundant
+        and the WHERE clause alone is used unchanged.
         """
-        if self.where_clause and self.where_clause.strip():
-            return self.where_clause.strip()
-        if self.outer_condition and self.outer_condition.strip():
-            return self.outer_condition.strip()
-        return None
+        where = self.where_clause.strip() if self.where_clause and self.where_clause.strip() else None
+        outer = (
+            self.outer_condition.strip()
+            if self.outer_condition and self.outer_condition.strip()
+            else None
+        )
+        if where and outer:
+            if outer.upper() in where.upper():
+                return where
+            return f"({outer}) AND ({where})"
+        return where or outer
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -154,12 +166,22 @@ def fold_column_mutations(
 
             ordinal += 1
             resolved_expr = _resolve_expression_tables(
-                assign["expr"], alias_map, lineage, entity_map, target_entity_norm
+                assign["expr"],
+                alias_map,
+                lineage,
+                entity_map,
+                target_entity_norm,
+                use_derived_formula=False,
             )
             resolved_where = None
             if where_clause:
                 resolved_where = _resolve_expression_tables(
-                    where_clause, alias_map, lineage, entity_map, target_entity_norm
+                    where_clause,
+                    alias_map,
+                    lineage,
+                    entity_map,
+                    target_entity_norm,
+                    use_derived_formula=False,
                 )
 
             outer_cond = None
@@ -169,7 +191,12 @@ def fold_column_mutations(
                 row_pred = exists_condition_to_row_predicate(branch.condition)
                 if row_pred and not re.match(r"(?is)^EXISTS\b", row_pred.strip()):
                     outer_cond = _resolve_expression_tables(
-                        row_pred, alias_map, lineage, entity_map, target_entity_norm
+                        row_pred,
+                        alias_map,
+                        lineage,
+                        entity_map,
+                        target_entity_norm,
+                        use_derived_formula=False,
                     )
             if where_clause:
                 dep_refs.extend(extract_subquery_dependency_refs(where_clause))
@@ -211,8 +238,18 @@ def fold_column_mutations(
 
         col_names = [bare_ident(c) for c in (ins.get("cols") or "").split(",") if bare_ident(c)]
         select_parts = split_csv_respecting_parens(ins.get("select_list") or "")
-        if not col_names or len(col_names) != len(select_parts):
-            # Without an explicit column list we cannot map projection → target col.
+        if not col_names:
+            # No explicit column list — fall back to the target table's own
+            # schema ordinal position when it's a local temp whose CREATE
+            # TABLE column order Phase 1 already captured. Without any known
+            # schema (e.g. an untracked permanent table) we still cannot map
+            # projection -> target column and must skip.
+            schema_cols = lineage.temp_table_columns.get(target_table)
+            if schema_cols and len(schema_cols) == len(select_parts):
+                col_names = schema_cols
+            else:
+                continue
+        if len(col_names) != len(select_parts):
             continue
 
         try:
@@ -573,12 +610,23 @@ def _resolve_expression_tables(
     lineage: LineageMap,
     entity_map: dict[str, str] | None,
     default_entity: str,
+    *,
+    use_derived_formula: bool = True,
 ) -> str:
     """Rewrite ``alias.col`` using the statement alias map only.
 
     Important: do **not** rewrite arbitrary ``schema.table`` tokens (e.g.
     ``PRO.AssetClassMovementHistory``) — those are not column refs and
     corrupting them turns scalar subqueries into invalid 4X strings.
+
+    ``use_derived_formula=False`` must be passed when resolving an UPDATE
+    statement's own SET/WHERE text: a temp table's UPDATE can be reached
+    here a second time (e.g. because the temp's lineage-mapped root entity
+    happens to equal the entity being folded) *after* Phase 1 has already
+    recorded that very UPDATE as the column's ``derived_formula`` — splicing
+    it back in here would self-reference and corrupt the expression. Only
+    genuinely downstream reads (a later INSERT/MERGE reading the temp's
+    already-settled value) should inherit the derived formula.
     """
 
     def repl(match: re.Match[str]) -> str:
@@ -596,6 +644,12 @@ def _resolve_expression_tables(
             else:
                 return match.group(0)
         ref = lineage.resolve_column(table, col, entity_map)
+        if use_derived_formula and getattr(ref, "derived_formula", None):
+            # Temp-table mutation checkpoint (Phase 1) — splice the folded
+            # expression in verbatim instead of a flat entity/column marker,
+            # so this reference inherits e.g. a staging-table markup pass
+            # rather than the pre-mutation root value.
+            return f"({ref.derived_formula})"
         relationship = ref.relationship
         if (
             relationship is None
