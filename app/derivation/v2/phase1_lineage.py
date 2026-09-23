@@ -19,6 +19,7 @@ from app.derivation.v2.sql_text import (
     iter_set_assignments,
     normalize_table_name,
     parse_from_join_clause,
+    parse_select_list,
     resolve_expression_column_refs,
     split_csv_respecting_parens,
     split_select_from,
@@ -31,11 +32,6 @@ logger = get_logger(__name__)
 
 _CREATE_TEMP_RE = re.compile(
     r"(?is)\bCREATE\s+TABLE\s+(?P<target>#+#?[A-Za-z0-9_]+)\s*\((?P<body>.*?)\)",
-)
-
-_COL_AS_RE = re.compile(
-    r"(?is)(?:(?P<qual>[#A-Za-z0-9_]+)\.)?(?P<col>\[?[A-Za-z_][A-Za-z0-9_]*\]?)"
-    r"(?:\s+AS\s+(?P<alias>\[?[A-Za-z_][A-Za-z0-9_]*\]?))?",
 )
 
 
@@ -214,7 +210,7 @@ def _ingest_select_projection(
         lineage.tables[target] = primary_root
         lineage.root_entities.add(primary_root)
 
-    projections = _parse_select_list(select_list)
+    projections = parse_select_list(select_list)
     if explicit_target_columns and len(explicit_target_columns) == len(projections):
         # Strict zero-indexed ordinal alignment: column Ci pairs ONLY with
         # projection Ei, even when some Ej in between is a CASE/function
@@ -431,67 +427,6 @@ def _alias_map(from_body: str) -> dict[str, str]:
         if alias:
             mapping[alias.upper()] = table
     return mapping
-
-
-def _parse_select_list(
-    select_list: str,
-) -> list[tuple[str | None, str | None, str | None, str]]:
-    """Parse a SELECT projection list, preserving one entry per ordinal slot.
-
-    Returns ``(src_qual, src_col, dest_alias, raw_chunk)`` per top-level item.
-    Complex expressions (CASE / function calls / subqueries) cannot resolve
-    to a single ``src_qual``/``src_col`` and are returned as
-    ``(None, None, alias_if_any, raw_chunk)`` — the caller MUST still count
-    this slot (not skip it) so positional alignment with an explicit target
-    column list stays correct for every projection after it.
-    """
-    results: list[tuple[str | None, str | None, str | None, str]] = []
-    if not select_list or not select_list.strip() or select_list.strip() == "*":
-        return results
-
-    # Strip leading SELECT modifiers (DISTINCT / ALL / TOP n) before
-    # splitting — otherwise the first chunk's own column regex greedily
-    # matches the modifier keyword itself as if it were the column name
-    # (``DISTINCT UcifEntityID`` -> column "DISTINCT").
-    select_list = select_list.strip()
-    for _ in range(3):
-        m = re.match(r"(?is)^(?:DISTINCT|ALL)\s+", select_list)
-        if m:
-            select_list = select_list[m.end():]
-            continue
-        m = re.match(r"(?is)^TOP\s*\(?\s*\d+\s*\)?\s+", select_list)
-        if m:
-            select_list = select_list[m.end():]
-            continue
-        break
-
-    for part in split_csv_respecting_parens(select_list):
-        chunk = part.strip()
-        if not chunk or chunk == "*":
-            results.append((None, None, None, chunk))
-            continue
-        if "(" in chunk:
-            alias = None
-            alias_m = re.search(
-                r"(?is)\)\s*(?:AS\s+)?(?P<alias>\[?[A-Za-z_][A-Za-z0-9_]*\]?)\s*$",
-                chunk,
-            )
-            if alias_m:
-                alias = bare_ident(alias_m.group("alias"))
-            results.append((None, None, alias, chunk))
-            continue
-        match = _COL_AS_RE.fullmatch(chunk)
-        if not match:
-            results.append((None, None, None, chunk))
-            continue
-        qual = match.group("qual")
-        col = bare_ident(match.group("col"))
-        alias = bare_ident(match.group("alias")) if match.group("alias") else None
-        if col.upper() in {"AS", "FROM", "INTO", "NULL", "CASE", "WHEN", "END", "TRUE", "FALSE"}:
-            results.append((None, None, None, chunk))
-            continue
-        results.append((qual, col, alias, chunk))
-    return results
 
 
 def _pick_primary_root(

@@ -487,7 +487,7 @@ def test_error_message_maps_to_variable_token():
 
 def test_select_distinct_projection_parses_column_name():
     """``SELECT DISTINCT col`` must not capture DISTINCT as the column name."""
-    from app.derivation.v2.phase1_lineage import _parse_select_list
+    from app.derivation.v2.sql_text import parse_select_list as _parse_select_list
 
     projections = _parse_select_list("DISTINCT UcifEntityID")
     assert len(projections) == 1
@@ -570,23 +570,26 @@ def test_not_like_with_literal_pattern_maps_to_doesnotcontains():
 def test_three_operand_string_concatenation_folds_left_associatively():
     """Regression: a chain with more than one operator of the same kind
     (e.g. ``'%' + A.Col + '%'``, two '+' signs / three operands) must fold
-    left-associatively into nested BINARY_OP nodes -- not fall through to
+    left-associatively into nested CONCAT calls -- not fall through to
     the final "give up" fallback that wraps the whole raw SQL text
-    (quotes, column reference and all) as a single opaque STRING literal."""
+    (quotes, column reference and all) as a single opaque STRING literal.
+
+    T-SQL's string "+" has no 4X equivalent (+ is numeric-only there), so
+    each "+" between text operands compiles to FUNCTION_CALL CONCAT."""
     node = parse_sql_expression_to_ast(
         "'%' + A.NPA_Reason + '%'",
         default_entity="CustomerCal",
     )
-    assert node["type"] == "BINARY_OP"
-    assert node["operator"] == "+"
-    # Outer node's right operand is the trailing '%' literal; its left
-    # operand is itself the inner ('%' + A.NPA_Reason) BINARY_OP.
-    assert node["right"] == {"type": "LITERAL", "value_type": "STRING", "value": "%"}
-    inner = node["left"]
-    assert inner["type"] == "BINARY_OP"
-    assert inner["operator"] == "+"
-    assert inner["right"]["type"] == "COLUMN_REF"
-    assert inner["right"]["column"] == "NPA_Reason"
+    assert node["type"] == "FUNCTION_CALL"
+    assert node["function_name"] == "CONCAT"
+    # Outer call's right argument is the trailing '%' literal; its left
+    # argument is itself the inner CONCAT('%', NPA_Reason) call.
+    assert node["arguments"][1] == {"type": "LITERAL", "value_type": "STRING", "value": "%"}
+    inner = node["arguments"][0]
+    assert inner["type"] == "FUNCTION_CALL"
+    assert inner["function_name"] == "CONCAT"
+    assert inner["arguments"][1]["type"] == "COLUMN_REF"
+    assert inner["arguments"][1]["column"] == "NPA_Reason"
 
 
 def test_like_with_dynamic_pattern_falls_back_honestly():

@@ -66,15 +66,19 @@ def run_one(path: Path) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--only", help="two-digit sample prefix, e.g. 01", default=None)
+    parser.add_argument("--file", help="arbitrary SQL file path, outside the 01-18 corpus", default=None)
     args = parser.parse_args()
 
-    paths = sample_sql_paths()
-    paths = [p for p in paths if p.stem[:2].isdigit() and 1 <= int(p.stem[:2]) <= 18]
-    if args.only:
-        paths = [p for p in paths if p.name.startswith(args.only)]
-        if not paths:
-            print(f"No sample starts with {args.only}", file=sys.stderr)
-            sys.exit(1)
+    if args.file:
+        paths = [Path(args.file)]
+    else:
+        paths = sample_sql_paths()
+        paths = [p for p in paths if p.stem[:2].isdigit() and 1 <= int(p.stem[:2]) <= 18]
+        if args.only:
+            paths = [p for p in paths if p.name.startswith(args.only)]
+            if not paths:
+                print(f"No sample starts with {args.only}", file=sys.stderr)
+                sys.exit(1)
 
     results = []
     for path in sorted(paths):

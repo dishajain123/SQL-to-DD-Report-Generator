@@ -205,11 +205,12 @@ def metadata_to_dd_row(
     """Convert Phase-4 metadata into a platform ``DDRow``."""
     valid = not meta.validation_errors
     # Valid formulas ship as ACTIVE/GENERATED. Only grammar failures go pending.
+    # An unmapped TIMEKEY (no real SysDayMatrix date available) makes the
+    # Effective Start Date value itself uncertain, but it says nothing about
+    # whether the condition/formula is correct -- surfaced as an advisory
+    # note only, not a review gate on the row.
     status = DDStatus.ACTIVE if valid else DDStatus.PENDING_REVIEW
     review_state = ReviewState.GENERATED if valid else ReviewState.NEEDS_REVIEW
-    if meta.synthetic_date:
-        status = DDStatus.PENDING_REVIEW
-        review_state = ReviewState.NEEDS_REVIEW
 
     sql_frags = list(meta.mutation_sql_fragments or source_statement_sql or [])
 

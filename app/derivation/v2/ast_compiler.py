@@ -159,6 +159,12 @@ def compile_ast_to_4x_string(node: dict[str, Any] | None) -> str:
         vals = ", ".join(_compile_membership_value(v) for v in (node.get("values") or []))
         return f"{col} {operator} [{vals}]"
 
+    if node_type == "LIST_LITERAL":
+        # The documented ``MIN(<Col>, [<GroupbyColumns>])`` / ``MAX(...)``
+        # second argument (app/grammar/fourx_grammar.lark's ``list_literal``).
+        items = ", ".join(_compile_membership_value(v) for v in (node.get("items") or []))
+        return f"[{items}]"
+
     if node_type == "COLUMN_REF":
         entity = _clean_entity_qualifier(str(node.get("entity") or "").strip())
         column = str(node.get("column") or "").strip()

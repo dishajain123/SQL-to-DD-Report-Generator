@@ -46,10 +46,17 @@ membership: arith
      | column_ref
      | NUMBER
      | if_expr
+     | list_literal
      | "(" expr ")"
 
 function_call: FUNC_NAME "(" [arg_list] ")"
 arg_list: expr ("," expr)*
+
+// A bracketed column list, e.g. the documented ``MIN(<Col>, [<GroupbyCols>])``
+// / ``MAX(<Col>, [<GroupbyCols>])`` second argument. Distinct from
+// membership's inline ``arith MEMBERSHIP_OP "[" value_list "]"`` -- this is
+// a standalone list usable anywhere an atom is expected (a function arg).
+list_literal: "[" value_list "]"
 
 // STRING is already accepted by a single-part column_ref. Listing it again
 // as an atom gives every quoted token two parses and makes nested formulas

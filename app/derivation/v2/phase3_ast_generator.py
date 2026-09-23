@@ -1,14 +1,13 @@
 """Phase 3 — structured 4X JSON AST generator.
 
-Prefers an LLM JSON response when available; always falls back to a
-deterministic mutation→AST folder so offline / mocked runs stay usable.
+Deterministic mutation→AST folder only. Formula/condition generation never
+calls an LLM, so every AST is reproducible straight from the source SQL.
 
 Allowed node types only:
   IF_THEN_ELSE, BINARY_OP, FUNCTION_CALL, MEMBERSHIP_OP, COLUMN_REF, LITERAL
 """
 from __future__ import annotations
 
-import json
 import re
 from typing import Any, Optional
 
@@ -17,20 +16,11 @@ from app.derivation.v2.sql_text import (
     bare_ident,
     extract_subquery_dependency_refs,
     normalize_table_name,
+    split_csv_respecting_parens,
 )
 from app.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
-
-_ALLOWED_TYPES = {
-    "IF_THEN_ELSE",
-    "BINARY_OP",
-    "FUNCTION_CALL",
-    "MEMBERSHIP_OP",
-    "COLUMN_REF",
-    "VARIABLE_REF",
-    "LITERAL",
-}
 
 
 def _is_single_quoted_string_literal(text: str) -> bool:
@@ -56,36 +46,6 @@ def _is_single_quoted_string_literal(text: str) -> bool:
             return i == len(body) - 1
         i += 1
     return False
-
-_AST_SYSTEM_PROMPT = """\
-You convert a chronological sequence of T-SQL UPDATE mutations for ONE
-target column into a single JSON Abstract Syntax Tree for the 4X platform.
-
-Return ONLY valid JSON (no markdown fences) using EXACTLY these node types:
-
-- IF_THEN_ELSE: {"type":"IF_THEN_ELSE","condition":<Node>,"then_branch":<Node>,"else_branch":<Node>}
-- BINARY_OP: {"type":"BINARY_OP","operator":"=="|"!="|">"|">="|"<"|"<="|"AND"|"OR"|"+"|"-"|"*"|"/","left":<Node>,"right":<Node>}
-- FUNCTION_CALL: {"type":"FUNCTION_CALL","function_name":"ISEMPTY"|"ISNOTEMPTY"|"COALESCE"|"SOM"|"EOM"|"ADDDAY","arguments":[<Node>]}
-- MEMBERSHIP_OP: {"type":"MEMBERSHIP_OP","operator":"IN"|"NOTIN","column":<Node>,"values":["v1","v2"]}
-- COLUMN_REF: {"type":"COLUMN_REF","entity":"ENTITY","relationship":null|"REL","column":"COL"}
-- LITERAL: {"type":"LITERAL","value_type":"STRING"|"NUMBER"|"NULL","value":...}
-
-Mapping rules:
-- T-SQL IS NULL → FUNCTION_CALL ISEMPTY
-- T-SQL IS NOT NULL → FUNCTION_CALL ISNOTEMPTY
-- T-SQL IN (...) → MEMBERSHIP_OP
-- T-SQL = → operator "=="; <> → "!="
-- Join paths → COLUMN_REF.relationship (e.g. "##CUSTOMERCAL")
-- Later mutations override earlier ones unless WHERE-guarded; nest as IF/ELSEIF chain
-  (outermost IF = last chronological pass).
-
-CRITICAL — arithmetic vs date offset:
-- Integer/numeric columns (COUNT, DpdDays, amounts, rates, flags-as-numbers):
-  map ``ISNULL(col,0)+1`` / ``col + X`` to BINARY_OP with operator "+"
-  (NEVER ADDDAY).
-- ADDDAY is ONLY for DATE/DATETIME columns OR explicit SQL DATEADD(DAY, n, expr).
-  Example: DATEADD(DAY, 1, ProcessDate) → FUNCTION_CALL ADDDAY(ProcessDate, 1).
-"""
 
 
 # Column-name hints that imply a date/datetime value (ADDDAY allowed).
@@ -153,20 +113,16 @@ def generate_ast(
     target_column: str,
     llm_client: Any | None = None,
 ) -> dict[str, Any]:
-    """Build a 4X JSON AST for the mutation sequence."""
+    """Build a 4X JSON AST for the mutation sequence.
+
+    AST/condition generation is deterministic-only: an LLM cannot be trusted
+    to reproduce the exact source SQL semantics as a formula, so ``llm_client``
+    (kept for signature compatibility) is never used here. The LLM is still
+    used elsewhere in the pipeline for report narrative/glossary text.
+    """
+    del llm_client
     if not mutations:
         return _column_ref(target_entity, target_column)
-
-    if llm_client is not None and _llm_can_generate_ast(llm_client):
-        try:
-            raw = _call_llm_for_ast(llm_client, mutations, target_entity, target_column)
-            node = _parse_json_ast(raw)
-            if node and _validate_ast_shape(node):
-                node = _sanitize_addday_misuse(node, target_column)
-                return _apply_value_predicate_guard(node, target_entity, target_column)
-            logger.warning("phase3 LLM AST failed shape validation; using deterministic fold")
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning("phase3 LLM AST generation failed: %s", exc)
 
     try:
         return build_ast_from_mutations(mutations, target_entity, target_column)
@@ -187,10 +143,6 @@ def generate_ast(
             "arguments": [],
             "_validation_error": str(exc),
         }
-
-
-def _llm_can_generate_ast(llm_client: Any) -> bool:
-    return hasattr(llm_client, "generate_ast_json") or hasattr(llm_client, "_complete")
 
 
 def build_ast_from_mutations(
@@ -507,6 +459,16 @@ def parse_sql_expression_to_ast(
     # Strip wrapping parentheses.
     while text.startswith("(") and text.endswith(")") and _balanced(text[1:-1]):
         text = text[1:-1].strip()
+
+    # Bracketed column list — the documented ``MIN(<Col>, [<GroupbyColumns>])``
+    # / ``MAX(...)`` second argument (app/grammar/fourx_grammar.lark's
+    # ``list_literal``). Each item is a bare column name, rendered as a
+    # quoted STRING token by the compiler (matching the grammar's
+    # ``value: STRING | NUMBER`` for bracketed lists).
+    if text.startswith("[") and text.endswith("]"):
+        inner = text[1:-1].strip()
+        items = [bare_ident(c.strip()) for c in split_csv_respecting_parens(inner) if c.strip()]
+        return {"type": "LIST_LITERAL", "items": items}
 
     # CAST(expr AS type) — 4X has no explicit cast; drop the type and parse
     # the inner expression (tried early so a cast wrapping a CASE/DATEADD/
@@ -862,6 +824,12 @@ def parse_sql_expression_to_ast(
         lhs, op, rhs = arithmetic
         left = parse_sql_expression_to_ast(lhs, default_entity=default_entity, target_column=target_column)
         right = parse_sql_expression_to_ast(rhs, default_entity=default_entity, target_column=target_column)
+        if op == "+" and (_is_string_literal_node(left) or _is_string_literal_node(right)):
+            # T-SQL overloads "+" for string concatenation, but the 4X
+            # grammar treats +/- as numeric-only -- CONCAT is the platform's
+            # documented equivalent (see app/grammar/validator.py's
+            # "numeric-only operators" check).
+            return {"type": "FUNCTION_CALL", "function_name": "CONCAT", "arguments": [left, right]}
         if op in {"+", "-"} and _should_use_addday_for_arithmetic(left, right, target_column):
             if op == "-":
                 right = {"type": "BINARY_OP", "operator": "*",
@@ -1274,6 +1242,14 @@ def _try_parse_scalar_subquery(
     return None
 
 
+def _is_string_literal_node(node: dict[str, Any]) -> bool:
+    return (
+        isinstance(node, dict)
+        and node.get("type") == "LITERAL"
+        and node.get("value_type") == "STRING"
+    )
+
+
 def _should_use_addday_for_arithmetic(
     left: dict[str, Any],
     right: dict[str, Any],
@@ -1591,84 +1567,6 @@ def _try_parse_case(
     return ast
 
 
-def _call_llm_for_ast(
-    llm_client: Any,
-    mutations: list[MutationPass],
-    target_entity: str,
-    target_column: str,
-) -> str:
-    payload = {
-        "target_entity": target_entity,
-        "target_column": target_column,
-        "mutations": [m.as_dict() for m in mutations],
-    }
-    user = (
-        f"Target: {target_entity}.{target_column}\n\n"
-        f"Mutations (chronological JSON):\n{json.dumps(payload, indent=2)}\n\n"
-        "Return the JSON AST only."
-    )
-    if hasattr(llm_client, "generate_ast_json"):
-        return str(llm_client.generate_ast_json(target_entity, target_column, payload))
-    if hasattr(llm_client, "_complete"):
-        return str(
-            llm_client._complete(
-                _AST_SYSTEM_PROMPT,
-                user,
-                max_tokens=getattr(llm_client, "max_new_tokens", 2048),
-                stage="ast_generation",
-            )
-        )
-    raise RuntimeError("llm_client cannot generate AST JSON")
-
-
-def _parse_json_ast(raw: str) -> dict[str, Any] | None:
-    text = (raw or "").strip()
-    if text.startswith("```"):
-        lines = text.splitlines()
-        if len(lines) >= 3 and lines[-1].strip().startswith("```"):
-            text = "\n".join(lines[1:-1]).strip()
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        # Try to extract outermost object.
-        start = text.find("{")
-        end = text.rfind("}")
-        if start < 0 or end <= start:
-            return None
-        try:
-            data = json.loads(text[start : end + 1])
-        except json.JSONDecodeError:
-            return None
-    return data if isinstance(data, dict) else None
-
-
-def _validate_ast_shape(node: Any) -> bool:
-    if not isinstance(node, dict):
-        return False
-    node_type = node.get("type")
-    if node_type not in _ALLOWED_TYPES:
-        return False
-    if node_type == "IF_THEN_ELSE":
-        return all(
-            _validate_ast_shape(node.get(k))
-            for k in ("condition", "then_branch", "else_branch")
-        )
-    if node_type == "BINARY_OP":
-        return _validate_ast_shape(node.get("left")) and _validate_ast_shape(node.get("right"))
-    if node_type == "FUNCTION_CALL":
-        args = node.get("arguments")
-        return isinstance(args, list) and all(_validate_ast_shape(a) for a in args)
-    if node_type == "MEMBERSHIP_OP":
-        return _validate_ast_shape(node.get("column")) and isinstance(node.get("values"), list)
-    if node_type == "COLUMN_REF":
-        return bool(node.get("entity")) and bool(node.get("column"))
-    if node_type == "VARIABLE_REF":
-        return bool(node.get("name") or node.get("variable"))
-    if node_type == "LITERAL":
-        return node.get("value_type") in {"STRING", "NUMBER", "NULL", "FLOAT", "INT", "DECIMAL"}
-    return False
-
-
 def _column_ref(
     entity: str,
     column: str,
@@ -1877,12 +1775,12 @@ def _split_top_level(text: str, separator: str) -> list[str]:
             buf.append(ch)
             i += 1
             continue
-        if ch == "(":
+        if ch == "(" or ch == "[":
             depth += 1
             buf.append(ch)
             i += 1
             continue
-        if ch == ")":
+        if ch == ")" or ch == "]":
             depth = max(0, depth - 1)
             buf.append(ch)
             i += 1

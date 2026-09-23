@@ -58,13 +58,19 @@ def analyze_object(obj: SQLObject) -> StructuralInfo:
     tables_read: set[str] = set()
     tables_written: set[str] = set()
     columns_written: set[str] = set()
-    columns_written_by_table: dict[str, set[str]] = {}
+    # Keyed by table -> {UPPER(column): first-seen-casing column}. SQL
+    # column names are case-insensitive, so ``A.DEGREASON = ...`` and a
+    # later ``A.DegReason = ...`` against the same physical column must
+    # collapse into one derivation target, not two separate DD rows.
+    columns_written_by_table: dict[str, dict[str, str]] = {}
     for s in statements:
         tables_read.update(s.tables_read)
         tables_written.update(s.tables_written)
         for table, cols in s.set_columns_by_table.items():
-            columns_written.update(cols)
-            columns_written_by_table.setdefault(table, set()).update(cols)
+            by_upper = columns_written_by_table.setdefault(table, {})
+            for col in cols:
+                by_upper.setdefault(col.upper(), col)
+            columns_written.update(by_upper.values())
 
     dml_statements = [s for s in statements if s.statement_type in ("SELECT", "UPDATE", "MERGE", "INSERT", "DELETE")]
     parsed_ok_count = sum(1 for s in dml_statements if s.parsed_ok)
@@ -85,7 +91,7 @@ def analyze_object(obj: SQLObject) -> StructuralInfo:
             tables_read=sorted(tables_read),
             tables_written=sorted(tables_written),
             columns_written=sorted(columns_written),
-            columns_written_by_table={t: sorted(c) for t, c in columns_written_by_table.items()},
+            columns_written_by_table={t: sorted(c.values()) for t, c in columns_written_by_table.items()},
         ),
         source_sql=obj.raw_sql,
     )
@@ -99,7 +105,7 @@ def analyze_object(obj: SQLObject) -> StructuralInfo:
         tables_read=sorted(tables_read),
         tables_written=sorted(tables_written),
         columns_written=sorted(columns_written),
-        columns_written_by_table={t: sorted(c) for t, c in columns_written_by_table.items()},
+        columns_written_by_table={t: sorted(c.values()) for t, c in columns_written_by_table.items()},
         called_objects=_find_called_objects(obj.raw_sql),
         has_dynamic_sql=bool(_DYNAMIC_SQL_RE.search(obj.raw_sql)),
         version_thresholds=_find_version_thresholds(obj.raw_sql),

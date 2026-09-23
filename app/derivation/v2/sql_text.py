@@ -902,19 +902,20 @@ def _read_until_keyword(
 
 
 def extract_select_into(sql: str) -> list[dict[str, str]]:
-    """Find SELECT … INTO #temp FROM … statements."""
+    """Find SELECT … INTO #temp FROM … [WHERE …] statements."""
     text = strip_sql_comments(sql or "")
     results: list[dict[str, str]] = []
     for match in re.finditer(r"(?is)\bSELECT\b", text):
-        start = match.end()
-        into_match = re.search(r"(?is)\bINTO\b", text[start:])
+        start = match.start()
+        list_start = match.end()
+        into_match = re.search(r"(?is)\bINTO\b", text[list_start:])
         if not into_match:
             continue
-        select_list = text[start : start + into_match.start()]
+        select_list = text[list_start : list_start + into_match.start()]
         # Skip if this SELECT is clearly not a SELECT INTO (INTO too far / subquery-ish)
         if select_list.count("(") != select_list.count(")"):
             continue
-        after_into = start + into_match.end()
+        after_into = list_start + into_match.end()
         target_match = re.match(
             rf"(?is)\s*(?P<target>{_TABLE_TOKEN})",
             text[after_into:],
@@ -926,6 +927,8 @@ def extract_select_into(sql: str) -> list[dict[str, str]]:
             continue
         pos = after_into + target_match.end()
         from_clause = ""
+        where_clause = ""
+        group_by_clause = ""
         if re.match(r"(?is)^\s*FROM\b", text[pos:]):
             from_match = re.match(r"(?is)^\s*FROM\b", text[pos:])
             assert from_match is not None
@@ -933,13 +936,99 @@ def extract_select_into(sql: str) -> list[dict[str, str]]:
             from_clause, pos = _read_until_keyword(
                 text, pos, {"WHERE", "GROUP", "ORDER", "HAVING"}, stop_at_statement=True
             )
+        if re.match(r"(?is)^\s*WHERE\b", text[pos:]):
+            where_match = re.match(r"(?is)^\s*WHERE\b", text[pos:])
+            assert where_match is not None
+            pos = pos + where_match.end()
+            where_clause, pos = _read_until_keyword(
+                text, pos, {"GROUP", "ORDER", "HAVING"}, stop_at_statement=True
+            )
+        if re.match(r"(?is)^\s*GROUP\s+BY\b", text[pos:]):
+            group_match = re.match(r"(?is)^\s*GROUP\s+BY\b", text[pos:])
+            assert group_match is not None
+            pos = pos + group_match.end()
+            group_by_clause, pos = _read_until_keyword(
+                text, pos, {"ORDER", "HAVING"}, stop_at_statement=True
+            )
         results.append(
             {
                 "target": target,
                 "select_list": select_list.strip(),
                 "from_body": from_clause.strip(),
+                "where_clause": where_clause.strip(),
+                "group_by": group_by_clause.strip(),
+                "raw_sql": text[start:pos].strip(),
+                "start": str(start),
+                "end": str(pos),
             }
         )
+    return results
+
+
+_SELECT_ITEM_COL_AS_RE = re.compile(
+    r"(?is)(?:(?P<qual>[#A-Za-z0-9_]+)\.)?(?P<col>\[?[A-Za-z_][A-Za-z0-9_]*\]?)"
+    r"(?:\s+AS\s+(?P<alias>\[?[A-Za-z_][A-Za-z0-9_]*\]?))?",
+)
+
+
+def parse_select_list(
+    select_list: str,
+) -> list[tuple[str | None, str | None, str | None, str]]:
+    """Parse a SELECT projection list, preserving one entry per ordinal slot.
+
+    Returns ``(src_qual, src_col, dest_alias, raw_chunk)`` per top-level item.
+    Complex expressions (CASE / function calls / subqueries) cannot resolve
+    to a single ``src_qual``/``src_col`` and are returned as
+    ``(None, None, alias_if_any, raw_chunk)`` — the caller MUST still count
+    this slot (not skip it) so positional alignment with an explicit target
+    column list stays correct for every projection after it.
+    """
+    results: list[tuple[str | None, str | None, str | None, str]] = []
+    if not select_list or not select_list.strip() or select_list.strip() == "*":
+        return results
+
+    # Strip leading SELECT modifiers (DISTINCT / ALL / TOP n) before
+    # splitting — otherwise the first chunk's own column regex greedily
+    # matches the modifier keyword itself as if it were the column name
+    # (``DISTINCT UcifEntityID`` -> column "DISTINCT").
+    select_list = select_list.strip()
+    for _ in range(3):
+        m = re.match(r"(?is)^(?:DISTINCT|ALL)\s+", select_list)
+        if m:
+            select_list = select_list[m.end():]
+            continue
+        m = re.match(r"(?is)^TOP\s*\(?\s*\d+\s*\)?\s+", select_list)
+        if m:
+            select_list = select_list[m.end():]
+            continue
+        break
+
+    for part in split_csv_respecting_parens(select_list):
+        chunk = part.strip()
+        if not chunk or chunk == "*":
+            results.append((None, None, None, chunk))
+            continue
+        if "(" in chunk:
+            alias = None
+            alias_m = re.search(
+                r"(?is)\)\s*(?:AS\s+)?(?P<alias>\[?[A-Za-z_][A-Za-z0-9_]*\]?)\s*$",
+                chunk,
+            )
+            if alias_m:
+                alias = bare_ident(alias_m.group("alias"))
+            results.append((None, None, alias, chunk))
+            continue
+        match = _SELECT_ITEM_COL_AS_RE.fullmatch(chunk)
+        if not match:
+            results.append((None, None, None, chunk))
+            continue
+        qual = match.group("qual")
+        col = bare_ident(match.group("col"))
+        alias = bare_ident(match.group("alias")) if match.group("alias") else None
+        if col.upper() in {"AS", "FROM", "INTO", "NULL", "CASE", "WHEN", "END", "TRUE", "FALSE"}:
+            results.append((None, None, None, chunk))
+            continue
+        results.append((qual, col, alias, chunk))
     return results
 
 

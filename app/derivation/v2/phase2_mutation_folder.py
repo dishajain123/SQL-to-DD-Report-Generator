@@ -17,10 +17,12 @@ from app.derivation.v2.sql_text import (
     extract_if_else_chains,
     extract_insert_select,
     extract_merge_matched_updates,
+    extract_select_into,
     extract_subquery_dependency_refs,
     extract_update_statements,
     normalize_table_name,
     parse_from_join_clause,
+    parse_select_list,
     split_csv_respecting_parens,
     strip_sql_comments,
 )
@@ -267,28 +269,7 @@ def fold_column_mutations(
         from_body = ins.get("from_body") or ""
         alias_map, joins = _parse_update_sources("", from_body, lineage, entity_map)
         where_clause = (ins.get("where_clause") or "").strip() or None
-        expr = select_parts[col_idx].strip()
-        # Strip trailing aliases: ``expr AS Alias`` / ``expr Alias``
-        alias_strip = re.match(
-            r"(?is)^(.+?)\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*$",
-            expr,
-        )
-        if alias_strip and not re.search(
-            r"(?is)\b(FROM|WHERE|JOIN|SELECT)\b", alias_strip.group(1)
-        ):
-            # Only strip when right token looks like an alias, not a function arg.
-            right = alias_strip.group(2)
-            if right.upper() not in {
-                "DAY",
-                "DAYS",
-                "DD",
-                "MONTH",
-                "YEAR",
-                "HOUR",
-                "MINUTE",
-                "SECOND", "END", "NULL", "TRUE", "FALSE",
-            }:
-                expr = alias_strip.group(1).strip()
+        expr = _strip_trailing_select_alias(select_parts[col_idx].strip())
 
         resolved_expr = _resolve_expression_tables(
             expr, alias_map, lineage, entity_map, target_entity_norm
@@ -340,9 +321,91 @@ def fold_column_mutations(
             )
         )
 
+    # SELECT ... INTO #temp FROM ... [WHERE ...] — same chronological fold as
+    # INSERT ... SELECT, but the destination column list comes from the
+    # projection itself (aliased name, or the bare source column name when
+    # unaliased) instead of an explicit ``INSERT INTO target (cols)`` list.
+    insert_select_count = len(list(extract_insert_select(sql_text, temps_only=False)))
+    for si_index, si in enumerate(extract_select_into(sql_text)):
+        target_table = normalize_table_name(si.get("target") or "")
+        if not _targets_entity([target_table], target_entity_norm, entity_map, lineage):
+            if not _targets_via_lineage([target_table], target_entity_norm, lineage):
+                continue
+
+        projections = parse_select_list(si.get("select_list") or "")
+        try:
+            col_idx = next(
+                i
+                for i, (_, src_col, dest_alias, _raw) in enumerate(projections)
+                if (dest_alias or src_col or "").upper() == target_col.upper()
+            )
+        except StopIteration:
+            continue
+
+        from_body = si.get("from_body") or ""
+        alias_map, joins = _parse_update_sources("", from_body, lineage, entity_map)
+        where_clause = (si.get("where_clause") or "").strip() or None
+        expr = _strip_trailing_select_alias(projections[col_idx][3].strip())
+        expr = _attach_groupby_to_bare_aggregate(expr, si.get("group_by") or "")
+
+        # Only the projected VALUE (not the WHERE predicate, which in
+        # practice is always alias-qualified already) needs the bare-column
+        # fallback -- an unqualified projection column implicitly means
+        # "this statement's [single] source table's column".
+        resolved_expr = _resolve_expression_tables(
+            expr, alias_map, lineage, entity_map, target_entity_norm,
+            default_source_table=_pick_primary_source_table(alias_map),
+        )
+        resolved_where = None
+        if where_clause:
+            resolved_where = _resolve_expression_tables(
+                where_clause, alias_map, lineage, entity_map, target_entity_norm
+            )
+
+        stmt_start = int(si.get("start") or 0)
+        branch = _branch_for_offset(stmt_start)
+        outer_cond = None
+        dep_refs: list[str] = []
+        if branch and branch.condition:
+            dep_refs.extend(extract_subquery_dependency_refs(branch.condition))
+            row_pred = branch.condition
+            if row_pred:
+                outer_cond = _resolve_expression_tables(
+                    row_pred, alias_map, lineage, entity_map, target_entity_norm
+                )
+        if where_clause:
+            dep_refs.extend(extract_subquery_dependency_refs(where_clause))
+        in_control = branch is not None
+        guarded = bool(where_clause) or (
+            in_control and branch.kind in {"IF", "ELSEIF"}
+        )
+
+        ordinal += 1
+        mutations.append(
+            MutationPass(
+                ordinal=ordinal,
+                target_entity=target_entity_norm,
+                target_column=target_col,
+                assigned_expression=resolved_expr,
+                where_clause=resolved_where,
+                joins=joins,
+                alias_map=alias_map,
+                raw_sql=(si.get("raw_sql") or "").strip(),
+                statement_index=update_stmt_count + insert_select_count + si_index,
+                source_position=stmt_start,
+                operation="SELECT_INTO",
+                guarded=guarded,
+                control_branch_group=branch.group_id if branch else None,
+                control_branch_index=branch.index if branch else None,
+                control_branch_kind=branch.kind if branch else None,
+                outer_condition=outer_cond,
+                dependency_refs=_dedupe_refs(dep_refs),
+            )
+        )
+
     # MERGE … WHEN MATCHED THEN UPDATE SET … — chronological with UPDATEs/INSERTs.
-    prior_stmt_count = update_stmt_count + len(
-        list(extract_insert_select(sql_text, temps_only=False))
+    prior_stmt_count = update_stmt_count + insert_select_count + len(
+        list(extract_select_into(sql_text))
     )
     for merge_index, merge in enumerate(extract_merge_matched_updates(sql_text)):
         target_table = normalize_table_name(merge.get("target") or "")
@@ -448,6 +511,61 @@ def fold_column_mutations(
     for ordinal, mutation in enumerate(mutations, 1):
         mutation.ordinal = ordinal
     return mutations
+
+
+def _strip_trailing_select_alias(expr: str) -> str:
+    """Strip a trailing projection alias: ``expr AS Alias`` / ``expr Alias``."""
+    alias_strip = re.match(
+        r"(?is)^(.+?)\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*$",
+        expr,
+    )
+    if not alias_strip:
+        # Some source SQL has zero whitespace between a function call's
+        # closing paren and its trailing alias (e.g. "MIN(x)Alias"). Only
+        # safe to split here because the left side ends in ")" with a
+        # balanced paren count -- a complete sub-expression, not a column
+        # name that merely happens to end near an identifier boundary.
+        glued = re.match(r"(?is)^(.+\))([A-Za-z_][A-Za-z0-9_]*)\s*$", expr)
+        if glued and glued.group(1).count("(") == glued.group(1).count(")"):
+            alias_strip = glued
+    if not alias_strip:
+        return expr
+    if re.search(r"(?is)\b(FROM|WHERE|JOIN|SELECT)\b", alias_strip.group(1)):
+        return expr
+    # Only strip when the right token looks like an alias, not a function arg.
+    right = alias_strip.group(2)
+    if right.upper() in {
+        "DAY", "DAYS", "DD", "MONTH", "YEAR", "HOUR", "MINUTE", "SECOND",
+        "END", "NULL", "TRUE", "FALSE",
+    }:
+        return expr
+    return alias_strip.group(1).strip()
+
+
+_BARE_MIN_MAX_RE = re.compile(
+    r"(?is)^(?P<fn>MIN|MAX)\s*\(\s*(?P<col>[#A-Za-z_][A-Za-z0-9_.]*)\s*\)$"
+)
+
+
+def _attach_groupby_to_bare_aggregate(expr: str, group_by_clause: str) -> str:
+    """Rewrite a bare ``MIN(col)``/``MAX(col)`` SELECT-INTO projection into
+    the platform's documented ``MIN(<Col>, [<GroupbyColumns>])`` form when
+    the statement has a GROUP BY (app/grammar/fourx_grammar.lark's
+    ``list_literal``; see samples/platform_docs/4x_functions_operators.md).
+    Only a bare single-column aggregate is rewritten -- anything already
+    multi-argument or wrapped in other logic is left untouched.
+    """
+    if not group_by_clause:
+        return expr
+    match = _BARE_MIN_MAX_RE.match(expr.strip())
+    if not match:
+        return expr
+    groupby_cols = [
+        bare_ident(c.strip().split(".")[-1]) for c in split_csv_respecting_parens(group_by_clause) if c.strip()
+    ]
+    if not groupby_cols:
+        return expr
+    return f"{match.group('fn').upper()}({match.group('col')}, [{', '.join(groupby_cols)}])"
 
 
 def _dedupe_refs(refs: list[str]) -> list[str]:
@@ -616,6 +734,117 @@ def _resolve_table_entity(
     return resolve_entity_name(norm, entity_map) or norm
 
 
+_KEYWORD_SKIP = {
+    "AND", "OR", "NOT", "NULL", "TRUE", "FALSE", "CASE", "WHEN", "THEN",
+    "ELSE", "END", "DISTINCT", "AS", "IS", "IN", "LIKE", "BETWEEN", "TOP",
+}
+
+
+def _qualify_bare_identifiers(text: str, table: str) -> str:
+    """Prefix every bare (unqualified) column-like identifier with ``table``.
+
+    A SELECT projection column with no explicit ``alias.`` prefix means
+    "this [single, unambiguous] source table's column" -- the same implicit
+    scoping SQL itself uses -- but downstream resolution only ever rewrote
+    already-qualified ``alias.col`` references, so an unqualified column
+    silently fell through unresolved and was later treated as a
+    self-reference on the DD row's own target entity.
+
+    Skips: string-literal contents; already-qualified references (preceded
+    by ``.``); an identifier that is ITSELF a qualifier -- i.e. immediately
+    FOLLOWED by ``.`` (e.g. the ``A`` in ``A.FacilityType``, which is a
+    table alias, not a column, even though nothing precedes it in the
+    string); T-SQL ``@variables``; function-call names (identifier
+    immediately followed by ``(``); and anything inside ``[...]`` (a
+    documented ``[<GroupbyColumns>]`` list, already the exact names it
+    should render as).
+    """
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    in_single = False
+    bracket_depth = 0
+    ident_re = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+    while i < n:
+        ch = text[i]
+        if not in_single and ch in "[]":
+            bracket_depth += 1 if ch == "[" else -1
+            bracket_depth = max(0, bracket_depth)
+            out.append(ch)
+            i += 1
+            continue
+        if in_single:
+            out.append(ch)
+            if ch == "'":
+                if i + 1 < n and text[i + 1] == "'":
+                    out.append(text[i + 1])
+                    i += 2
+                    continue
+                in_single = False
+            i += 1
+            continue
+        if ch == "'":
+            in_single = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch in (".", "@"):
+            # Already-qualified column or a T-SQL variable -- copy the
+            # whole following identifier untouched.
+            out.append(ch)
+            i += 1
+            m = ident_re.match(text, i)
+            if m:
+                out.append(m.group(0))
+                i = m.end()
+            continue
+        m = ident_re.match(text, i) if (i == 0 or text[i - 1] not in ".@") else None
+        if m:
+            ident = m.group(0)
+            end = m.end()
+            j = end
+            while j < n and text[j].isspace():
+                j += 1
+            is_call = j < n and text[j] == "("
+            is_qualifier = j < n and text[j] == "."
+            if (
+                is_call
+                or is_qualifier
+                or bracket_depth > 0
+                or ident.upper() in _KEYWORD_SKIP
+                or ident.isdigit()
+            ):
+                out.append(ident)
+            else:
+                out.append(f"{table}.{ident}")
+            i = end
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _pick_primary_source_table(alias_map: dict[str, str]) -> str | None:
+    """The one table an unqualified projection column implicitly refers to.
+
+    Mirrors phase1's ``_pick_primary_root`` preference (global temp, then
+    physical, then whatever's left) but returns ``None`` instead of
+    guessing when more than one local-temp candidate remains ambiguous --
+    leaving those bare references unresolved is safer than qualifying them
+    against the wrong table.
+    """
+    tables = list(dict.fromkeys(alias_map.values()))
+    if not tables:
+        return None
+    for t in tables:
+        if t.startswith("##"):
+            return t
+    for t in tables:
+        if not t.startswith("#"):
+            return t
+    return tables[0] if len(tables) == 1 else None
+
+
 def _resolve_expression_tables(
     expression: str,
     alias_map: dict[str, str],
@@ -624,6 +853,7 @@ def _resolve_expression_tables(
     default_entity: str,
     *,
     use_derived_formula: bool = True,
+    default_source_table: str | None = None,
 ) -> str:
     """Rewrite ``alias.col`` using the statement alias map only.
 
@@ -640,6 +870,8 @@ def _resolve_expression_tables(
     genuinely downstream reads (a later INSERT/MERGE reading the temp's
     already-settled value) should inherit the derived formula.
     """
+    if default_source_table:
+        expression = _qualify_bare_identifiers(expression, default_source_table)
 
     def repl(match: re.Match[str]) -> str:
         qual = match.group("qual")
