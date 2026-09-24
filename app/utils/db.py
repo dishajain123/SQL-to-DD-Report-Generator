@@ -77,6 +77,7 @@ def _ensure_job_columns(conn: sqlite3.Connection) -> None:
         ("report_path", "TEXT"),
         ("excel_path", "TEXT"),
         ("error_message", "TEXT"),
+        ("stage", "TEXT"),
     ):
         if column_name not in existing_columns:
             conn.execute(f"ALTER TABLE jobs ADD COLUMN {column_name} {column_type}")
@@ -96,7 +97,7 @@ def _ensure_job_columns(conn: sqlite3.Connection) -> None:
 def get_connection(db_path: str | None = None):
     path = db_path or settings.sqlite_db_path
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=5)
     conn.row_factory = sqlite3.Row
     try:
         yield conn
@@ -109,6 +110,35 @@ def init_db(db_path: str | None = None) -> None:
     with get_connection(db_path) as conn:
         conn.executescript(_SCHEMA)
         _ensure_job_columns(conn)
+
+
+def reconcile_orphaned_jobs(db_path: str | None = None) -> list[str]:
+    """Fail out any job still marked PENDING/RUNNING from a previous process.
+
+    Job execution happens in a FastAPI BackgroundTask inside the API
+    process (see app/api/routes.py::_execute_job). If that process is
+    restarted or crashes while a job is mid-flight (dev auto-reload, a
+    deploy, an OOM kill, ...), nothing ever runs the except-block that
+    would normally flip the job to FAILED -- the row is left at RUNNING
+    forever. The frontend then polls a job that can never finish: the
+    /report endpoint 409s indefinitely because status != COMPLETED, and
+    the job looks permanently "stuck" even though the process that was
+    running it is long gone. Called once at API startup so every
+    restart clears out anything orphaned by the previous run.
+    """
+    with get_connection(db_path) as conn:
+        rows = conn.execute(
+            "SELECT job_id FROM jobs WHERE status IN ('PENDING', 'RUNNING')"
+        ).fetchall()
+        orphaned = [row["job_id"] for row in rows]
+        if orphaned:
+            conn.execute(
+                "UPDATE jobs SET status = 'FAILED', "
+                "error_message = COALESCE(error_message, 'Job was orphaned by an API server restart and never completed. Please resubmit.'), "
+                "updated_at = CURRENT_TIMESTAMP "
+                "WHERE status IN ('PENDING', 'RUNNING')"
+            )
+    return orphaned
 
 
 def record_job(job_id: str, company: str, platform: str, intent: str, status: str, db_path: str | None = None) -> None:
@@ -124,6 +154,21 @@ def record_job(job_id: str, company: str, platform: str, intent: str, status: st
             "INSERT INTO jobs (job_id, company, platform, intent, status, run_number) VALUES (?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(job_id) DO UPDATE SET status=excluded.status, updated_at=CURRENT_TIMESTAMP",
             (job_id, company, platform, intent, status, run_number),
+        )
+
+
+def set_job_stage(job_id: str, stage: str, db_path: str | None = None) -> None:
+    """Record the pipeline step currently in progress.
+
+    Status stays RUNNING for the whole job, and DD rows are written only
+    after generation finishes, so a poll that only watches status and row
+    count goes silent the moment work actually starts. The stage is what
+    tells the UI the job is still moving (and where it stopped if it is not).
+    """
+    with get_connection(db_path) as conn:
+        conn.execute(
+            "UPDATE jobs SET stage = ?, updated_at = CURRENT_TIMESTAMP WHERE job_id = ?",
+            (stage, job_id),
         )
 
 

@@ -26,9 +26,6 @@ from app.report.dd_export import export_dd_rows_csv, export_dd_rows_excel
 from app.report.report_generator import generate_report
 from app.utils import db
 from app.utils.config import settings
-from app.utils.logging_config import get_logger
-
-logger = get_logger(__name__)
 
 
 def _persist_llm_token_usage(job_id: str, llm_client: LLMClient) -> None:
@@ -80,7 +77,14 @@ class PipelineState(TypedDict, total=False):
     existing_dd_csv_path: str
 
 
+def _set_stage(state: PipelineState, stage: str) -> None:
+    job_plan = state.get("job_plan")
+    if job_plan is not None:
+        db.set_job_stage(job_plan.job_id, stage)
+
+
 def node_split_and_parse(state: PipelineState) -> PipelineState:
+    _set_stage(state, "Parsing SQL")
     objects: dict[str, SQLObject] = {}
     for filename, content in state["uploaded_files"].items():
         dialect = detect_dialect(content)
@@ -91,6 +95,7 @@ def node_split_and_parse(state: PipelineState) -> PipelineState:
 
 
 def node_structural_analysis(state: PipelineState) -> PipelineState:
+    _set_stage(state, "Analyzing SQL structure")
     structural_infos = {}
     structural_errors = {}
     for oid, obj in state["objects"].items():
@@ -121,6 +126,7 @@ def node_structural_analysis(state: PipelineState) -> PipelineState:
 
 
 def node_smart_chunking(state: PipelineState) -> PipelineState:
+    _set_stage(state, "Chunking procedures")
     smart_chunks = {}
     job_id = state["job_plan"].job_id
     audit_entries: list[tuple[str, str, str]] = []
@@ -135,6 +141,7 @@ def node_smart_chunking(state: PipelineState) -> PipelineState:
 
 
 def node_lineage(state: PipelineState) -> PipelineState:
+    _set_stage(state, "Building lineage")
     objects_list = list(state["objects"].values())
     graph = build_graph(objects_list, state["structural_infos"])
     chains = find_chains(graph, state["job_plan"].job_id, objects_list)
@@ -143,6 +150,7 @@ def node_lineage(state: PipelineState) -> PipelineState:
 
 
 def node_canonical_models(state: PipelineState, llm_client: LLMClient) -> PipelineState:
+    _set_stage(state, "Preparing derivation from the SQL")
     chains = state["chains"]
     job_id = state["job_plan"].job_id
 
@@ -185,6 +193,7 @@ def node_canonical_models(state: PipelineState, llm_client: LLMClient) -> Pipeli
 def node_dd_generation(
     state: PipelineState, llm_client: LLMClient, rag_store: Optional[ChromaStore] = None
 ) -> PipelineState:
+    _set_stage(state, "Generating derivation rows and conditions")
     chains = state["chains"]
     canonical_models = state["canonical_models"]
     job_id = state["job_plan"].job_id
@@ -255,6 +264,7 @@ def node_skip_dd_generation(state: PipelineState) -> PipelineState:
 
 
 def node_report_and_export(state: PipelineState) -> PipelineState:
+    _set_stage(state, "Writing the report, CSV, and Excel")
     job_plan = state["job_plan"]
     output_dir = db.get_job_output_dir(job_plan.job_id)
     report_path = generate_report(
@@ -336,24 +346,15 @@ def _requires_dd_generation(state: PipelineState) -> str:
     return "generate_dd" if state["job_plan"].requires_dd_generation else "skip_dd"
 
 
-def _build_default_rag_store() -> Optional[ChromaStore]:
-    """RAG is a targeting aid layered on top of the existing full-reference
-    behavior (see RAG retrieval in the orchestration / chroma path),
-    not a hard dependency -- if Chroma can't be initialized for any reason
-    (no persist directory yet, environment issue, etc.), the pipeline must
-    keep working exactly as it did before RAG was wired in, just without
-    the extra retrieval step."""
-    try:
-        return ChromaStore()
-    except Exception as exc:  # pragma: no cover - defensive: RAG must never block startup
-        logger.warning("Could not initialize the RAG store, continuing without it: %s", exc)
-        return None
-
-
 def build_pipeline(llm_client: LLMClient | None = None, rag_store: ChromaStore | None = None) -> Any:
     llm_client = llm_client or LLMClient()
-    if rag_store is None:
-        rag_store = _build_default_rag_store()
+    # v2 derivation does not read the RAG store (it is discarded in
+    # generate_dd_rows_for_chains). Opening Chroma here used to run on every
+    # job, immediately after status flipped to RUNNING and before any DD row
+    # existed. PersistentClient blocks on a locked .chroma database instead
+    # of raising, so the job stayed RUNNING forever and never reached the
+    # report / CSV / Excel export. Callers that still want retrieval can
+    # pass a store in; the default path does not touch Chroma.
 
     graph = StateGraph(PipelineState)
     graph.add_node("split_and_parse", node_split_and_parse)

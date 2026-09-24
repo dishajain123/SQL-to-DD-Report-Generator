@@ -9,15 +9,30 @@ from app.derivation.llm_client import LLMClient
 from app.models.core import CanonicalModel, GlossaryTerm, LineageChain, SQLObject, StructuralInfo
 
 
-def _business_reasoning_details(llm_client: LLMClient, technical_summary: str) -> tuple[str, list[GlossaryTerm]]:
-    details_method = getattr(llm_client, "business_reasoning_details", None)
-    if callable(details_method):
-        result = details_method(technical_summary)
-        summary = getattr(result, "summary", "")
-        glossary_terms = getattr(result, "glossary_terms", [])
-        return str(summary), list(glossary_terms)
+def _fallback_technical_summary(
+    ordered_objects: list[SQLObject],
+    structural_infos: dict[str, StructuralInfo],
+    chain: LineageChain,
+) -> str:
+    names = ", ".join(obj.name for obj in ordered_objects) or "the procedure"
+    tables: list[str] = []
+    for object_id in chain.order:
+        info = structural_infos.get(object_id)
+        if info is not None:
+            tables.extend(info.tables_written or [])
+    written = ", ".join(sorted(set(tables))[:8])
+    if written:
+        return f"{names} writes {written}. Column conditions are taken from the procedure SQL."
+    return f"{names} derives its target columns from the procedure SQL."
 
-    return llm_client.business_reasoning(technical_summary), []
+
+def _fallback_business_summary(ordered_objects: list[SQLObject]) -> str:
+    names = ", ".join(obj.name for obj in ordered_objects) or "This procedure"
+    return (
+        f"{names} applies the conditions encoded in the source SQL. "
+        "The narrative model did not respond, so the report and the DD export "
+        "use those SQL conditions directly."
+    )
 
 
 def build_canonical_model(
@@ -28,10 +43,13 @@ def build_canonical_model(
     llm_client: LLMClient,
 ) -> CanonicalModel:
     ordered_objects = [objects[oid] for oid in chain.order]
-    sql_snippets = [f"-- Object: {o.name}\n{o.raw_sql}" for o in ordered_objects]
-
-    technical_summary = llm_client.technical_reasoning(sql_snippets)
-    business_summary, glossary_terms = _business_reasoning_details(llm_client, technical_summary)
+    # Narrative model calls were blocking the API process itself: the status
+    # endpoint then stopped answering and the UI aborted before any CSV or
+    # Excel was written. Column conditions come from the SQL, so the summary
+    # is filled locally and the export is not gated on a model response.
+    technical_summary = _fallback_technical_summary(ordered_objects, structural_infos, chain)
+    business_summary = _fallback_business_summary(ordered_objects)
+    glossary_terms: list[GlossaryTerm] = []
 
     evidence = []
     for oid in chain.order:

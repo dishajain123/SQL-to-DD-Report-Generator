@@ -11,6 +11,16 @@ def test_init_db_creates_tables(tmp_db_path):
     assert {"jobs", "dd_rows", "review_decisions", "audit_log"} <= tables
 
 
+def test_set_job_stage_is_readable(tmp_db_path):
+    db.init_db(tmp_db_path)
+    db.record_job("job-1", "Acme", "4X", "Generate DD", "RUNNING", tmp_db_path)
+    db.set_job_stage("job-1", "Generating derivation rows and conditions", tmp_db_path)
+
+    row = db.get_job("job-1", db_path=tmp_db_path)
+    assert row["stage"] == "Generating derivation rows and conditions"
+    assert row["status"] == "RUNNING"
+
+
 def test_record_and_update_job(tmp_db_path):
     db.init_db(tmp_db_path)
     db.record_job("job-1", "Acme", "4X", "Generate DD", "RUNNING", tmp_db_path)

@@ -33,6 +33,7 @@ COLUMNS = dd_export.COLUMNS
 export_reviewed_dd_rows_for_job_csv = dd_export.export_reviewed_dd_rows_for_job_csv
 export_reviewed_dd_rows_for_job_excel = dd_export.export_reviewed_dd_rows_for_job_excel
 from app.review import review_store
+from app.review.local_api import ensure_local_api
 from app.review.sql_input import bundled_sample_names, bundled_sql_file, pasted_sql_file, uploaded_sql_files
 from app.utils import db
 from app.utils.config import settings
@@ -212,35 +213,95 @@ def _get_bytes(url: str) -> tuple[int, bytes]:
         raise RuntimeError(f"Could not reach the API at {url}: {reason}") from exc
 
 
-def _wait_for_job(api_base_url: str, job_id: str, max_wait_seconds: int = 1800) -> dict:
+def _wait_for_job(
+    api_base_url: str,
+    job_id: str,
+    max_wait_seconds: int = 1800,
+    on_tick=None,
+) -> dict:
+    """Poll the job status endpoint until it finishes.
+
+    `on_tick(response_body, elapsed_seconds)` is called after every poll,
+    including the first one, so the caller can repaint live progress
+    (status box, log panel) as the run progresses instead of only finding
+    out once this function returns -- previously the UI froze on
+    "Running pipeline..." for the entire duration of the run because
+    nothing re-rendered inside this loop.
+    """
     status_url = api_base_url.rstrip("/") + f"/api/jobs/{job_id}/status"
     start = time.monotonic()
     last_status = ""
+    last_dd_row_count = -1
+    last_stage = ""
+    last_heartbeat = -1
 
     while True:
-        status_code, response_body = _get_json(status_url)
+        try:
+            status_code, response_body = _get_json(status_url)
+        except RuntimeError as exc:
+            elapsed = time.monotonic() - start
+            if elapsed >= max_wait_seconds:
+                raise
+            _log("Status check failed (%s). Retrying." % exc)
+            time.sleep(2)
+            continue
         if status_code >= 400:
             raise RuntimeError(response_body.get("detail", f"HTTP {status_code} from status endpoint"))
 
-        last_status = str(response_body.get("status", "")).upper()
-        _log(f"Job {job_id} status: {last_status or '(unknown)'}")
+        elapsed = time.monotonic() - start
+        new_status = str(response_body.get("status", "")).upper()
+        dd_row_count = response_body.get("dd_row_count", 0)
+        stage = str(response_body.get("stage") or "").strip()
+        heartbeat = int(elapsed) // 10
+        if (
+            new_status != last_status
+            or dd_row_count != last_dd_row_count
+            or stage != last_stage
+            or heartbeat != last_heartbeat
+        ):
+            stage_bit = f" stage={stage}" if stage else ""
+            status_label = new_status or "(unknown)"
+            pending_review = response_body.get("pending_review_count", 0)
+            _log(
+                "Job %s status: %s%s (dd_rows=%s, pending_review=%s, elapsed=%ss)"
+                % (job_id, status_label, stage_bit, dd_row_count, pending_review, int(elapsed))
+            )
+            last_status = new_status
+            last_dd_row_count = dd_row_count
+            last_stage = stage
+            last_heartbeat = heartbeat
 
-        if last_status in {"COMPLETED", "FAILED"}:
+        if on_tick is not None:
+            on_tick(response_body, elapsed)
+
+        if new_status in {"COMPLETED", "FAILED"}:
             return response_body
 
-        if time.monotonic() - start >= max_wait_seconds:
+        if elapsed >= max_wait_seconds:
             raise TimeoutError(
-                f"Job {job_id} is still {last_status.lower() or 'running'} after {max_wait_seconds} seconds."
+                f"Job {job_id} is still {new_status.lower() or 'running'} after {max_wait_seconds} seconds."
             )
 
         time.sleep(2)
 
 
 def _fetch_report_markdown(api_base_url: str, job_id: str, job_row: dict | None = None) -> str | None:
+    # The API 409s on /report until the job reaches COMPLETED (see
+    # app/api/routes.py::download_business_understanding_report). Skip the
+    # request entirely while we already know locally that the job isn't
+    # done yet, instead of hitting the API (and spamming its logs with
+    # expected 409s) on every Streamlit rerun.
+    status = str((job_row or {}).get("status", "")).upper()
+    if status and status != "COMPLETED":
+        report_path = (job_row or {}).get("report_path")
+        if report_path and Path(report_path).exists():
+            return Path(report_path).read_text(encoding="utf-8", errors="replace")
+        return None
+
     report_url = api_base_url.rstrip("/") + f"/api/jobs/{job_id}/report"
     try:
-        status, payload = _get_bytes(report_url)
-        if status < 400 and payload:
+        status_code, payload = _get_bytes(report_url)
+        if status_code < 400 and payload:
             return payload.decode("utf-8", errors="replace")
     except RuntimeError:
         pass
@@ -530,6 +591,15 @@ def _render_submission_tab() -> None:
         return
 
     _log(f"Loaded {len(files)} SQL file(s).")
+    try:
+        started = ensure_local_api(api_base_url)
+    except RuntimeError as exc:
+        _log(str(exc))
+        _render_logs()
+        st.error(str(exc))
+        return
+    if started:
+        _log(started)
     _log("Submitting job to the API...")
 
     payload = {
@@ -544,7 +614,25 @@ def _render_submission_tab() -> None:
     status_panel = st.container(border=True)
     status_box = status_panel.empty()
     progress = status_panel.progress(5)
+    log_box = status_panel.empty()
     status_box.markdown("### Live Run Status\n\n- **Current step:** Submitting job…")
+
+    def _render_live_logs() -> None:
+        logs = st.session_state.get("ui_logs", [])
+        log_box.code("\n".join(logs[-30:]), language="text")
+
+    def _on_tick(job_status_body: dict, elapsed_seconds: float) -> None:
+        status = str(job_status_body.get("status", "")).upper() or "UNKNOWN"
+        stage = str(job_status_body.get("stage") or "Working").strip()
+        progress.progress(min(20 + int(elapsed_seconds), 95))
+        status_box.markdown(
+            f"### Live Run Status\n\n- **Job:** `{job_id}`\n"
+            f"- **Status:** `{status}`\n"
+            f"- **Step:** {stage}\n"
+            f"- **DD rows so far:** {job_status_body.get('dd_row_count', 0)}\n"
+            f"- **Elapsed:** {int(elapsed_seconds)}s"
+        )
+        _render_live_logs()
 
     with st.spinner("Submitting job..."):
         try:
@@ -571,7 +659,7 @@ def _render_submission_tab() -> None:
     )
 
     try:
-        final_status = _wait_for_job(api_base_url, job_id)
+        final_status = _wait_for_job(api_base_url, job_id, on_tick=_on_tick)
     except TimeoutError as exc:
         _log(str(exc))
         _render_logs()

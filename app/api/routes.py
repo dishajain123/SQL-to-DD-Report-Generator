@@ -24,6 +24,7 @@ router = APIRouter()
 def _execute_job(job_id: str, request_payload: dict[str, Any]) -> None:
     request = JobSubmitRequest.model_validate(request_payload)
     db.update_job_status(job_id, "RUNNING")
+    db.set_job_stage(job_id, "Starting pipeline")
 
     try:
         job_plan = JobPlan(
@@ -49,8 +50,10 @@ def _execute_job(job_id: str, request_payload: dict[str, Any]) -> None:
             report_path=result.get("report_path"),
             excel_path=result.get("excel_path"),
         )
+        db.set_job_stage(job_id, "Complete")
     except Exception as exc:  # pragma: no cover - defensive background worker guard
         db.update_job_status(job_id, "FAILED", error_message=str(exc))
+        db.set_job_stage(job_id, "Failed")
         db.log_audit(job_id, "job_execution", f"Job failed: {exc}")
         return
 

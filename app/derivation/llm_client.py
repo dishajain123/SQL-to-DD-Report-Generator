@@ -468,7 +468,11 @@ class LLMClient:
 
             self.bedrock_client = boto3.client(
                 "bedrock-runtime",
-                config=Config(read_timeout=self.request_timeout_seconds),
+                config=Config(
+                    connect_timeout=self.request_timeout_seconds,
+                    read_timeout=self.request_timeout_seconds,
+                    retries={"max_attempts": 2},
+                ),
             )
 
         try:
@@ -511,7 +515,30 @@ class LLMClient:
         )
 
     def _complete(self, system: str, user: str, max_tokens: Optional[int] = None, stage: str = "") -> str:
-        return self._complete_with_model(system, user, max_tokens=max_tokens or self.max_new_tokens, stage=stage)
+        # Socket timeouts do not cover a hung credential lookup or a read
+        # that never unblocks. Run the call on a daemon thread and abandon
+        # it when the deadline passes so the pipeline can keep going.
+        outcome: dict[str, Any] = {}
+
+        def _run() -> None:
+            try:
+                outcome["value"] = self._complete_with_model(
+                    system, user, max_tokens=max_tokens or self.max_new_tokens, stage=stage
+                )
+            except BaseException as exc:  # re-raised on the caller thread
+                outcome["error"] = exc
+
+        worker = threading.Thread(target=_run, name=f"llm-{stage or 'call'}", daemon=True)
+        worker.start()
+        worker.join(self.request_timeout_seconds)
+        if worker.is_alive():
+            raise RuntimeError(
+                f"{self.provider} did not respond within {int(self.request_timeout_seconds)}s "
+                f"during {stage or 'completion'}"
+            )
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["value"]
 
     def technical_reasoning(self, sql_snippets: list[str]) -> str:
         prompts = _load_prompts()
