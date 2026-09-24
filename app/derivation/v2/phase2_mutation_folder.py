@@ -510,7 +510,7 @@ def fold_column_mutations(
     mutations.sort(key=lambda m: m.source_position)
     for ordinal, mutation in enumerate(mutations, 1):
         mutation.ordinal = ordinal
-    return mutations
+    return _prune_redundant_mutations(mutations)
 
 
 def _strip_trailing_select_alias(expr: str) -> str:
@@ -560,12 +560,100 @@ def _attach_groupby_to_bare_aggregate(expr: str, group_by_clause: str) -> str:
     match = _BARE_MIN_MAX_RE.match(expr.strip())
     if not match:
         return expr
-    groupby_cols = [
-        bare_ident(c.strip().split(".")[-1]) for c in split_csv_respecting_parens(group_by_clause) if c.strip()
-    ]
+    groupby_cols = []
+    for raw in split_csv_respecting_parens(group_by_clause):
+        cleaned = raw.strip().strip('"').strip("'").rstrip(";").strip().strip('"').strip("'")
+        name = bare_ident(cleaned.split(".")[-1] if cleaned else "")
+        name = name.rstrip(";").strip()
+        if name:
+            groupby_cols.append(name)
     if not groupby_cols:
         return expr
-    return f"{match.group('fn').upper()}({match.group('col')}, [{', '.join(groupby_cols)}])"
+    quoted = ", ".join(f'"{name}"' for name in groupby_cols)
+    return f"{match.group('fn').upper()}({match.group('col')}, [{quoted}])"
+
+
+def _prune_redundant_mutations(mutations: list[MutationPass]) -> list[MutationPass]:
+    """Drop duplicate ELSEIF arms produced by folding the same UPDATE twice."""
+    kept: list[MutationPass] = []
+    seen: set[tuple] = set()
+    for mutation in mutations:
+        if (mutation.control_branch_kind or "").upper() == "ELSEIF":
+            key = (
+                (mutation.control_branch_group or "").upper(),
+                (mutation.outer_condition or "").strip().upper(),
+                (mutation.assigned_expression or "").strip().upper(),
+                (mutation.where_clause or "").strip().upper(),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+        kept.append(mutation)
+    return kept
+
+
+def prune_redundant_ast(node: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Remove dead IF arms that cannot change the column.
+
+    - Inside ``IF(ISNOTEMPTY(col))``, an immediate ``IF(ISEMPTY(col))`` in
+      THEN is unreachable.
+    - Identical nested ELSEIF arms are collapsed.
+    - ``ELSE(col)`` under ``IF(ISNOTEMPTY(col))`` is a self-assignment on the
+      null path and is dropped.
+    """
+    if not isinstance(node, dict):
+        return node
+    cleaned = dict(node)
+    for key, value in list(cleaned.items()):
+        if isinstance(value, dict) and "type" in value:
+            cleaned[key] = prune_redundant_ast(value)
+        elif isinstance(value, list):
+            cleaned[key] = [
+                prune_redundant_ast(item) if isinstance(item, dict) else item for item in value
+            ]
+    if cleaned.get("type") != "IF_THEN_ELSE":
+        return cleaned
+
+    outer = _predicate_column(cleaned.get("condition"), "ISNOTEMPTY")
+    then_branch = cleaned.get("then_branch")
+    if outer and isinstance(then_branch, dict) and then_branch.get("type") == "IF_THEN_ELSE":
+        inner = _predicate_column(then_branch.get("condition"), "ISEMPTY")
+        if inner and inner == outer:
+            replacement = then_branch.get("else_branch")
+            cleaned["then_branch"] = prune_redundant_ast(replacement) if isinstance(replacement, dict) else replacement
+
+    else_branch = cleaned.get("else_branch")
+    if (
+        isinstance(else_branch, dict)
+        and else_branch.get("type") == "IF_THEN_ELSE"
+        and else_branch.get("condition") == cleaned.get("condition")
+        and else_branch.get("then_branch") == cleaned.get("then_branch")
+    ):
+        cleaned["else_branch"] = else_branch.get("else_branch")
+
+    if outer and _is_same_column_ref(cleaned.get("else_branch"), outer):
+        cleaned.pop("else_branch", None)
+    return cleaned
+
+
+def _predicate_column(node: dict[str, Any] | None, function_name: str) -> tuple[str, str] | None:
+    if not isinstance(node, dict) or node.get("type") != "FUNCTION_CALL":
+        return None
+    if str(node.get("function_name") or "").upper() != function_name:
+        return None
+    args = node.get("arguments") or []
+    if len(args) != 1 or not isinstance(args[0], dict):
+        return None
+    ref = args[0]
+    if ref.get("type") != "COLUMN_REF":
+        return None
+    return (str(ref.get("entity") or "").upper(), str(ref.get("column") or "").upper())
+
+
+def _is_same_column_ref(node: dict[str, Any] | None, identity: tuple[str, str]) -> bool:
+    if not isinstance(node, dict) or node.get("type") != "COLUMN_REF":
+        return False
+    return (str(node.get("entity") or "").upper(), str(node.get("column") or "").upper()) == identity
 
 
 def _dedupe_refs(refs: list[str]) -> list[str]:

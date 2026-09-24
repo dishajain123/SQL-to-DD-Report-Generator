@@ -53,9 +53,9 @@ function_call: FUNC_NAME "(" [arg_list] ")"
 arg_list: expr ("," expr)*
 
 // A bracketed column list, e.g. the documented ``MIN(<Col>, [<GroupbyCols>])``
-// / ``MAX(<Col>, [<GroupbyCols>])`` second argument. Distinct from
-// membership's inline ``arith MEMBERSHIP_OP "[" value_list "]"`` -- this is
-// a standalone list usable anywhere an atom is expected (a function arg).
+// / ``MAX(<Col>, [<GroupbyCols>])`` second argument. Names are clean quoted
+// identifiers (``["UCIF_ID"]``). Trailing semicolons and extra quotes are
+// stripped before this list is emitted.
 list_literal: "[" value_list "]"
 
 // STRING is already accepted by a single-part column_ref. Listing it again

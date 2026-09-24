@@ -109,10 +109,15 @@ def compile_ast_to_4x_string(node: dict[str, Any] | None) -> str:
                 func = "ISEMPTY" if operator in {"==", "<=", ">="} else "ISNOTEMPTY"
                 return f"{func}({compile_ast_to_4x_string(operand)})"
 
+        if operator in {"AND", "OR"}:
+            parts = _flatten_logical(node, operator)
+            rendered = ", ".join(compile_ast_to_4x_string(part) for part in parts)
+            return f"{operator}({rendered})"
+
         left = compile_ast_to_4x_string(node["left"])
         right = compile_ast_to_4x_string(node["right"])
-        # Preserve the AST's grouping; dropping parentheses changes both
-        # arithmetic and mixed AND/OR expressions on the target platform.
+        # Preserve the AST's grouping; dropping parentheses changes
+        # arithmetic expressions on the target platform.
         if node["left"].get("type") == "BINARY_OP":
             left = f"({left})"
         if node["right"].get("type") == "BINARY_OP":
@@ -162,7 +167,9 @@ def compile_ast_to_4x_string(node: dict[str, Any] | None) -> str:
     if node_type == "LIST_LITERAL":
         # The documented ``MIN(<Col>, [<GroupbyColumns>])`` / ``MAX(...)``
         # second argument (app/grammar/fourx_grammar.lark's ``list_literal``).
-        items = ", ".join(_compile_membership_value(v) for v in (node.get("items") or []))
+        items = ", ".join(
+            _compile_membership_value(_clean_group_item(v)) for v in (node.get("items") or [])
+        )
         return f"[{items}]"
 
     if node_type == "COLUMN_REF":
@@ -378,6 +385,32 @@ def _repair_value_branch(node: Any) -> Any:
     return node
 
 
+def _flatten_logical(node: dict[str, Any], operator: str) -> list[dict[str, Any]]:
+    """Collapse a same-operator AND/OR tree into the function-form argument list."""
+    parts: list[dict[str, Any]] = []
+    for side in ("left", "right"):
+        child = node.get(side) or {}
+        child_op = str(child.get("operator") or "").strip().upper()
+        if isinstance(child, dict) and child.get("type") == "BINARY_OP" and child_op == operator:
+            parts.extend(_flatten_logical(child, operator))
+        else:
+            parts.append(child)
+    return parts
+
+
+def _clean_group_item(value: Any) -> Any:
+    """Drop a trailing semicolon or stray quotes inside a group-by name."""
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
+        text = text[1:-1]
+    text = text.strip().rstrip(";").strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
+        text = text[1:-1].strip()
+    return text.rstrip(";").strip()
+
+
 def _compile_if_then_else(node: dict[str, Any]) -> str:
     """Flatten nested IF_THEN_ELSE else-branches into ELSEIF clauses.
 
@@ -386,6 +419,7 @@ def _compile_if_then_else(node: dict[str, Any]) -> str:
     clauses: list[tuple[str, str]] = []
     current: dict[str, Any] | None = node
     default_node: dict[str, Any] = {"type": "LITERAL", "value_type": "NULL", "value": None}
+    has_else = False
 
     while current is not None and current.get("type") == "IF_THEN_ELSE":
         cond = compile_ast_to_4x_string(current["condition"])
@@ -397,16 +431,24 @@ def _compile_if_then_else(node: dict[str, Any]) -> str:
             continue
         if isinstance(else_branch, dict):
             default_node = else_branch
+            has_else = True
         current = None
 
     if not clauses:
         raise ValueError("IF_THEN_ELSE node produced no clauses")
 
-    first_cond, first_then = clauses[0]
+    deduped: list[tuple[str, str]] = []
+    for clause in clauses:
+        if deduped and deduped[-1] == clause:
+            continue
+        deduped.append(clause)
+
+    first_cond, first_then = deduped[0]
     parts = [f"IF({first_cond})THEN({first_then})"]
-    for cond, then_b in clauses[1:]:
+    for cond, then_b in deduped[1:]:
         parts.append(f"ELSEIF({cond})THEN({then_b})")
-    parts.append(f"ELSE({compile_ast_to_4x_string(_repair_value_branch(default_node))})")
+    if has_else:
+        parts.append(f"ELSE({compile_ast_to_4x_string(_repair_value_branch(default_node))})")
     return "".join(parts)
 
 

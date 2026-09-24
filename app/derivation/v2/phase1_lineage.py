@@ -248,13 +248,18 @@ def _register_projection(
     if src_qual:
         src_table = alias_to_table.get(bare_ident(src_qual).upper()) or normalize_table_name(src_qual)
     if not src_table and alias_to_table:
-        # Prefer first global-temp / physical table.
-        for table in alias_to_table.values():
+        # Bare projections take the FROM/JOIN source, never the temp being filled.
+        candidates = [
+            table for table in alias_to_table.values()
+            if normalize_table_name(table).upper() != normalize_table_name(target).upper()
+        ]
+        pool = candidates or list(alias_to_table.values())
+        for table in pool:
             if _is_global_temp(table) or not table.startswith("#"):
                 src_table = table
                 break
         if not src_table:
-            src_table = next(iter(alias_to_table.values()))
+            src_table = pool[0]
 
     if not src_table:
         return

@@ -209,7 +209,10 @@ def build_ast_from_mutations(
             else:
                 # Unguarded pass resets the base value for subsequent guards.
                 ast = then_node
-    return ast
+    from app.derivation.v2.phase2_mutation_folder import prune_redundant_ast
+
+    pruned = prune_redundant_ast(ast)
+    return pruned if isinstance(pruned, dict) else ast
 
 
 def _segment_mutations_by_control_flow(
@@ -456,6 +459,14 @@ def parse_sql_expression_to_ast(
     if not text:
         return {"type": "LITERAL", "value_type": "NULL", "value": None}
 
+    if re.search(r"(?is)\bROW_NUMBER\s*\(|\bOVER\s*\(", text):
+        return {
+            "type": "FUNCTION_CALL",
+            "function_name": "__UNSUPPORTED_SQL__",
+            "arguments": [],
+            "_validation_error": "ROW_NUMBER()/OVER window syntax is unsupported and must be reviewed",
+        }
+
     # Strip wrapping parentheses.
     while text.startswith("(") and text.endswith(")") and _balanced(text[1:-1]):
         text = text[1:-1].strip()
@@ -467,7 +478,13 @@ def parse_sql_expression_to_ast(
     # ``value: STRING | NUMBER`` for bracketed lists).
     if text.startswith("[") and text.endswith("]"):
         inner = text[1:-1].strip()
-        items = [bare_ident(c.strip()) for c in split_csv_respecting_parens(inner) if c.strip()]
+        items = []
+        for raw in split_csv_respecting_parens(inner):
+            cleaned = raw.strip().strip('"').strip("'").rstrip(";").strip()
+            name = bare_ident(cleaned)
+            name = name.rstrip(";").strip()
+            if name:
+                items.append(name)
         return {"type": "LIST_LITERAL", "items": items}
 
     # CAST(expr AS type) — 4X has no explicit cast; drop the type and parse
