@@ -23,21 +23,20 @@ BEGIN
         DECLARE @ProcessDate DATE = (SELECT [Date] FROM SysDayMatrix WHERE TimeKey = @TimeKey)
         DECLARE @GraceWindowStart DATE = DATEADD(DAY, -3, @ProcessDate)
 
-        -- Rule 1: derive days past due from the last payment date
+
         UPDATE A
         SET A.DpdDays = DATEDIFF(DAY, A.LastPaymentDueDate, @ProcessDate)
         FROM PRO.LoanAccountCal A
         WHERE A.LastPaymentDueDate IS NOT NULL
           AND A.LastPaymentDueDate <= @ProcessDate
 
-        -- Rule 2: accounts with no due date on record cannot be aged
+
         UPDATE A
         SET A.DpdDays = 0,
             A.DpdBucket = 'NOT_APPLICABLE'
         FROM PRO.LoanAccountCal A
         WHERE A.LastPaymentDueDate IS NULL
 
-        -- Rule 3: multi-branch bucket classification by DPD range
         UPDATE A
         SET A.DpdBucket = (
                 CASE
@@ -52,8 +51,7 @@ BEGIN
         FROM PRO.LoanAccountCal A
         WHERE A.DpdDays IS NOT NULL
 
-        -- Rule 4: penal interest applies only once an account is overdue,
-        -- and scales with how late the account is
+
         UPDATE A
         SET A.PenalInterestAmount = (
                 CASE
@@ -65,9 +63,6 @@ BEGIN
             )
         FROM PRO.LoanAccountCal A
 
-        -- Rule 5: sequential IF/ELSE - accounts within the 3-day grace
-        -- window skip escalation entirely this cycle, everything else
-        -- worsened relative to the prior run is flagged
         IF EXISTS (SELECT 1 FROM PRO.LoanAccountCal WHERE LastPaymentDueDate >= @GraceWindowStart)
         BEGIN
             UPDATE A
@@ -110,8 +105,7 @@ BEGIN
         FROM PRO.LoanAccountCal A
         WHERE A.BucketWorsened = 'Y'
 
-        -- Rule 7: derived-assignment UPDATE reading back the staging rows
-        -- written above - facility type nudges the penalty up or down
+
         UPDATE S
         SET S.AdjustedPenalty = (
                 CASE
@@ -123,8 +117,6 @@ BEGIN
         FROM #DpdStaging S
         WHERE S.AdjustedPenalty IS NOT NULL
 
-        -- Rule 8: upsert the staged, adjusted rows into the DPD history
-        -- table - refresh accounts already tracked, add new ones
         MERGE PRO.DpdBucketHistory AS Target
         USING #DpdStaging AS Source
         ON Target.AccountId = Source.AccountId
@@ -137,9 +129,7 @@ BEGIN
             INSERT (AccountId, DpdBucket, AdjustedPenalty, FirstFlaggedDate, LastUpdatedDate)
             VALUES (Source.AccountId, Source.DpdBucket, Source.AdjustedPenalty, @ProcessDate, @ProcessDate);
 
-        -- Rule 9: queue a notification for every newly-worsened account -
-        -- nested IF/ELSE (severity first, then facility type within the
-        -- severe branch) expressed as a multi-branch CASE, set-based
+
         INSERT INTO PRO.CollectionsQueue (AccountId, EscalationDate, Reason)
         SELECT AccountId, @ProcessDate,
                CASE
@@ -152,8 +142,7 @@ BEGIN
         FROM PRO.LoanAccountCal
         WHERE BucketWorsened = 'Y'
 
-        -- Rule 10: status-transition audit row for every bucket change
-        -- applied this run, cross-referencing the history table above
+
         INSERT INTO PRO.DpdBucketAuditLog (AccountId, TransitionDate, NewBucket)
         SELECT H.AccountId, @ProcessDate, H.DpdBucket
         FROM PRO.DpdBucketHistory H

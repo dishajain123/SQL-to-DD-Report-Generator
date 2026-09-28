@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from typing import Any, Optional
 
-from app.derivation.v2.phase2_mutation_folder import MutationPass
+from app.derivation.v2.phase2_mutation_folder import MutationPass, prune_redundant_ast
 from app.derivation.v2.sql_text import (
     bare_ident,
     extract_subquery_dependency_refs,
@@ -209,7 +209,6 @@ def build_ast_from_mutations(
             else:
                 # Unguarded pass resets the base value for subsequent guards.
                 ast = then_node
-    from app.derivation.v2.phase2_mutation_folder import prune_redundant_ast
 
     pruned = prune_redundant_ast(ast)
     return pruned if isinstance(pruned, dict) else ast
@@ -253,6 +252,10 @@ def _fold_control_branch_group(mutations, target_entity, target_column, prior=No
 
     A false WHERE inside a selected IF arm must not execute the ELSE arm.
     Every arm starts from the same pre-branch column state.
+
+    Each arm is pruned as soon as it is wrapped: an ``IF EXISTS(... WHERE A)``
+    arm around ``UPDATE ... WHERE A`` otherwise yields ``IF(A) THEN(IF(A) ...)``,
+    and later passes would copy that duplicate into every prior-value slot.
     """
     from dataclasses import replace
     base = prior if prior is not None else _column_ref(target_entity, target_column)
@@ -274,8 +277,8 @@ def _fold_control_branch_group(mutations, target_entity, target_column, prior=No
         cond = parse_sql_expression_to_ast(predicate, default_entity=target_entity,
                                           target_column=target_column, as_condition=True)
         cond = _substitute_prior_value(cond, base, target_entity, target_column)
-        result = {"type": "IF_THEN_ELSE", "condition": cond,
-                  "then_branch": value, "else_branch": result}
+        result = prune_redundant_ast({"type": "IF_THEN_ELSE", "condition": cond,
+                                      "then_branch": value, "else_branch": result})
     return result
 
 

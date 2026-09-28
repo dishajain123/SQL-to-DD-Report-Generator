@@ -595,6 +595,9 @@ def _prune_redundant_mutations(mutations: list[MutationPass]) -> list[MutationPa
 def prune_redundant_ast(node: dict[str, Any] | None) -> dict[str, Any] | None:
     """Remove dead IF arms that cannot change the column.
 
+    - ``IF(A) THEN(IF(A) THEN(x) ELSE(y))`` collapses to ``IF(A) THEN(x)`` —
+      the inner ELSE is unreachable once the outer guard already holds (an
+      ``IF EXISTS(... WHERE A)`` block wrapping ``UPDATE ... WHERE A``).
     - Inside ``IF(ISNOTEMPTY(col))``, an immediate ``IF(ISEMPTY(col))`` in
       THEN is unreachable.
     - Identical nested ELSEIF arms are collapsed.
@@ -614,8 +617,20 @@ def prune_redundant_ast(node: dict[str, Any] | None) -> dict[str, Any] | None:
     if cleaned.get("type") != "IF_THEN_ELSE":
         return cleaned
 
-    outer = _predicate_column(cleaned.get("condition"), "ISNOTEMPTY")
+    # Children are already pruned, so peeling repeated identical guards off
+    # the THEN side is enough (handles IF(A) THEN(IF(A) THEN(IF(A) ...))).
     then_branch = cleaned.get("then_branch")
+    condition_sig = _ast_signature(cleaned.get("condition"))
+    while (
+        isinstance(then_branch, dict)
+        and then_branch.get("type") == "IF_THEN_ELSE"
+        and "then_branch" in then_branch
+        and _ast_signature(then_branch.get("condition")) == condition_sig
+    ):
+        then_branch = then_branch.get("then_branch")
+        cleaned["then_branch"] = then_branch
+
+    outer = _predicate_column(cleaned.get("condition"), "ISNOTEMPTY")
     if outer and isinstance(then_branch, dict) and then_branch.get("type") == "IF_THEN_ELSE":
         inner = _predicate_column(then_branch.get("condition"), "ISEMPTY")
         if inner and inner == outer:
@@ -634,6 +649,31 @@ def prune_redundant_ast(node: dict[str, Any] | None) -> dict[str, Any] | None:
     if outer and _is_same_column_ref(cleaned.get("else_branch"), outer):
         cleaned.pop("else_branch", None)
     return cleaned
+
+
+_IDENTIFIER_KEYS = {"entity", "relationship", "column", "function_name", "name", "operator"}
+
+
+def _ast_signature(node: Any) -> Any:
+    """Hashable, comparison-only form of an AST subtree.
+
+    Drops ``_``-prefixed metadata (e.g. ``_dependency_refs`` attached when an
+    ``EXISTS(...)`` guard is projected to a row predicate, which the UPDATE's
+    own WHERE clause never carries) and case-folds identifiers, since SQL
+    names are case-insensitive. Literal values keep their case.
+    """
+    if isinstance(node, dict):
+        items = []
+        for key, value in node.items():
+            if str(key).startswith("_"):
+                continue
+            if key in _IDENTIFIER_KEYS and isinstance(value, str):
+                value = value.upper()
+            items.append((key, _ast_signature(value)))
+        return tuple(sorted(items))
+    if isinstance(node, list):
+        return tuple(_ast_signature(item) for item in node)
+    return node
 
 
 def _predicate_column(node: dict[str, Any] | None, function_name: str) -> tuple[str, str] | None:

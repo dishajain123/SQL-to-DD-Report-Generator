@@ -292,6 +292,76 @@ def test_phase3_outer_if_else_preserves_branch_order():
     assert formula.index('THEN("N")') < formula.index('THEN("Y")')
 
 
+def _grace_condition(**extra):
+    return {
+        "type": "BINARY_OP",
+        "operator": ">=",
+        "left": {
+            "type": "COLUMN_REF",
+            "entity": "LoanAccountCal",
+            "relationship": None,
+            "column": "LastPaymentDueDate",
+        },
+        "right": {"type": "VARIABLE_REF", "name": "@GraceWindowStart"},
+        **extra,
+    }
+
+
+def test_prune_collapses_nested_identical_condition():
+    from app.derivation.v2.phase2_mutation_folder import prune_redundant_ast
+
+    self_ref = {
+        "type": "COLUMN_REF",
+        "entity": "LoanAccountCal",
+        "relationship": None,
+        "column": "BucketWorsened",
+    }
+    n_lit = {"type": "LITERAL", "value_type": "STRING", "value": "N"}
+    node = {
+        "type": "IF_THEN_ELSE",
+        # Outer EXISTS guard carries projection metadata the WHERE lacks.
+        "condition": _grace_condition(_dependency_refs=["LoanAccountCal.LastPaymentDueDate"]),
+        "then_branch": {
+            "type": "IF_THEN_ELSE",
+            "condition": _grace_condition(),
+            "then_branch": n_lit,
+            "else_branch": self_ref,
+        },
+        "else_branch": self_ref,
+    }
+    pruned = prune_redundant_ast(node)
+    assert pruned["then_branch"] == n_lit
+    assert pruned["else_branch"] == self_ref
+
+    # A different inner condition is a real guard and must survive.
+    node["then_branch"]["condition"] = {**_grace_condition(), "operator": "<"}
+    assert prune_redundant_ast(node)["then_branch"]["type"] == "IF_THEN_ELSE"
+
+
+def test_bucket_worsened_has_no_nested_duplicate_guard():
+    sql = (ROOT / "samples" / "sql" / "07_DPD_Bucket_Classification.sql").read_text(
+        encoding="utf-8"
+    )
+    lineage = build_lineage_map(sql)
+    mutations = fold_column_mutations(sql, "LoanAccountCal", "BucketWorsened", lineage)
+    ast = build_ast_from_mutations(mutations, "LoanAccountCal", "BucketWorsened")
+
+    def walk(node):
+        if not isinstance(node, dict):
+            return
+        if node.get("type") == "IF_THEN_ELSE":
+            inner = node.get("then_branch")
+            if isinstance(inner, dict) and inner.get("type") == "IF_THEN_ELSE":
+                strip = lambda c: {k: v for k, v in (c or {}).items() if not k.startswith("_")}
+                assert strip(inner.get("condition")) != strip(node.get("condition"))
+        for value in node.values():
+            walk(value)
+
+    walk(ast)
+    _, debug = generate_for_sql(sql, "LoanAccountCal", "BucketWorsened")
+    assert validate_expression(debug["formula"]).valid
+
+
 def test_dpd_bucket_classification_verification_formulas():
     """Golden checks from the v2 bug-fix pass against sample 07."""
     sql = (ROOT / "samples" / "sql" / "07_DPD_Bucket_Classification.sql").read_text(
