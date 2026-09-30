@@ -8,6 +8,13 @@ from unittest.mock import patch
 import pytest
 from streamlit.testing.v1 import AppTest
 
+# The app script's heavy imports, loaded once at collection time. AppTest
+# counts the script's first run against its timeout, and a cold import of
+# pandas/openpyxl (slow on WSL /mnt/c) used to push that first run past 15s.
+import pandas  # noqa: F401
+import streamlit.components.v1  # noqa: F401
+from app.report import dd_export  # noqa: F401
+from app.review import local_api, review_store  # noqa: F401
 from app.review.sql_input import (
     bundled_sample_names,
     bundled_sql_file,
@@ -21,11 +28,20 @@ from app.utils import db
 # -- an absolute path is required so the test doesn't depend on where
 # pytest happens to be invoked from.
 STREAMLIT_APP_PATH = str(Path(__file__).resolve().parents[2] / "app" / "review" / "streamlit_app.py")
+# Headroom for slow filesystems; a healthy run finishes in a few seconds.
+APP_TIMEOUT = 60
 
 
 @pytest.fixture(autouse=True)
 def isolated_streamlit_db(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "settings", replace(db.settings, sqlite_db_path=str(tmp_path / "streamlit.db")))
+
+
+@pytest.fixture(autouse=True)
+def no_local_api_launch(monkeypatch):
+    """These tests cover SQL input → API payload. They must never start a real
+    uvicorn process (which outlives the test and holds port 8000)."""
+    monkeypatch.setattr(local_api, "ensure_local_api", lambda *_a, **_k: "")
 
 
 class _Response:
@@ -61,7 +77,7 @@ def test_bundled_sample_preview_and_submission():
     sql = (Path(__file__).resolve().parents[2] / "samples" / "sql" / name).read_bytes().decode("utf-8")
     captured = []
     with patch("urllib.request.urlopen", _capture_submissions(captured)):
-        app = AppTest.from_file(STREAMLIT_APP_PATH, default_timeout=15).run()
+        app = AppTest.from_file(STREAMLIT_APP_PATH, default_timeout=APP_TIMEOUT).run()
         assert not app.exception
         app.radio(key="sql-input-mode").set_value("Bundled sample").run()
         assert not app.exception
@@ -78,7 +94,7 @@ def test_pasted_sql_submission():
     sql = "CREATE PROCEDURE pasted_test AS SELECT 1;"
     captured = []
     with patch("urllib.request.urlopen", _capture_submissions(captured)):
-        app = AppTest.from_file(STREAMLIT_APP_PATH, default_timeout=15).run()
+        app = AppTest.from_file(STREAMLIT_APP_PATH, default_timeout=APP_TIMEOUT).run()
         app.radio(key="sql-input-mode").set_value("Paste SQL").run()
         app.text_area(key="pasted-sql-text").set_value(sql).run()
         assert any(sql == block.value for block in app.code)
@@ -95,7 +111,7 @@ def test_same_job_in_submission_and_review_has_unique_widget_keys(tmp_path, monk
         replace(db.settings, output_dir=str(tmp_path / "output")),
     )
     db.init_db()
-    db.record_job(job_id, "Acme Bank", "4X", "Generate DD", "COMPLETED")
+    db.record_job(job_id, "Default", "4X", "Generate DD", "COMPLETED")
     report = tmp_path / "report.md"
     report.write_text("# Business Understanding\n\nSample report.\n", encoding="utf-8")
     db.update_job_status(job_id, "COMPLETED", report_path=str(report))
@@ -124,7 +140,7 @@ def test_same_job_in_submission_and_review_has_unique_widget_keys(tmp_path, monk
         return _Response(b"test-csv-bytes")
 
     with patch("urllib.request.urlopen", fake_urlopen):
-        app = AppTest.from_file(STREAMLIT_APP_PATH, default_timeout=30).run()
+        app = AppTest.from_file(STREAMLIT_APP_PATH, default_timeout=APP_TIMEOUT).run()
         app.radio(key="sql-input-mode").set_value("Paste SQL").run()
         app.text_area(key="pasted-sql-text").set_value("CREATE PROCEDURE demo AS SELECT 1;").run()
         app.button[0].click().run()
@@ -138,7 +154,7 @@ def test_same_job_in_submission_and_review_has_unique_widget_keys(tmp_path, monk
 def test_submit_without_sql_does_not_call_api():
     captured = []
     with patch("urllib.request.urlopen", _capture_submissions(captured)):
-        app = AppTest.from_file(STREAMLIT_APP_PATH, default_timeout=15).run()
+        app = AppTest.from_file(STREAMLIT_APP_PATH, default_timeout=APP_TIMEOUT).run()
         app.button[0].click().run()
 
     assert not app.exception

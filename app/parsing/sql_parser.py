@@ -166,6 +166,15 @@ def _split_tsql_statement(stmt: str) -> list[str]:
 
     masked_lines = _strip_strings_and_comments(stmt).splitlines(keepends=True)
     case_depth = 0
+    # True once the DML statement a `;WITH cte AS (...)` consumes has already
+    # started. `buffer_lead` keeps reading "WITH" for the rest of that
+    # statement's lines (it's the leading word of the whole accumulated
+    # buffer, which never changes until the buffer is flushed), so without
+    # this the WITH carve-out below would also swallow the *next*,
+    # completely unrelated statement any time it happens to start with
+    # SELECT/UPDATE/DELETE/MERGE/INSERT -- gluing every following UPDATE in
+    # the file onto the first CTE it ever saw.
+    with_consumer_started = False
 
     for line, masked_line in zip(lines, masked_lines):
         stripped = _strip_leading_comments(line)
@@ -178,6 +187,7 @@ def _split_tsql_statement(stmt: str) -> list[str]:
             if buffer_text:
                 result.append(buffer_text)
                 buf = []
+                with_consumer_started = False
             continue
 
         should_split = (
@@ -213,15 +223,38 @@ def _split_tsql_statement(stmt: str) -> list[str]:
             "SELECT",
             "WITH",
         }
+        # `;WITH cte AS (...) UPDATE/DELETE/MERGE/INSERT ...` is one T-SQL
+        # statement -- the semicolon-prefixed CTE is vanishingly rare with a
+        # trailing SELECT in this corpus and near-universal with a trailing
+        # UPDATE (e.g. `;WITH CTE_NPA_UCIFID AS (...) UPDATE A SET ... FROM
+        # ##ACCOUNTCAL A INNER JOIN CTE_NPA_UCIFID B ON ...`). Splitting at
+        # that UPDATE/DELETE/MERGE/INSERT line severs the CTE definition from
+        # its only consumer: the CTE half fails to parse (a bare WITH with no
+        # query is invalid SQL) and shows up as a spurious "genuine parse
+        # failure" in the coverage ledger, while the UPDATE half loses the
+        # CTE's definition entirely, so sqlglot resolves the CTE alias as if
+        # it were a real physical source table instead of a re-read of
+        # whatever table the CTE actually selects from -- silently polluting
+        # the object's "tables read" with a name that was never a table.
+        is_with_awaiting_dml = (
+            should_split
+            and buffer_lead == "WITH"
+            and not with_consumer_started
+            and lead in {"SELECT", "UPDATE", "DELETE", "MERGE", "INSERT"}
+        )
+        if is_with_awaiting_dml:
+            with_consumer_started = True
+
         if (
             should_split
-            and not (buffer_lead == "WITH" and lead == "SELECT")
+            and not is_with_awaiting_dml
             and not is_update_awaiting_set
             and not is_insert_awaiting_source
             and not is_merge_clause
         ):
             result.append(buffer_text)
             buf = []
+            with_consumer_started = False
 
         buf.append(line)
         for token in re.findall(r"\b(?:CASE|END)\b", masked_line, re.IGNORECASE):
@@ -434,12 +467,89 @@ def classify_statement(stmt_text: str) -> str:
     first_word = first_word_match.group(0).upper() if first_word_match else ""
 
     if first_word == "WITH":
+        # T-SQL allows a CTE to prefix UPDATE/INSERT/DELETE/MERGE, not just
+        # SELECT (``;WITH cte AS (...) UPDATE t SET ... FROM cte ...``).
+        # Defaulting every WITH-led statement to SELECT is only right for the
+        # overwhelmingly common case; when it's wrong, the write target
+        # resolves to nothing later (see ``_tables_from_tree``'s SELECT
+        # branch and ``_apply_regex_write_fallback``), silently dropping the
+        # UPDATE's column writes from the whole pipeline.
+        after = _dml_keyword_after_cte(stripped)
+        if after in _DML_KEYWORDS:
+            return after
         return "SELECT"
     if first_word in _DML_KEYWORDS:
         return first_word
     if first_word in _CONTROL_KEYWORDS:
         return "CONTROL_FLOW"
     return "OTHER"
+
+
+def _dml_keyword_after_cte(text: str) -> str | None:
+    """The real statement keyword following a leading CTE list.
+
+    Scans past ``WITH name [(cols)] AS ( ... ) [, name2 AS ( ... )]*`` with
+    paren-depth tracking (over string/comment-masked text) so a CTE body's
+    own nested SELECT is never mistaken for the outer statement's type, and
+    returns whatever DML keyword (SELECT/UPDATE/INSERT/DELETE/MERGE) comes
+    right after the last CTE definition. Returns ``None`` when the text
+    doesn't start with WITH or the CTE list can't be parsed this way (the
+    caller falls back to treating it as a SELECT).
+    """
+    from app.parsing.write_inventory_scan import _strip_strings_and_comments
+
+    masked = _strip_strings_and_comments(text)
+    with_match = re.match(r"(?is)^\s*WITH\s+", masked)
+    if not with_match:
+        return None
+    i = with_match.end()
+    n = len(masked)
+
+    def _skip_ws(pos: int) -> int:
+        while pos < n and masked[pos].isspace():
+            pos += 1
+        return pos
+
+    def _skip_parens(pos: int) -> int | None:
+        if pos >= n or masked[pos] != "(":
+            return None
+        depth = 0
+        while pos < n:
+            if masked[pos] == "(":
+                depth += 1
+            elif masked[pos] == ")":
+                depth -= 1
+                pos += 1
+                if depth == 0:
+                    return pos
+                continue
+            pos += 1
+        return None  # unbalanced -- give up
+
+    while True:
+        i = _skip_ws(i)
+        name_match = re.match(r"[A-Za-z_][\w$]*", masked[i:])
+        if not name_match:
+            return None
+        i = _skip_ws(i + name_match.end())
+        after_parens = _skip_parens(i)
+        if after_parens is not None:
+            i = _skip_ws(after_parens)
+        as_match = re.match(r"(?i)AS\b", masked[i:])
+        if not as_match:
+            return None
+        i = _skip_ws(i + as_match.end())
+        body_end = _skip_parens(i)
+        if body_end is None:
+            return None
+        i = _skip_ws(body_end)
+        if i < n and masked[i] == ",":
+            i = _skip_ws(i + 1)
+            continue
+        break
+
+    kw_match = re.match(r"[A-Za-z]+", masked[i:])
+    return kw_match.group(0).upper() if kw_match else None
 
 
 def _leading_keyword_ignoring_comments(text: str) -> str:
@@ -524,28 +634,37 @@ def _apply_regex_write_fallback(info: StatementInfo) -> None:
     """
     text = _strip_leading_comments(info.raw_text or "")
     target = ""
-    if info.statement_type == "INSERT" or re.match(r"(?is)^\s*INSERT\b", text):
+
+    # A leading CTE can prefix UPDATE/INSERT/DELETE/MERGE, not just SELECT.
+    # Resolve the keyword that actually follows the CTE list up front so the
+    # generic "starts with WITH" catch-all below (correct only for the
+    # common WITH -> SELECT case) never shadows a real write statement and
+    # silently drops its target.
+    cte_dml_keyword = (
+        _dml_keyword_after_cte(text) if re.match(r"(?is)^\s*WITH\b", text) else None
+    )
+    is_cte_write = cte_dml_keyword in {"UPDATE", "INSERT", "DELETE", "MERGE", "TRUNCATE"}
+    effective_type = cte_dml_keyword if is_cte_write else info.statement_type
+
+    if effective_type == "INSERT" or re.match(r"(?is)^\s*INSERT\b", text):
         match = _INSERT_TARGET_RE.search(text)
         target = _clean_regex_table_name(match.group(1)) if match else ""
         info.statement_type = "INSERT"
-    elif info.statement_type == "MERGE" or re.match(r"(?is)^\s*MERGE\b", text):
+    elif effective_type == "MERGE" or re.match(r"(?is)^\s*MERGE\b", text):
         match = _MERGE_TARGET_RE.search(text)
         target = _clean_regex_table_name(match.group(1)) if match else ""
         info.statement_type = "MERGE"
-    elif info.statement_type == "TRUNCATE" or re.match(r"(?is)^\s*TRUNCATE\b", text):
+    elif effective_type == "TRUNCATE" or re.match(r"(?is)^\s*TRUNCATE\b", text):
         match = _TRUNCATE_TARGET_RE.search(text)
         target = _clean_regex_table_name(match.group(1)) if match else ""
         info.statement_type = "TRUNCATE"
-    elif info.statement_type == "DELETE" or re.match(r"(?is)^\s*DELETE\b", text):
+    elif effective_type == "DELETE" or re.match(r"(?is)^\s*DELETE\b", text):
         match = _DELETE_TARGET_RE.search(text)
         target = _clean_regex_table_name(match.group(1)) if match else ""
         info.statement_type = "DELETE"
-    elif info.statement_type == "SELECT" or re.match(r"(?is)^\s*(?:WITH\b|SELECT\b)", text):
-        match = _SELECT_INTO_TARGET_RE.search(text)
-        if match:
-            target = _clean_regex_table_name(match.group(1))
-            info.statement_type = "SELECT"
-    elif info.statement_type == "UPDATE" or re.match(r"(?is)^\s*UPDATE\b", text):
+    elif effective_type == "UPDATE" or (
+        not is_cte_write and re.match(r"(?is)^\s*UPDATE\b", text)
+    ):
         # Prefer UPDATE alias … FROM real_table alias over bare UPDATE alias.
         from_match = _UPDATE_FROM_ALIAS_RE.search(text)
         if from_match:
@@ -554,6 +673,13 @@ def _apply_regex_write_fallback(info: StatementInfo) -> None:
             match = _UPDATE_TARGET_RE.search(text)
             target = _clean_regex_table_name(match.group(1)) if match else ""
         info.statement_type = "UPDATE"
+    elif effective_type == "SELECT" or (
+        not is_cte_write and re.match(r"(?is)^\s*(?:WITH\b|SELECT\b)", text)
+    ):
+        match = _SELECT_INTO_TARGET_RE.search(text)
+        if match:
+            target = _clean_regex_table_name(match.group(1))
+            info.statement_type = "SELECT"
 
     if target and target not in info.tables_written:
         info.tables_written = sorted({*info.tables_written, target})
@@ -724,9 +850,31 @@ def _table_display_name(table: exp.Table | None) -> str | None:
     return name
 
 
+def _cte_names_from_tree(tree: exp.Expression) -> set[str]:
+    """Names defined by `WITH cte AS (...)` anywhere in the statement.
+
+    A CTE reference inside the main query (`... FROM ##T A INNER JOIN
+    CTE_NPA_UCIFID B ON ...`) is just an `exp.Table` node like any other to
+    sqlglot -- nothing marks it as "not a real table". Left uncorrected, a
+    statement built on a CTE reports that CTE's name as a physical source
+    table it read from, when the actual source is whatever table the CTE's
+    own body selects from (already captured separately by the lineage
+    engine's own CTE-projection handling).
+    """
+    return {cte.alias_or_name.upper() for cte in tree.find_all(exp.CTE) if cte.alias_or_name}
+
+
 def _tables_from_tree(tree: exp.Expression, stmt_type: str) -> tuple[list[str], list[str]]:
     table_nodes = [t for t in tree.find_all(exp.Table) if t.name]
-    all_tables = sorted({_table_display_name(t) or t.name for t in table_nodes})
+    cte_names = _cte_names_from_tree(tree)
+    all_tables = sorted(
+        {
+            name
+            for t in table_nodes
+            if (name := (_table_display_name(t) or t.name))
+            and _normalize_table_token(name) not in cte_names
+        }
+    )
 
     written: set[str] = set()
     if stmt_type in ("UPDATE", "INSERT", "DELETE", "TRUNCATE"):
@@ -790,8 +938,19 @@ def _resolve_target_table_name(tree: exp.Expression, stmt_type: str) -> tuple[st
         if delete_node is None:
             return None, None, set()
         target = delete_node.this
+        # T-SQL multi-table form ``DELETE A FROM T1 X JOIN T2 A ON …``: sqlglot
+        # puts the deleted alias in ``tables`` and the FROM (with joins) in
+        # ``this`` — the target is whichever FROM/JOIN table carries that alias.
+        named = [t for t in (delete_node.args.get("tables") or []) if isinstance(t, exp.Table)]
+        if named and isinstance(target, exp.Table):
+            wanted = named[0].name.upper()
+            for candidate in target.find_all(exp.Table):
+                if (candidate.alias_or_name or "").upper() == wanted:
+                    return _table_display_name(candidate), wanted, {named[0].name}
         if isinstance(target, exp.Table):
             return _table_display_name(target), target.alias_or_name or None, set()
+        if named:  # ``DELETE PRO.T WHERE …`` (T-SQL allows omitting FROM)
+            return _table_display_name(named[0]), named[0].alias_or_name or None, set()
         return None, None, set()
 
     if stmt_type != "UPDATE":

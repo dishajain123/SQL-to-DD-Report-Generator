@@ -38,7 +38,7 @@ def _row(**overrides) -> DDRow:
 
 
 def test_report_uses_required_structure_and_rule_ids(tmp_path):
-    job_plan = JobPlan(job_id="job-1", intent=Intent.GENERATE_DD, company="Acme", platform="4X")
+    job_plan = JobPlan(job_id="job-1", intent=Intent.GENERATE_DD, company="Default", platform="4X")
     model = CanonicalModel(
         chain_id="chain-1",
         job_id="job-1",
@@ -98,7 +98,7 @@ def test_report_uses_required_structure_and_rule_ids(tmp_path):
 
 
 def test_platform_condition_is_preserved_and_explanation_is_separate(tmp_path):
-    job_plan = JobPlan(job_id="job-4", intent=Intent.GENERATE_DD, company="Acme", platform="4X")
+    job_plan = JobPlan(job_id="job-4", intent=Intent.GENERATE_DD, company="Default", platform="4X")
     model = CanonicalModel(
         chain_id="chain-4",
         job_id="job-4",
@@ -128,7 +128,7 @@ def test_platform_condition_is_preserved_and_explanation_is_separate(tmp_path):
 
 
 def test_operational_fields_are_grouped_without_status_noise(tmp_path):
-    job_plan = JobPlan(job_id="job-3", intent=Intent.GENERATE_DD, company="Acme", platform="4X")
+    job_plan = JobPlan(job_id="job-3", intent=Intent.GENERATE_DD, company="Default", platform="4X")
     model = CanonicalModel(
         chain_id="chain-3",
         job_id="job-3",
@@ -154,7 +154,7 @@ def test_operational_fields_are_grouped_without_status_noise(tmp_path):
 
 
 def test_report_omits_status_even_when_formula_is_missing(tmp_path):
-    job_plan = JobPlan(job_id="job-2", intent=Intent.GENERATE_DD, company="Acme", platform="4X")
+    job_plan = JobPlan(job_id="job-2", intent=Intent.GENERATE_DD, company="Default", platform="4X")
     model = CanonicalModel(
         chain_id="chain-2",
         job_id="job-2",
@@ -186,7 +186,7 @@ def test_report_omits_status_even_when_formula_is_missing(tmp_path):
 
 
 def test_report_renders_cleanup_null_conditions_with_human_readable_explanation(tmp_path):
-    job_plan = JobPlan(job_id="job-6", intent=Intent.GENERATE_DD, company="Acme", platform="4X")
+    job_plan = JobPlan(job_id="job-6", intent=Intent.GENERATE_DD, company="Default", platform="4X")
     model = CanonicalModel(
         chain_id="chain-6",
         job_id="job-6",
@@ -217,7 +217,7 @@ def test_report_renders_cleanup_null_conditions_with_human_readable_explanation(
 
 
 def test_tables_involved_combines_read_and_written(tmp_path):
-    job_plan = JobPlan(job_id="job-5", intent=Intent.GENERATE_DD, company="Acme", platform="4X")
+    job_plan = JobPlan(job_id="job-5", intent=Intent.GENERATE_DD, company="Default", platform="4X")
     model = CanonicalModel(
         chain_id="chain-5",
         job_id="job-5",
@@ -451,7 +451,7 @@ def test_report_dependency_extraction_preserves_exact_table_casing():
 
 
 def test_report_resolves_aliases_to_source_table_names(tmp_path):
-    job_plan = JobPlan(job_id="job-5", intent=Intent.GENERATE_DD, company="Acme", platform="4X")
+    job_plan = JobPlan(job_id="job-5", intent=Intent.GENERATE_DD, company="Default", platform="4X")
     model = CanonicalModel(
         chain_id="chain-5",
         job_id="job-5",

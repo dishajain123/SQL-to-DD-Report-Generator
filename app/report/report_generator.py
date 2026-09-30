@@ -238,7 +238,7 @@ def _process_name(job_plan: JobPlan, canonical_models: list[CanonicalModel], obj
             object_names.append(name)
     if object_names:
         return ", ".join(object_names)
-    return f"{job_plan.company} {job_plan.platform}"
+    return f"{job_plan.platform} job {job_plan.job_id}"
 
 
 def _extract_dependencies(expression: str, known_names: frozenset[str] = frozenset()) -> list[str]:
@@ -697,6 +697,87 @@ def _is_merge_branch_fragment(stmt: "StatementInfo") -> bool:
     return False
 
 
+def _control_context_annotator(sql: str):
+    """Return ``annotate(raw_statement) -> suffix`` naming the statement's
+    procedure-level context: a workflow gate arm, a plain ELSE arm, or the
+    CATCH handler. Statements are located in order in the comment-stripped,
+    whitespace-collapsed source; one that cannot be found gets no suffix.
+    """
+    from app.derivation.v2.sql_text import (
+        extract_catch_spans,
+        extract_if_else_chains,
+        extract_workflow_gates,
+        strip_sql_comments,
+    )
+
+    stripped = strip_sql_comments(sql or "")
+    collapsed_chars: list[str] = []
+    origin: list[int] = []
+    previous_space = False
+    for idx, ch in enumerate(stripped):
+        if ch.isspace():
+            if previous_space:
+                continue
+            ch, previous_space = " ", True
+        else:
+            previous_space = False
+        collapsed_chars.append(ch.upper())
+        origin.append(idx)
+    collapsed = "".join(collapsed_chars)
+    spans = extract_if_else_chains(stripped)
+    gates = {(g.group_id, g.index): g for g in extract_workflow_gates(stripped)}
+    catches = extract_catch_spans(stripped)
+    cursor = 0
+
+    def annotate(raw: str) -> str:
+        nonlocal cursor
+        needle = " ".join((strip_sql_comments(raw or "")).split()).upper()[:80]
+        if not needle:
+            return ""
+        found = collapsed.find(needle, cursor)
+        if found < 0:
+            return ""
+        cursor = found + 1
+        pos = origin[found]
+        if any(start <= pos < end for start, end in catches):
+            return " *(exception handler — runs only if the main path fails)*"
+        for span in spans:
+            if not (span.body_start <= pos < span.body_end):
+                continue
+            gate = gates.get((span.group_id, span.index))
+            if gate is not None:
+                return f" *(only when procedure-wide {gate.name} holds)*"
+            group_gates = [g.name for g in gates.values() if g.group_id == span.group_id]
+            if span.kind == "ELSE" and group_gates:
+                return f" *(only when none of {', '.join(group_gates)} hold)*"
+        return ""
+
+    return annotate
+
+
+def _procedure_gate_lines(objects: dict[str, SQLObject], object_ids: list[str]) -> list[str]:
+    from app.derivation.v2.sql_text import extract_workflow_gates
+
+    lines: list[str] = []
+    for oid in object_ids:
+        sql = getattr(objects.get(oid), "raw_sql", "") or ""
+        for gate in extract_workflow_gates(sql):
+            lines.append(f"- **{gate.name}:** `IF {gate.condition}`")
+    if not lines:
+        return []
+    return [
+        "### Procedural Context — Procedure-wide Gates",
+        "",
+        "These `IF` conditions are tested once per run against the whole table, and "
+        "only the first branch that holds runs. The platform conditions below cannot "
+        "express a run-level test, so they apply each branch's own row conditions "
+        "row by row; see each affected rule's procedural-context note.",
+        "",
+        *lines,
+        "",
+    ]
+
+
 def _process_flow_steps(
     canonical_models: list[CanonicalModel],
     objects: dict[str, SQLObject],
@@ -719,12 +800,14 @@ def _process_flow_steps(
         info = structural_infos.get(oid)
         if info is None:
             continue
+        annotate = _control_context_annotator(getattr(objects.get(oid), "raw_sql", "") or "")
         for stmt in info.statements:
             kind = (stmt.statement_type or "").upper()
             if kind in {"", "UNKNOWN", "DECLARE", "SET_VAR", "BEGIN", "END", "COMMIT", "ROLLBACK", "PRINT"}:
                 continue
             if _is_merge_branch_fragment(stmt):
                 continue
+            context = annotate(stmt.raw_text or "")
 
             written_cols = {
                 c.split(".")[-1]
@@ -765,23 +848,23 @@ def _process_flow_steps(
             source = f" from {', '.join(read)}" if read else ""
 
             if kind == "UPDATE":
-                steps.append(f"Update {target}{col_text}.")
+                steps.append(f"Update {target}{col_text}.{context}")
             elif kind == "INSERT":
-                steps.append(f"Insert into {target}{col_text}{source}.")
+                steps.append(f"Insert into {target}{col_text}{source}.{context}")
             elif kind == "MERGE":
-                steps.append(f"Merge into {target}{col_text}{source}.")
+                steps.append(f"Merge into {target}{col_text}{source}.{context}")
             elif kind == "DELETE":
-                steps.append(f"Delete from {target}.")
+                steps.append(f"Delete from {target}.{context}")
             elif kind == "SELECT":
                 if "INTO" in (stmt.raw_text or "").upper() or cols:
-                    steps.append(f"Load {target}{source}.")
+                    steps.append(f"Load {target}{source}.{context}")
                 elif read:
-                    steps.append(f"Read from {', '.join(read)}.")
+                    steps.append(f"Read from {', '.join(read)}.{context}")
             elif kind == "CONTROL_FLOW":
                 if cols:
-                    steps.append(f"Apply conditional updates on {target}{col_text}.")
+                    steps.append(f"Apply conditional updates on {target}{col_text}.{context}")
             elif cols:
-                steps.append(f"Process {target}{col_text}.")
+                steps.append(f"Process {target}{col_text}.{context}")
 
     deduped: list[str] = []
     for step in steps:
@@ -873,6 +956,9 @@ def _process_overview_lines(
             lines.append("1. Execute the uploaded procedure and apply the derived platform conditions.")
     lines.append("")
 
+    object_ids = list(dict.fromkeys(oid for model in canonical_models for oid in model.object_ids))
+    lines.extend(_procedure_gate_lines(objects, object_ids))
+
     lines.extend(_tables_involved_lines(canonical_models, objects, structural_infos))
     return lines
 
@@ -881,34 +967,98 @@ def _rule_display_name(rule: "_RuleGroup") -> str:
     return f"Determine {rule.column_name} ({rule.entity_name})"
 
 
-def _rule_summary_table_lines(business_groups: list[_RuleGroup], technical_groups: list[_RuleGroup]) -> list[str]:
+def _rule_summary_table_lines(rules: list[_RuleGroup]) -> list[str]:
     lines: list[str] = ["## Business Rule Summary", ""]
-    all_rules = business_groups + technical_groups
-    if not all_rules:
+    if not rules:
         lines.append("- No DD rows were generated for this job.")
         lines.append("")
         return lines
 
-    lines.append("| Rule | Affected Field | Business Purpose |")
-    lines.append("|---|---|---|")
-    for rule in all_rules:
+    lines.append("Rules are listed in the order the procedure executes them.")
+    lines.append("")
+    lines.append("| Step | Rule | Affected Field | Business Purpose |")
+    lines.append("|---|---|---|---|")
+    for step, rule in enumerate(rules, 1):
         anchor = _slugify(rule.rule_id, rule.column_name)
         label = _rule_display_name(rule)
         purpose = rule.business_meaning or "Not specified"
         affected = f"{rule.entity_name}.{rule.column_name}" if rule.entity_name else rule.column_name
         lines.append(
-            f"| [{label}](#{anchor}) | `{affected}` | {_flatten_for_table_cell(purpose)} |"
+            f"| {step} | [{label}](#{anchor}) | `{affected}` | {_flatten_for_table_cell(purpose)} |"
         )
     lines.append("")
     return lines
 
 
-def _rule_card_lines(rule: _RuleGroup) -> list[str]:
+def _execution_context_lines(rule: _RuleGroup) -> list[str]:
+    """Workflow gates, the step-by-step write sequence, and the CATCH path."""
+    row = rule.rows[0]
+    lines: list[str] = []
+    if row.workflow_gates:
+        lines.append("**Procedural context / advisory:**")
+        lines.append("")
+        for gate in row.workflow_gates:
+            name, _, condition = gate.partition(" := ")
+            lines.append(f"- {name}: `{condition}` is tested once per run against the whole table.")
+        lines.append(
+            "- The condition above applies each branch's row-level test directly. In SQL, "
+            "only the first branch whose gate holds runs at all, so exact behaviour needs "
+            "a platform workflow step that evaluates the gate."
+        )
+        lines.append("")
+
+    steps = row.execution_steps
+    show_steps = len(steps) > 1 or any(
+        s.notes or s.workflow_gate or s.join_conditions for s in steps
+    )
+    if show_steps:
+        lines.append("**Execution sequence:**")
+        lines.append("")
+        lines.append("| Step | Line | Scope | Gate | Row condition | Joined via | Value |")
+        lines.append("|---|---|---|---|---|---|---|")
+        for step in steps:
+            joins = "; ".join(step.join_conditions)
+            lines.append(
+                f"| {step.step} | {step.source_line or '—'} | {step.scope} | "
+                f"{_flatten_for_table_cell(step.workflow_gate or '') or '—'} | "
+                f"`{_flatten_for_table_cell(step.row_condition) or '(all rows)'}` | "
+                f"{('`' + _flatten_for_table_cell(joins) + '`') if joins else '—'} | "
+                f"`{_flatten_for_table_cell(step.assigned_value)}` |"
+            )
+        lines.append("")
+        for step in steps:
+            for note in step.notes:
+                if note.startswith(("Overwritten", "State reset")):
+                    lines.append(f"> **Step {step.step}:** {note}")
+                    lines.append("")
+
+    if row.exception_handler_expression:
+        lines.append(
+            "**Exception handler (CATCH) path** — runs only if the main path fails; "
+            "not part of the platform condition above:"
+        )
+        lines.append("")
+        lines.append("```text")
+        lines.append(row.exception_handler_expression)
+        lines.append("```")
+        lines.append("")
+    elif steps and all(s.scope != "Main" for s in steps):
+        lines.append(
+            "**Scope:** Exception handler (CATCH) only — this condition applies only "
+            "when the procedure fails."
+        )
+        lines.append("")
+    return lines
+
+
+def _rule_card_lines(rule: _RuleGroup, step_number: int | None = None) -> list[str]:
     anchor = _slugify(rule.rule_id, rule.column_name)
     lines: list[str] = []
     lines.append(f'<a id="{anchor}"></a>')
     lines.append(f"#### {_rule_display_name(rule)}")
     lines.append("")
+    if step_number is not None:
+        lines.append(f"**Execution Step:** {step_number}  ")
     lines.append(f"**Table:** `{rule.entity_name}`  ")
     lines.append(f"**Column:** `{rule.column_name}`  ")
     if rule.effective_dates and rule.effective_dates != "—":
@@ -930,6 +1080,8 @@ def _rule_card_lines(rule: _RuleGroup) -> list[str]:
     lines.extend(explanation.splitlines() or [explanation])
     lines.append("")
 
+    lines.extend(_execution_context_lines(rule))
+
     if rule.depends_on:
         lines.append("**Depends On**")
         for dep in rule.depends_on:
@@ -941,24 +1093,25 @@ def _rule_card_lines(rule: _RuleGroup) -> list[str]:
     return lines
 
 
-def _detailed_rules_lines(business_groups: list[_RuleGroup], technical_groups: list[_RuleGroup]) -> list[str]:
+def _detailed_rules_lines(rules: list[_RuleGroup], operational: set[str]) -> list[str]:
+    """Rule cards in execution order; a heading marks each change of table."""
     lines: list[str] = ["## Detailed Business Rules & DD Conditions", ""]
-    if not business_groups and not technical_groups:
+    if not rules:
         lines.append("- No DD rows were generated for this job.")
         return lines
 
-    for entity_name, rules in _rules_by_entity(business_groups):
-        lines.append(f"### {entity_name}")
-        lines.append("")
-        for rule in rules:
-            lines.extend(_rule_card_lines(rule))
-
-    if technical_groups:
-        lines.append("### Operational / housekeeping fields")
-        lines.append("")
-        for entity_name, rules in _rules_by_entity(technical_groups):
-            for rule in rules:
-                lines.extend(_rule_card_lines(rule))
+    current_entity: str | None = None
+    for step, rule in enumerate(rules, 1):
+        if rule.entity_name != current_entity:
+            current_entity = rule.entity_name
+            suffix = (
+                " — Operational / housekeeping fields"
+                if rule.entity_name in operational
+                else ""
+            )
+            lines.append(f"### {rule.entity_name}{suffix}")
+            lines.append("")
+        lines.extend(_rule_card_lines(rule, step))
 
     return lines
 
@@ -971,16 +1124,17 @@ def generate_report(
     objects: dict[str, SQLObject] | None = None,
     structural_infos: dict[str, StructuralInfo] | None = None,
 ) -> Path:
+    from app.report.dd_export import execution_ordered
+
     objects = objects or {}
-    rule_groups = _build_rule_groups(dd_rows, objects)
-    entity_groups = _rules_by_entity(rule_groups)
-    business_groups: list[_RuleGroup] = []
-    technical_groups: list[_RuleGroup] = []
-    for entity_name, rules in entity_groups:
-        if _is_operational_entity(entity_name, rules):
-            technical_groups.extend(rules)
-        else:
-            business_groups.extend(rules)
+    # Rules read top to bottom in the order the SQL executes them — never
+    # regrouped by table or column name, which would hide overwrite order.
+    rule_groups = _build_rule_groups(execution_ordered(list(dd_rows)), objects)
+    operational = {
+        entity_name
+        for entity_name, rules in _rules_by_entity(rule_groups)
+        if _is_operational_entity(entity_name, rules)
+    }
 
     process_name = _process_name(job_plan, canonical_models, objects)
     top_summary = _first_sentence(next((model.business_summary for model in canonical_models if model.business_summary.strip()), ""))
@@ -998,7 +1152,7 @@ def generate_report(
             canonical_models,
             objects,
             structural_infos,
-            business_rule_count=len(business_groups) + len(technical_groups),
+            business_rule_count=len(rule_groups),
         )
     )
 
@@ -1010,9 +1164,9 @@ def generate_report(
     lines.extend(_process_overview_lines(job_plan, canonical_models, objects, structural_infos))
     lines.append("")
 
-    lines.extend(_rule_summary_table_lines(business_groups, technical_groups))
+    lines.extend(_rule_summary_table_lines(rule_groups))
 
-    lines.extend(_detailed_rules_lines(business_groups, technical_groups))
+    lines.extend(_detailed_rules_lines(rule_groups, operational))
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)

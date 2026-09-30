@@ -31,7 +31,7 @@ def test_structural_errors_surface_as_qa_coverage_blockers(monkeypatch, tmp_path
     job_plan = JobPlan(
         job_id="job-structural-errors-1",
         intent=Intent.GENERATE_DD,
-        company="Acme Bank",
+        company="Default",
         platform="4X",
     )
     state = {

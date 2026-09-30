@@ -97,8 +97,25 @@ def _ensure_job_columns(conn: sqlite3.Connection) -> None:
 def get_connection(db_path: str | None = None):
     path = db_path or settings.sqlite_db_path
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, timeout=5)
+    conn = sqlite3.connect(path, timeout=30)
     conn.row_factory = sqlite3.Row
+    # The API process (running a job in a background task) and the Streamlit
+    # review UI are two separate OS processes opening their own short-lived
+    # connection to this same file for every call. SQLite's default
+    # rollback-journal mode takes a whole-file lock for the entire duration
+    # of any write transaction, so a plain SELECT from the review tab
+    # (`_list_jobs` polling while a job updates its stage/DD rows) collides
+    # with that lock and raises "database is locked" under completely
+    # ordinary use -- not a rare race. WAL lets readers run concurrently
+    # with a single writer, which is exactly this app's access pattern.
+    # `busy_timeout` covers the remaining writer-vs-writer case (two jobs
+    # updating status at nearly the same instant) by waiting instead of
+    # failing immediately; it's a PRAGMA (not just the Python-level
+    # `timeout=` above) so it also applies to statements run via
+    # `executescript`/`executemany`, not only the connection's own default
+    # busy handler.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     try:
         yield conn
         conn.commit()

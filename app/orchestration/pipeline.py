@@ -85,8 +85,13 @@ def _set_stage(state: PipelineState, stage: str) -> None:
 
 def node_split_and_parse(state: PipelineState) -> PipelineState:
     _set_stage(state, "Parsing SQL")
+    from app.utils.text_encoding import normalize_sql_text
+
     objects: dict[str, SQLObject] = {}
     for filename, content in state["uploaded_files"].items():
+        # API clients send already-decoded text; repair a UTF-16 file that a
+        # client decoded as latin-1 (NUL-interleaved) and drop a stray BOM.
+        content = normalize_sql_text(content)
         dialect = detect_dialect(content)
         for obj in split_objects(content, filename, dialect):
             objects[obj.object_id] = obj

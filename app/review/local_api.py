@@ -10,9 +10,9 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib import request
 from urllib.error import URLError
 from urllib.parse import urlparse
-from urllib.request import urlopen
 
 _LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 _api_process: subprocess.Popen | None = None
@@ -34,9 +34,13 @@ def _endpoint(api_base_url: str) -> tuple[str, int] | None:
 
 
 def api_is_up(api_base_url: str, timeout: float = 1.5) -> bool:
-    health = api_base_url.rstrip("/") + "/health"
+    # Resolve ``request.urlopen`` at call time (not ``from urllib.request
+    # import urlopen``): a name bound at import time ignores any later patch
+    # of ``urllib.request.urlopen``, so tests that fake the API still probed
+    # the real port 8000 and spawned a real uvicorn server.
+    health = request.Request(api_base_url.rstrip("/") + "/health", method="GET")
     try:
-        with urlopen(health, timeout=timeout) as resp:
+        with request.urlopen(health, timeout=timeout) as resp:
             return resp.status < 500
     except (URLError, TimeoutError, OSError):
         return False

@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import re
+from bisect import bisect_left
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 
 from app.utils.entity_name_map import resolve_entity_name
@@ -13,9 +15,36 @@ _STMT_START = re.compile(
     r"|IF|BEGIN|ELSE)\b"
 )
 
+_CACHE_MIN_CHARS = 4000
+
+
 def strip_sql_comments(sql: str) -> str:
     """Remove ``--`` line comments and ``/* */`` block comments."""
+    sql = sql or ""
+    if len(sql) >= _CACHE_MIN_CHARS:
+        return _strip_large(sql)
+    return _strip_sql_comments_impl(sql, with_map=False)[0]
+
+
+@lru_cache(maxsize=16)
+def _strip_large(sql: str) -> str:
+    return _strip_sql_comments_impl(sql, with_map=False)[0]
+
+
+@lru_cache(maxsize=8)
+def _strip_sql_comments_with_map(sql: str) -> tuple[str, list[int]]:
+    """Comment-stripped text plus, per output char, its offset in ``sql``."""
+    return _strip_sql_comments_impl(sql or "", with_map=True)
+
+
+def _strip_sql_comments_impl(sql: str, *, with_map: bool) -> tuple[str, list[int]]:
     out: list[str] = []
+    origin: list[int] = []
+    if not with_map:
+        # Same scanner without the per-character offset bookkeeping.
+        origin_append = lambda _i: None  # noqa: E731
+    else:
+        origin_append = origin.append
     i = 0
     n = len(sql)
     in_single = False
@@ -24,9 +53,11 @@ def strip_sql_comments(sql: str) -> str:
         nxt = sql[i + 1] if i + 1 < n else ""
         if in_single:
             out.append(ch)
+            origin_append(i)
             if ch == "'":
                 if nxt == "'":
                     out.append(nxt)
+                    origin_append(i + 1)
                     i += 2
                     continue
                 in_single = False
@@ -35,6 +66,7 @@ def strip_sql_comments(sql: str) -> str:
         if ch == "'":
             in_single = True
             out.append(ch)
+            origin_append(i)
             i += 1
             continue
         if ch == "-" and nxt == "-":
@@ -49,8 +81,27 @@ def strip_sql_comments(sql: str) -> str:
             i = min(n, i + 2)
             continue
         out.append(ch)
+        origin_append(i)
         i += 1
-    return "".join(out)
+    return "".join(out), origin
+
+
+@lru_cache(maxsize=8)
+def _newline_offsets(sql: str) -> list[int]:
+    return [i for i, ch in enumerate(sql) if ch == "\n"]
+
+
+def stripped_offset_to_line(sql: str, offset: int) -> int | None:
+    """1-based line in the original ``sql`` for an offset in its stripped text.
+
+    Statement positions throughout v2 are comment-stripped offsets; reports
+    need the line a reviewer will find in the file they uploaded.
+    """
+    _, origin = _strip_sql_comments_with_map(sql or "")
+    if not origin or offset < 0:
+        return None
+    original = origin[min(offset, len(origin) - 1)]
+    return bisect_left(_newline_offsets(sql or ""), original) + 1
 
 
 def split_csv_respecting_parens(text: str) -> list[str]:
@@ -105,8 +156,16 @@ def bare_ident(name: str) -> str:
     return (name or "").strip().strip("[]").strip('"').strip()
 
 
-_TABLE_TOKEN = r"(?:\[?#?#?[A-Za-z_][A-Za-z0-9_]*\]?(?:\.\[[A-Za-z_][A-Za-z0-9_]*\]|\.[A-Za-z_][A-Za-z0-9_]*)?)"
-_ALIAS_TOKEN = r"(?:AS\s+)?(?P<alias>(?!ON\b|WHERE\b|JOIN\b|LEFT\b|RIGHT\b|INNER\b|OUTER\b|FULL\b|CROSS\b|GROUP\b|ORDER\b|SET\b|FROM\b)[A-Za-z_][A-Za-z0-9_]*)"
+# One to three dotted parts: Table, Schema.Table, Db.Schema.Table (each
+# optionally [bracketed]). A two-part limit truncated "DB.PRO.T" to "DB.PRO".
+_TABLE_TOKEN = r"(?:\[?#?#?[A-Za-z_][A-Za-z0-9_]*\]?(?:\.\[?#?#?[A-Za-z_][A-Za-z0-9_]*\]?){0,2})"
+_ALIAS_TOKEN = (
+    r"(?:AS\s+)?(?P<alias>(?!(?:ON|WHERE|JOIN|LEFT|RIGHT|INNER|OUTER|FULL|CROSS|APPLY|"
+    r"GROUP|ORDER|SET|FROM|WITH|OPTION|UNION)\b)[A-Za-z_][A-Za-z0-9_]*)"
+)
+# T-SQL table hints — ``WITH (NOLOCK)`` — may follow a table or its alias.
+_TABLE_HINT = r"(?:\s+WITH\s*\([^)]*\))?"
+_JOIN_KEYWORD = r"(?:(?:LEFT|RIGHT|FULL)(?:\s+OUTER)?|INNER|CROSS)\s+JOIN|JOIN"
 
 
 def parse_from_join_clause(from_body: str) -> list[tuple[str, str | None, str | None]]:
@@ -121,12 +180,15 @@ def parse_from_join_clause(from_body: str) -> list[tuple[str, str | None, str | 
         text = "FROM " + text
 
     results: list[tuple[str, str | None, str | None]] = []
-    # Split roughly on JOIN keywords while keeping JOIN type words out of aliases.
+    # Split on JOIN keywords (incl. LEFT/RIGHT/FULL OUTER JOIN) while keeping
+    # join-type words and table hints out of aliases and ON clauses: the ON
+    # body stops at the next complete join keyword, so "… LEFT OUTER" never
+    # leaks into the previous join's condition.
     pattern = re.compile(
-        rf"(?is)\b(?:FROM|(?:LEFT|RIGHT|INNER|OUTER|FULL|CROSS)\s+JOIN|JOIN)\s+"
-        rf"(?P<table>{_TABLE_TOKEN})"
-        rf"(?:\s+{_ALIAS_TOKEN})?"
-        rf"(?:\s+ON\s+(?P<on>.+?)(?=\b(?:LEFT|RIGHT|INNER|OUTER|FULL|CROSS)\s+JOIN\b|\bJOIN\b|\bWHERE\b|\bGROUP\b|\bORDER\b|$))?"
+        rf"(?is)\b(?:FROM|{_JOIN_KEYWORD})\s+"
+        rf"(?P<table>{_TABLE_TOKEN}){_TABLE_HINT}"
+        rf"(?:\s+{_ALIAS_TOKEN})?{_TABLE_HINT}"
+        rf"(?:\s+ON\s+(?P<on>.+?)(?=\b(?:{_JOIN_KEYWORD})\b|\bWHERE\b|\bGROUP\b|\bORDER\b|\bOPTION\b|$))?"
     )
     for match in pattern.finditer(text):
         table = normalize_table_name(match.group("table"))
@@ -136,32 +198,119 @@ def parse_from_join_clause(from_body: str) -> list[tuple[str, str | None, str | 
     return results
 
 
+def parse_from_join_clause_with_type(
+    from_body: str,
+) -> list[tuple[str, str | None, str | None, str]]:
+    """Like :func:`parse_from_join_clause`, but each entry also carries its
+    join keyword ("FROM", "JOIN", "INNER JOIN", "LEFT JOIN", ...), upper-cased
+    and whitespace-normalized.
+
+    Needed wherever INNER-vs-OUTER semantics matter: an INNER (or plain,
+    unqualified) JOIN's ON-clause predicates restrict which driving rows
+    the statement ever touches, exactly like a WHERE term would — but a
+    LEFT/RIGHT/FULL JOIN's ON-clause predicates only decide whether the
+    *joined* side matches, and never remove a driving row from the result.
+    Folding the two cases the same way would be correct for the former and
+    wrong for the latter.
+    """
+    text = (from_body or "").strip()
+    if not text:
+        return []
+    if not re.match(r"(?is)^(FROM|JOIN)\b", text):
+        text = "FROM " + text
+
+    results: list[tuple[str, str | None, str | None, str]] = []
+    pattern = re.compile(
+        rf"(?is)\b(?P<kw>FROM|{_JOIN_KEYWORD})\s+"
+        rf"(?P<table>{_TABLE_TOKEN}){_TABLE_HINT}"
+        rf"(?:\s+{_ALIAS_TOKEN})?{_TABLE_HINT}"
+        rf"(?:\s+ON\s+(?P<on>.+?)(?=\b(?:{_JOIN_KEYWORD})\b|\bWHERE\b|\bGROUP\b|\bORDER\b|\bOPTION\b|$))?"
+    )
+    for match in pattern.finditer(text):
+        table = normalize_table_name(match.group("table"))
+        alias = match.groupdict().get("alias")
+        on_clause = (match.group("on") or "").strip() or None
+        join_type = re.sub(r"\s+", " ", (match.group("kw") or "").strip()).upper()
+        results.append((table, alias, on_clause, join_type))
+    return results
+
+
+# Performance rule for every scanner in this module: match keywords with a
+# compiled pattern AT a position — ``_KW.match(text, i)`` — never
+# ``re.match(p, text[i:])``. The slice copies the rest of the file on every
+# call; inside a per-character loop that is O(n²) bytes per scan, which made a
+# 150 KB production procedure take hours in "Generating derivation rows".
+_UPDATE_KW = re.compile(r"(?is)\bUPDATE\b")
+_WS_SET_KW = re.compile(r"(?is)\s+SET\b")
+_SET_KW = re.compile(r"(?is)\bSET\b")
+_FROM_KW = re.compile(r"(?is)FROM\b")
+_WHERE_KW = re.compile(r"(?is)WHERE\b")
+_BEGIN_KW = re.compile(r"(?is)BEGIN\b")
+_CASE_KW = re.compile(r"(?is)CASE\b")
+_END_KW = re.compile(r"(?is)END\b")
+_IF_KW = re.compile(r"(?is)IF\b")
+_IF_OBJECT_ID = re.compile(r"(?is)IF\s+OBJECT_ID\b")
+_ELSE_IF_KW = re.compile(r"(?is)ELSE\s+IF\b|ELSEIF\b")
+_ELSE_KW = re.compile(r"(?is)ELSE\b")
+_UPDATE_AT = re.compile(r"(?is)UPDATE\b")
+_END_OR_ELSE = re.compile(r"(?is)(END|ELSE)\b")
+
+
+def _cached(func):
+    """Memoise a whole-SQL scanner by its input text.
+
+    Each DD column re-runs the same scanners over the same procedure; for a
+    150-column procedure that repeated the identical full-text work 150×.
+    Results are returned as fresh shallow copies so callers may mutate them.
+    """
+    from functools import wraps
+
+    @lru_cache(maxsize=16)
+    def cached(sql: str):
+        return func(sql)
+
+    @wraps(func)
+    def wrapper(sql: str):
+        sql = sql or ""
+        # Small inputs (single statements, fragments) are cheap and numerous;
+        # caching them would evict the one large procedure text that matters.
+        result = cached(sql) if len(sql) >= _CACHE_MIN_CHARS else func(sql)
+        if isinstance(result, list):
+            return [dict(item) if isinstance(item, dict) else item for item in result]
+        if isinstance(result, dict):
+            return {k: (dict(v) if isinstance(v, dict) else v) for k, v in result.items()}
+        return result
+
+    wrapper.cache_clear = cached.cache_clear  # type: ignore[attr-defined]
+    return wrapper
+
+
+@_cached
 def extract_update_statements(sql: str) -> list[dict[str, str | None]]:
     """Extract UPDATE statements with SET / FROM / WHERE (paren-aware)."""
     text = strip_sql_comments(sql or "")
     statements: list[dict[str, str | None]] = []
-    pattern = re.compile(r"(?is)\bUPDATE\b")
-    for match in pattern.finditer(text):
+    for match in _UPDATE_KW.finditer(text):
         start = match.start()
         i = match.end()
         # MERGE's UPDATE SET has no target here; handled by the MERGE extractor.
-        if re.match(r"(?is)\s+SET\b", text[i:]):
+        if _WS_SET_KW.match(text, i):
             continue
         # head until SET
-        set_match = re.search(r"(?is)\bSET\b", text[i:])
+        set_match = _SET_KW.search(text, i)
         if not set_match:
             continue
-        head = text[i : i + set_match.start()].strip()
-        i = i + set_match.end()
+        head = text[i : set_match.start()].strip()
+        i = set_match.end()
 
         set_clause, i = _read_until_keyword(text, i, {"FROM", "WHERE"}, stop_at_statement=True)
         from_clause = None
         where_clause = None
-        if i < len(text) and re.match(r"(?is)^FROM\b", text[i:]):
+        if i < len(text) and _FROM_KW.match(text, i):
             i = i + len("FROM")
             from_clause, i = _read_until_keyword(text, i, {"WHERE"}, stop_at_statement=True)
             from_clause = from_clause.strip() or None
-        if i < len(text) and re.match(r"(?is)^WHERE\b", text[i:]):
+        if i < len(text) and _WHERE_KW.match(text, i):
             i = i + len("WHERE")
             where_clause, i = _read_until_keyword(text, i, set(), stop_at_statement=True)
             where_clause = where_clause.strip() or None
@@ -192,6 +341,7 @@ class ControlBranchSpan:
     body_end: int
 
 
+@_cached
 def extract_if_else_chains(sql: str) -> list[ControlBranchSpan]:
     """Locate procedural IF / ELSE IF / ELSE BEGIN…END chains (comment-stripped).
 
@@ -205,12 +355,13 @@ def extract_if_else_chains(sql: str) -> list[ControlBranchSpan]:
     n = len(text)
 
     while i < n:
+        # Jump straight to the next "IF" token instead of testing every char.
+        next_if = _IF_KW.search(text, i)
+        if next_if is None:
+            break
+        i = next_if.start()
         # Skip IF OBJECT_ID(...) utility guards — not derivation branches.
-        if re.match(r"(?is)^IF\s+OBJECT_ID\b", text[i:]):
-            i += 1
-            continue
-        if_match = re.match(r"(?is)^IF\b", text[i:])
-        if not if_match:
+        if _IF_OBJECT_ID.match(text, i):
             i += 1
             continue
         # "DROP TABLE IF EXISTS x" / "CREATE TABLE IF NOT EXISTS x" use IF as
@@ -252,7 +403,7 @@ def _parse_one_if_else_chain(
     index = 0
 
     # Leading IF
-    if not re.match(r"(?is)^IF\b", text[i:]):
+    if not _IF_KW.match(text, i):
         return None
     i += len("IF")
     cond, i = _read_if_condition(text, i)
@@ -275,9 +426,9 @@ def _parse_one_if_else_chain(
         # Skip whitespace
         while i < len(text) and text[i].isspace():
             i += 1
-        else_if = re.match(r"(?is)^ELSE\s+IF\b|^ELSEIF\b", text[i:])
+        else_if = _ELSE_IF_KW.match(text, i)
         if else_if:
-            i += else_if.end()
+            i = else_if.end()
             cond, i = _read_if_condition(text, i)
             body_start, body_end, i = _read_begin_end_body(text, i)
             if body_start < 0:
@@ -294,9 +445,9 @@ def _parse_one_if_else_chain(
             )
             index += 1
             continue
-        else_only = re.match(r"(?is)^ELSE\b", text[i:])
+        else_only = _ELSE_KW.match(text, i)
         if else_only:
-            i += else_only.end()
+            i = else_only.end()
             body_start, body_end, i = _read_begin_end_body(text, i)
             if body_start < 0:
                 break
@@ -351,10 +502,10 @@ def _read_if_condition(text: str, start: int) -> tuple[str, int]:
             buf.append(ch)
             i += 1
             continue
-        if depth == 0 and re.match(r"(?is)^BEGIN\b", text[i:]):
+        if depth == 0 and _BEGIN_KW.match(text, i):
             break
         # Single-statement IF without BEGIN: stop before UPDATE/INSERT/…
-        if depth == 0 and _STMT_START.match(text[i:]):
+        if depth == 0 and _STMT_START.match(text, i):
             break
         buf.append(ch)
         i += 1
@@ -369,7 +520,7 @@ def _read_begin_end_body(text: str, start: int) -> tuple[int, int, int]:
     i = start
     while i < len(text) and text[i].isspace():
         i += 1
-    if re.match(r"(?is)^BEGIN\b", text[i:]):
+    if _BEGIN_KW.match(text, i):
         i += len("BEGIN")
         body_start = i
         depth = 1
@@ -389,17 +540,17 @@ def _read_begin_end_body(text: str, start: int) -> tuple[int, int, int]:
                 in_single = True
                 i += 1
                 continue
-            if re.match(r"(?is)^BEGIN\b", text[i:]):
+            if _BEGIN_KW.match(text, i):
                 depth += 1
                 i += 5
                 continue
-            if re.match(r"(?is)^CASE\b", text[i:]):
+            if _CASE_KW.match(text, i):
                 # A bare CASE ... END is not a BEGIN block -- its own END
                 # must not be mistaken for this block's terminator below.
                 case_depth += 1
                 i += 4
                 continue
-            if re.match(r"(?is)^END\b", text[i:]):
+            if _END_KW.match(text, i):
                 if case_depth > 0:
                     case_depth -= 1
                     i += 3
@@ -416,15 +567,8 @@ def _read_begin_end_body(text: str, start: int) -> tuple[int, int, int]:
 
     # Single-statement body (no BEGIN)
     body_start = i
-    _ignored, after = _read_until_keyword(text, i, set(), stop_at_statement=False)
-    # Read one statement: advance until next sibling ELSE/END/IF at depth 0 is hard;
-    # fall back to reading until END/ELSE at depth 0 via statement extractor end.
-    stmt_end = body_start
-    upd = re.match(r"(?is)^UPDATE\b", text[body_start:])
-    if upd:
-        # Reuse update extractor on a slice — approximate end by scanning.
-        from_slice = text[body_start:]
-        # Find end via extract on prefixed text — cheap path: read until END/ELSE
+    if _UPDATE_AT.match(text, body_start):
+        # Read until the sibling END/ELSE at depth 0.
         j = body_start
         depth = 0
         in_single = False
@@ -445,12 +589,168 @@ def _read_begin_end_body(text: str, start: int) -> tuple[int, int, int]:
                 depth += 1
             elif text[j] == ")":
                 depth = max(0, depth - 1)
-            if depth == 0 and re.match(r"(?is)^(END|ELSE)\b", text[j:]):
+            if depth == 0 and _END_OR_ELSE.match(text, j):
                 break
             j += 1
         return body_start, j, j
 
     return -1, -1, start
+
+
+_SUBQUERY_RE = re.compile(r"(?is)\bSELECT\b")
+
+
+def is_procedure_wide_gate(condition: str | None) -> bool:
+    """True when a procedural ``IF`` condition is a set-level test over a table.
+
+    A T-SQL ``IF`` is always evaluated once per run, never per row. Scalar
+    conditions (``IF @TimeKey > 26267``) already read as run-level in a
+    formula because they only reference variables. A condition containing a
+    subquery (``IF EXISTS (SELECT … WHERE col >= @x)``, ``IF (SELECT COUNT(*)
+    …) > 0``) does not: projecting its inner WHERE into the row formula would
+    make it look like every row is tested independently.
+    """
+    return bool(condition and _SUBQUERY_RE.search(condition))
+
+
+@dataclass
+class WorkflowGate:
+    """A procedure-wide IF/ELSE IF condition, evaluated once per run."""
+
+    name: str  # e.g. "Gate 1" — a report label, never a formula variable
+    group_id: str
+    index: int
+    kind: str  # IF | ELSEIF
+    condition: str
+
+
+@_cached
+def extract_workflow_gates(sql: str) -> list[WorkflowGate]:
+    """Name every procedure-wide gate in source order (stable across columns)."""
+    gates: list[WorkflowGate] = []
+    for span in extract_if_else_chains(sql):
+        if span.kind == "ELSE" or not is_procedure_wide_gate(span.condition):
+            continue
+        gates.append(
+            WorkflowGate(
+                name=f"Gate {len(gates) + 1}",
+                group_id=span.group_id,
+                index=span.index,
+                kind=span.kind,
+                condition=" ".join((span.condition or "").split()),
+            )
+        )
+    return gates
+
+
+@_cached
+def extract_catch_spans(sql: str) -> list[tuple[int, int]]:
+    """``BEGIN CATCH … END CATCH`` body spans (comment-stripped coordinates)."""
+    text = strip_sql_comments(sql or "")
+    spans: list[tuple[int, int]] = []
+    stack: list[int] = []
+    for match in re.finditer(r"(?is)\b(BEGIN|END)\s+CATCH\b", text):
+        if match.group(1).upper() == "BEGIN":
+            stack.append(match.end())
+        elif stack:
+            spans.append((stack.pop(), match.start()))
+    return spans
+
+
+_RESET_RE = re.compile(
+    rf"(?is)\b(?P<kind>TRUNCATE\s+TABLE|DROP\s+TABLE(?:\s+IF\s+EXISTS)?|DELETE(?:\s+FROM)?)"
+    rf"\s+(?P<table>{_TABLE_TOKEN})"
+)
+
+
+@_cached
+def extract_table_resets(sql: str) -> list[dict[str, Any]]:
+    """Statements that empty a table: ``TRUNCATE TABLE``, ``DROP TABLE`` and a
+    ``DELETE`` with no WHERE and no JOIN (which clears every row).
+
+    Returns ``[{"table", "kind", "start"}]`` in comment-stripped coordinates.
+    A filtered DELETE removes only some rows and is not a reset. Resets inside
+    an IF/ELSE branch or a CATCH handler are conditional and are skipped —
+    except the ``IF OBJECT_ID(...) IS NOT NULL DROP TABLE`` idiom, which the
+    branch scanner deliberately does not treat as a branch.
+    """
+    text = strip_sql_comments(sql or "")
+    branches = extract_if_else_chains(text)
+    catches = extract_catch_spans(text)
+    resets: list[dict[str, Any]] = []
+    for match in _RESET_RE.finditer(text):
+        start = match.start()
+        if any(b.body_start <= start < b.body_end for b in branches):
+            continue
+        if any(s <= start < e for s, e in catches):
+            continue
+        kind = " ".join(match.group("kind").upper().split())
+        table = normalize_table_name(match.group("table"))
+        # "MERGE … WHEN MATCHED THEN DELETE" / "DELETE TOP (n) …" are row-level.
+        if table.upper() in {"WHEN", "OUTPUT", "TOP", "WHERE"} or re.search(
+            r"(?is)\bTHEN\s*$", text[max(0, start - 40):start]
+        ):
+            continue
+        if kind.startswith("DELETE"):
+            if not kind.endswith("FROM") and re.match(r"(?is)\s*FROM\b", text[match.end():]):
+                continue  # DELETE alias FROM … — multi-table form, always filtered by a join
+            body, _ = _read_until_keyword(text, match.end(), set(), stop_at_statement=True)
+            if re.search(r"(?is)\b(?:WHERE|JOIN)\b", body):
+                continue
+            kind = "DELETE"
+        elif kind.startswith("DROP"):
+            kind = "DROP TABLE"
+        resets.append({"table": table, "kind": kind, "start": start})
+    return resets
+
+
+_CREATE_TABLE_RE = re.compile(
+    r"(?is)\bCREATE\s+TABLE\s+(?P<table>[#\w\[\]\.]+)\s*\("
+)
+_DECLARE_TABLE_RE = re.compile(r"(?is)\bDECLARE\s+(?P<table>@\w+)\s+TABLE\s*\(")
+_DECLARE_SCALAR_RE = re.compile(
+    r"(?is)\bDECLARE\s+(?P<var>@\w+)\s+(?P<type>(?!TABLE\b)[A-Za-z]+(?:\s*\([^)]*\))?)"
+)
+_COLUMN_DEF_RE = re.compile(r"(?is)^\s*\[?(?P<col>[A-Za-z_]\w*)\]?\s+(?P<type>[A-Za-z]+)")
+_NON_COLUMN_DEFS = {"CONSTRAINT", "PRIMARY", "UNIQUE", "INDEX", "FOREIGN", "CHECK"}
+
+
+@_cached
+def extract_declared_column_types(sql: str) -> dict[str, dict[str, str]]:
+    """``{TABLE: {COLUMN: SQL_TYPE}}`` from ``CREATE TABLE`` / ``DECLARE @t TABLE``.
+
+    Keys are upper-cased; table keys use :func:`normalize_table_name` (so
+    ``#DpdStaging`` stays ``#DPDSTAGING``). Scalar ``DECLARE @var TYPE`` lands
+    under the ``"@"`` key.
+    """
+    text = strip_sql_comments(sql or "")
+    out: dict[str, dict[str, str]] = {}
+    for pattern in (_CREATE_TABLE_RE, _DECLARE_TABLE_RE):
+        for match in pattern.finditer(text):
+            open_idx = match.end() - 1
+            depth = 0
+            close_idx = -1
+            for idx in range(open_idx, len(text)):
+                if text[idx] == "(":
+                    depth += 1
+                elif text[idx] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        close_idx = idx
+                        break
+            if close_idx < 0:
+                continue
+            table = normalize_table_name(match.group("table")).upper()
+            columns = out.setdefault(table, {})
+            for part in split_csv_respecting_parens(text[open_idx + 1 : close_idx]):
+                col_match = _COLUMN_DEF_RE.match(part)
+                if not col_match or col_match.group("col").upper() in _NON_COLUMN_DEFS:
+                    continue
+                columns[col_match.group("col").upper()] = col_match.group("type").upper()
+    scalars = out.setdefault("@", {})
+    for match in _DECLARE_SCALAR_RE.finditer(text):
+        scalars[match.group("var").upper()] = match.group("type").split("(")[0].strip().upper()
+    return out
 
 
 def exists_condition_to_row_predicate(condition: str | None) -> str | None:
@@ -608,6 +908,7 @@ def extract_subquery_dependency_refs(sql_fragment: str) -> list[str]:
     return refs
 
 
+@_cached
 def extract_merge_matched_updates(sql: str) -> list[dict[str, str]]:
     """Extract ``MERGE … WHEN MATCHED THEN UPDATE SET …`` assignment blocks.
 
@@ -823,6 +1124,16 @@ def _parens_balanced(text: str) -> bool:
     return depth == 0
 
 
+_KEYWORD_PATTERNS: dict[str, re.Pattern[str]] = {}
+
+
+def _keyword_pattern(keyword: str) -> re.Pattern[str]:
+    pattern = _KEYWORD_PATTERNS.get(keyword)
+    if pattern is None:
+        pattern = _KEYWORD_PATTERNS[keyword] = re.compile(rf"(?is){keyword}\b")
+    return pattern
+
+
 def _read_until_keyword(
     text: str,
     start: int,
@@ -867,29 +1178,33 @@ def _read_until_keyword(
         if depth == 0 and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] in "_@#")):
             if ch == ";" and stop_at_statement:
                 return "".join(buf), i
-            rest = text[i:]
+            # Only a letter can start a keyword; skip the regex work otherwise.
+            if not ch.isalpha():
+                buf.append(ch)
+                i += 1
+                continue
             # A bare CASE ... END is not wrapped in parens, so it needs its
             # own nesting counter — otherwise the CASE's own closing END is
             # mistaken for the statement/block-terminating END below and the
             # read stops mid-expression, silently truncating everything after
             # it (including the real trailing FROM/WHERE clause).
-            case_match = re.match(r"(?is)^CASE\b", rest)
+            case_match = _CASE_KW.match(text, i)
             if case_match:
                 case_depth += 1
                 buf.append(case_match.group(0))
-                i += len(case_match.group(0))
+                i = case_match.end()
                 continue
-            end_match = re.match(r"(?is)^END\b", rest)
+            end_match = _END_KW.match(text, i)
             if end_match and case_depth > 0:
                 case_depth -= 1
                 buf.append(end_match.group(0))
-                i += len(end_match.group(0))
+                i = end_match.end()
                 continue
             if case_depth == 0:
                 for kw in keywords:
-                    if re.match(rf"(?is)^{kw}\b", rest):
+                    if _keyword_pattern(kw).match(text, i):
                         return "".join(buf), i
-                if stop_at_statement and _STMT_START.match(rest):
+                if stop_at_statement and _STMT_START.match(text, i):
                     return "".join(buf), i
                 # Bare END at depth 0 (outside any open CASE) is a
                 # procedure/block terminator (END TRY / END CATCH / END) —
@@ -901,52 +1216,57 @@ def _read_until_keyword(
     return "".join(buf), i
 
 
+_SELECT_KW = re.compile(r"(?is)\bSELECT\b")
+_INTO_KW = re.compile(r"(?is)INTO\b")
+_TARGET_AFTER_INTO = re.compile(rf"(?is)\s*(?P<target>{_TABLE_TOKEN})")
+_WS_FROM_KW = re.compile(r"(?is)\s*FROM\b")
+_WS_WHERE_KW = re.compile(r"(?is)\s*WHERE\b")
+_WS_GROUP_BY_KW = re.compile(r"(?is)\s*GROUP\s+BY\b")
+
+
+@_cached
 def extract_select_into(sql: str) -> list[dict[str, str]]:
     """Find SELECT … INTO #temp FROM … [WHERE …] statements."""
     text = strip_sql_comments(sql or "")
     results: list[dict[str, str]] = []
-    for match in re.finditer(r"(?is)\bSELECT\b", text):
+    for match in _SELECT_KW.finditer(text):
         start = match.start()
         list_start = match.end()
-        into_match = re.search(r"(?is)\bINTO\b", text[list_start:])
+        # The projection ends at this SELECT's own top-level INTO or FROM.
+        # (Searching for the next INTO anywhere paired a plain SELECT with an
+        # unrelated later "INSERT INTO #T", and cost O(file) per SELECT.)
+        select_list, stop = _read_until_keyword(
+            text, list_start, {"INTO", "FROM"}, stop_at_statement=True
+        )
+        into_match = _INTO_KW.match(text, stop)
         if not into_match:
             continue
-        select_list = text[list_start : list_start + into_match.start()]
-        # Skip if this SELECT is clearly not a SELECT INTO (INTO too far / subquery-ish)
-        if select_list.count("(") != select_list.count(")"):
-            continue
-        after_into = list_start + into_match.end()
-        target_match = re.match(
-            rf"(?is)\s*(?P<target>{_TABLE_TOKEN})",
-            text[after_into:],
-        )
+        after_into = into_match.end()
+        target_match = _TARGET_AFTER_INTO.match(text, after_into)
         if not target_match:
             continue
         target = normalize_table_name(target_match.group("target"))
         if not target.startswith("#"):
             continue
-        pos = after_into + target_match.end()
+        pos = target_match.end()
         from_clause = ""
         where_clause = ""
         group_by_clause = ""
-        if re.match(r"(?is)^\s*FROM\b", text[pos:]):
-            from_match = re.match(r"(?is)^\s*FROM\b", text[pos:])
-            assert from_match is not None
-            pos = pos + from_match.end()
+        from_match = _WS_FROM_KW.match(text, pos)
+        if from_match:
+            pos = from_match.end()
             from_clause, pos = _read_until_keyword(
                 text, pos, {"WHERE", "GROUP", "ORDER", "HAVING"}, stop_at_statement=True
             )
-        if re.match(r"(?is)^\s*WHERE\b", text[pos:]):
-            where_match = re.match(r"(?is)^\s*WHERE\b", text[pos:])
-            assert where_match is not None
-            pos = pos + where_match.end()
+        where_match = _WS_WHERE_KW.match(text, pos)
+        if where_match:
+            pos = where_match.end()
             where_clause, pos = _read_until_keyword(
                 text, pos, {"GROUP", "ORDER", "HAVING"}, stop_at_statement=True
             )
-        if re.match(r"(?is)^\s*GROUP\s+BY\b", text[pos:]):
-            group_match = re.match(r"(?is)^\s*GROUP\s+BY\b", text[pos:])
-            assert group_match is not None
-            pos = pos + group_match.end()
+        group_match = _WS_GROUP_BY_KW.match(text, pos)
+        if group_match:
+            pos = group_match.end()
             group_by_clause, pos = _read_until_keyword(
                 text, pos, {"ORDER", "HAVING"}, stop_at_statement=True
             )
@@ -1243,25 +1563,33 @@ def extract_insert_select(
     By default includes permanent tables (needed for DD mutation collection).
     Pass ``temps_only=True`` for phase-1 local-temp lineage only.
     """
+    results = _extract_all_insert_select(sql)
+    if temps_only:
+        results = [r for r in results if r["target"].startswith("#")]
+    return results
+
+
+_INSERT_SELECT_RE = re.compile(
+    rf"(?is)\bINSERT\s+INTO\s+(?P<target>{_TABLE_TOKEN})\s*"
+    rf"(?:\((?P<cols>[^)]+)\))?\s*"
+    rf"SELECT\b"
+)
+
+
+@_cached
+def _extract_all_insert_select(sql: str) -> list[dict[str, str]]:
     text = strip_sql_comments(sql or "")
     results: list[dict[str, str]] = []
-    pattern = re.compile(
-        rf"(?is)\bINSERT\s+INTO\s+(?P<target>{_TABLE_TOKEN})\s*"
-        rf"(?:\((?P<cols>[^)]+)\))?\s*"
-        rf"SELECT\b"
-    )
-    for match in pattern.finditer(text):
+    for match in _INSERT_SELECT_RE.finditer(text):
         target_raw = match.group("target")
         target = normalize_table_name(target_raw)
-        if temps_only and not target.startswith("#"):
-            continue
         cols = (match.group("cols") or "").strip()
         start = match.start()
         pos = match.end()
         select_list, pos = _read_until_keyword(text, pos, {"FROM"}, stop_at_statement=True)
         from_body = ""
         where_clause = ""
-        if re.match(r"(?is)^FROM\b", text[pos:]):
+        if _FROM_KW.match(text, pos):
             pos += len("FROM")
             from_body, pos = _read_until_keyword(
                 text,
@@ -1269,7 +1597,7 @@ def extract_insert_select(
                 {"WHERE", "GROUP", "ORDER", "HAVING"},
                 stop_at_statement=True,
             )
-        if re.match(r"(?is)^WHERE\b", text[pos:]):
+        if _WHERE_KW.match(text, pos):
             pos += len("WHERE")
             where_clause, pos = _read_until_keyword(
                 text, pos, {"GROUP", "ORDER", "HAVING"}, stop_at_statement=True

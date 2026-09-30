@@ -594,6 +594,154 @@ def test_select_distinct_cte_lineage_resolves_correctly():
     assert "CUSTOMERCAL" in ref.entity.upper()
 
 
+def test_chained_self_referential_passes_collapse_to_flat_or():
+    """Regression: several ``UPDATE ... SET Col = 'X' WHERE Col = 'Y'`` passes
+    (same guard, same assigned value, each restricted to a different
+    JOIN/cohort population) must fold into one flat ``OR(...)`` guard instead
+    of nesting each pass's own guard around the full accumulated prior AST.
+
+    This is the exact shape from PRO.Final_AssetClass_Npadate: three
+    consecutive UPDATEs set ##ACCOUNTCAL.ASSET_NORM = 'CONDI_STD' wherever it
+    is currently 'ALWYS_STD', each gated by a different CTE/cohort join.
+    Naive prior-value substitution nests an IF_THEN_ELSE as a comparison
+    operand on every pass after the first, producing a formula that grows
+    with every additional pass and previously failed Lark grammar
+    validation -- which silently dropped the row from the DD export
+    (app/report/dd_export.py's ``export_dd_rows`` filters out any row with
+    ``validation_errors``).
+    """
+    sql = """
+    ;WITH CTE_NPA_UCIFID AS (
+        SELECT UcifEntityID FROM ##ACCOUNTCAL WHERE FinalAssetClassAlt_Key > 1 GROUP BY UcifEntityID
+    )
+    UPDATE A SET A.ASSET_NORM = 'CONDI_STD' FROM ##ACCOUNTCAL A
+    INNER JOIN CTE_NPA_UCIFID B ON A.UcifEntityID = B.UcifEntityID
+    WHERE ASSET_NORM = 'ALWYS_STD'
+
+    ;WITH CTE_NPA_UCIFID_CUST AS (
+        SELECT DISTINCT UcifEntityID FROM ##CUSTOMERCAL WHERE SysAssetClassAlt_Key > 1 GROUP BY UcifEntityID
+    )
+    UPDATE A SET A.ASSET_NORM = 'CONDI_STD' FROM ##ACCOUNTCAL A
+    INNER JOIN CTE_NPA_UCIFID_CUST B ON A.UcifEntityID = B.UcifEntityID
+    WHERE A.ASSET_NORM = 'ALWYS_STD'
+
+    UPDATE A SET A.ASSET_NORM = 'CONDI_STD' FROM ##ACCOUNTCAL A
+    INNER JOIN coborrowercal B ON A.UCIF_ID = B.UCIC
+    WHERE A.ASSET_NORM = 'ALWYS_STD'
+    """
+    row, debug = generate_for_sql(sql, "##ACCOUNTCAL", "ASSET_NORM", llm_client=None)
+    formula = debug["formula"]
+    assert formula
+    result = validate_expression(formula)
+    assert result.valid, f"{result.error}\nformula={formula}"
+    # Collapsed to a flat OR, not nested IF-as-comparison-operand passes --
+    # a nested fold would repeat 'THEN("CONDI_STD")ELSE(' at least 3 times.
+    assert formula.count('THEN("CONDI_STD")') == 1
+    assert "OR(" in formula
+    assert len(formula) < 1000
+    assert row.display_derivation_expression == formula
+    assert not row.validation_errors
+
+
+def test_chained_self_referential_passes_with_different_values_do_not_collapse():
+    """When chained self-referential passes assign DIFFERENT values, the
+    flat-OR collapse must not apply (it would conflate two distinct
+    outcomes) -- the general prior-value-substitution fold still runs, and
+    the result must still validate."""
+    sql = """
+    UPDATE A SET A.ASSET_NORM = 'CONDI_STD' FROM ##ACCOUNTCAL A
+    WHERE ASSET_NORM = 'ALWYS_STD'
+
+    UPDATE A SET A.ASSET_NORM = 'OTHER_VALUE' FROM ##ACCOUNTCAL A
+    WHERE ASSET_NORM = 'ALWYS_STD'
+    """
+    row, debug = generate_for_sql(sql, "##ACCOUNTCAL", "ASSET_NORM", llm_client=None)
+    formula = debug["formula"]
+    assert formula
+    result = validate_expression(formula)
+    assert result.valid, f"{result.error}\nformula={formula}"
+    assert '"CONDI_STD"' in formula
+    assert '"OTHER_VALUE"' in formula
+
+
+def test_isempty_guarded_chain_collapses_to_elseif_priority_cascade():
+    """Class B: a chain of ``UPDATE ... SET Col = 'literal' WHERE ... AND
+    Col IS NULL`` passes, each assigning a DIFFERENT non-empty literal,
+    must flatten into one priority-ordered ELSEIF cascade (earliest pass
+    wins) instead of nesting the full accumulated tree into each guard.
+
+    Sound because ISEMPTY(self) can only go true -> false once any pass in
+    the chain writes a non-empty literal -- a later same-shaped guard can
+    never re-match that row, so evaluating every guard against the
+    ORIGINAL state (chronological order, first match wins) reproduces the
+    real UPDATE-by-UPDATE execution exactly.
+    """
+    sql = """
+    UPDATE A SET A.DegReason = 'REASON_ONE' FROM ##ACCOUNTCAL A
+    WHERE A.FlgOne = 'Y' AND A.DegReason IS NULL
+
+    UPDATE A SET A.DegReason = 'REASON_TWO' FROM ##ACCOUNTCAL A
+    WHERE A.FlgTwo = 'Y' AND A.DegReason IS NULL
+    """
+    row, debug = generate_for_sql(sql, "##ACCOUNTCAL", "DegReason", llm_client=None)
+    formula = debug["formula"]
+    assert formula
+    result = validate_expression(formula)
+    assert result.valid, f"{result.error}\nformula={formula}"
+    assert not row.validation_errors
+    assert "ELSEIF" in formula
+    # Earliest pass (REASON_ONE) must be the outer/first-checked arm.
+    assert formula.index('"REASON_ONE"') < formula.index('"REASON_TWO"')
+    # Flat cascade, not nested IF-as-comparison-operand: each guard's own
+    # ISEMPTY check appears once per arm, not duplicated by substitution.
+    assert formula.count("ISEMPTY(") == 2
+
+
+def test_degreason_style_value_dependent_chain_does_not_collapse():
+    """Class C: PRO.Final_AssetClass_Npadate's real DEGREASON shape --
+    steps 1-2 share an ISEMPTY guard with DIFFERENT values (NULL then a
+    literal, so Class B's non-empty-literal requirement rules out the
+    first), step 3's guard reads a SPECIFIC VALUE step 2 just wrote (order
+    -dependent, never flattenable), and steps 3 & 4 both assign the exact
+    same COLUMN_REF (##CustomerCal.DegReason) -- which must NOT trigger
+    Class A's flat OR, because a shared value only collapses safely when
+    it's a literal (see ``_try_collapse_class_a``'s docstring); a shared
+    column read has no such guarantee if anything else writes that source
+    column in between.
+
+    None of this should silently collapse -- the general prior-value
+    substitution fold must still run for all of it, and the result must
+    still be a valid, if larger, formula.
+    """
+    sql = """
+    UPDATE A SET A.DegReason = NULL FROM ##ACCOUNTCAL A
+    WHERE A.FlgDeg = 'Y' AND A.DegReason IS NULL
+
+    UPDATE A SET A.DegReason = 'PERCOLATION BY OTHER ACCOUNT' FROM ##ACCOUNTCAL A
+    WHERE A.FlgDeg = 'Y' AND A.DegReason IS NULL
+
+    UPDATE A SET A.DegReason = B.DegReason FROM ##ACCOUNTCAL A
+    INNER JOIN ##CustomerCal B ON A.SourceSystemCustomerID = B.SourceSystemCustomerID
+    WHERE A.DegReason = 'PERCOLATION BY OTHER ACCOUNT' AND A.FlgDeg = 'N'
+
+    UPDATE A SET A.DegReason = B.DegReason FROM ##ACCOUNTCAL A
+    INNER JOIN ##CustomerCal B ON A.SourceSystemCustomerID = B.SourceSystemCustomerID
+    WHERE A.FlgProcessing = 'N' AND A.FlgDeg = 'N' AND B.DegReason IS NOT NULL AND A.DegReason IS NULL
+    """
+    row, debug = generate_for_sql(sql, "##ACCOUNTCAL", "DegReason", llm_client=None)
+    formula = debug["formula"]
+    assert formula
+    result = validate_expression(formula)
+    assert result.valid, f"{result.error}\nformula={formula}"
+    assert not row.validation_errors
+    # Steps 3 & 4 both assign CustomerCal.DegReason. A wrongful Class A
+    # collapse would merge them into one shared THEN (a single OR'd
+    # condition), leaving only one THEN-position occurrence of that
+    # relationship path; the correct, uncollapsed fold keeps each pass's
+    # own copy, so it appears at least twice.
+    assert formula.upper().count("CUSTOMERCAL") >= 2
+
+
 def test_like_with_literal_pattern_maps_to_membership_op():
     """A fixed-literal LIKE pattern must map onto the grammar's native
     CONTAINS/BEGINSWITH/ENDSWITH — the 4X grammar has no LIKE token."""
@@ -678,6 +826,30 @@ def test_like_with_dynamic_pattern_falls_back_honestly():
     assert node["left"]["type"] == "COLUMN_REF"
     formula = compile_ast_to_4x_string(node)
     assert not validate_expression(formula).valid
+
+
+def test_npa_reason_staged_match_flag_compiles_without_dynamic_like():
+    """PRO.Final_AssetClass_Npadate refactored shape: NPA_Reason uses a
+    precomputed flag join, not LIKE '%' + column + '%' in the SET clause."""
+    sql = """
+    UPDATE A
+    SET A.NPA_Reason = CASE WHEN M.Stg_NpaReason_MatchFlag = 1
+        THEN A.NPA_Reason
+        ELSE CONCAT(A.NPA_Reason, ',', B.DegradeReason) END
+    FROM ##ACCOUNTCAL A
+    INNER JOIN (SELECT DISTINCT CUSTOMERACID, DegradeReason FROM PRO.CoBorrowerCal) B
+        ON A.CustomerAcID = B.CustomerACID
+    INNER JOIN #NPA_Reason_Match M ON A.CustomerAcID = M.CustomerAcID
+    WHERE B.PERC_FinalAssetClass_AltKey > 1
+    """
+    row, debug = generate_for_sql(sql, "##ACCOUNTCAL", "NPA_Reason", llm_client=None)
+    formula = debug["formula"]
+    assert formula
+    result = validate_expression(formula)
+    assert result.valid, f"{result.error}\nformula={formula}"
+    assert not row.validation_errors
+    assert "LIKE" not in formula.upper()
+    assert "CONCAT" in formula or "concat" in formula.lower()
 
 
 def test_membership_op_preserves_contains_operator_in_compiler():
@@ -785,3 +957,361 @@ def test_plain_scalar_subquery_inside_case_else_branch():
     formula = compile_ast_to_4x_string(node)
     assert '"DimAssetClass"."AssetClassAlt_Key"' in formula
     assert validate_expression(formula).valid, formula
+
+
+@pytest.mark.parametrize(
+    "sql,expected",
+    [
+        ("SUBSTRING(Code, 1, 3)", 'SUBSTR("AccountCal"."Code", 1, 3)'),
+        ("TRIM(Code)", 'TRIM("AccountCal"."Code")'),
+        ("LTRIM(Code)", 'TRIM("AccountCal"."Code")'),
+        ("RTRIM(Code)", 'TRIM("AccountCal"."Code")'),
+        ("REPLACE(Code, ',', ' ')", 'REPLACE("AccountCal"."Code", ",", " ")'),
+        ("FLOOR(Balance)", 'FLOOR("AccountCal"."Balance")'),
+        ("CEILING(Balance)", 'CEIL("AccountCal"."Balance")'),
+        ("CAST(Balance AS DECIMAL(18, 4))", 'CONVERT("AccountCal"."Balance", "DECIMAL(18,4)")'),
+        ("CONVERT(VARCHAR(10), Code)", 'CONVERT("AccountCal"."Code", "VARCHAR(10)")'),
+        ("CONVERT(VARCHAR(10), OpenDate, 112)", 'CONVERT("AccountCal"."OpenDate", "VARCHAR(10)")'),
+    ],
+)
+def test_tsql_string_and_math_functions_map_to_4x_equivalents(sql, expected):
+    node = parse_sql_expression_to_ast(sql, default_entity="AccountCal")
+    formula = compile_ast_to_4x_string(node)
+    assert formula == expected
+    assert validate_expression(formula).valid, formula
+
+
+def test_4x_reference_function_conformance():
+    """Every documented 4X function, AND/OR function form and membership
+    operator must compile from an AST node into grammar-valid 4X syntax."""
+    import re
+
+    doc = (ROOT / "samples" / "platform_docs" / "4x_functions_operators.md").read_text(
+        encoding="utf-8"
+    )
+    documented_functions = set(re.findall(r"`([A-Z]+)\(", doc))
+    documented_membership_ops = set(re.findall(r"> ([A-Z]+) \[ListOfValues\]", doc))
+
+    def col(name):
+        return {"type": "COLUMN_REF", "entity": "AccountCal", "relationship": None, "column": name}
+
+    def num(value):
+        return {"type": "LITERAL", "value_type": "NUMBER", "value": value}
+
+    def text(value):
+        return {"type": "LITERAL", "value_type": "STRING", "value": value}
+
+    def call(name, *args):
+        return {"type": "FUNCTION_CALL", "function_name": name, "arguments": list(args)}
+
+    def compare(op, left, right):
+        return {"type": "BINARY_OP", "operator": op, "left": left, "right": right}
+
+    # Argument shapes follow the documented signatures.
+    function_cases = {
+        "SUBSTR": call("SUBSTR", col("Code"), num(1), num(3)),
+        "LOWER": call("LOWER", col("Code")),
+        "UPPER": call("UPPER", col("Code")),
+        "LEN": call("LEN", col("Code")),
+        "CONVERT": call("CONVERT", col("Balance"), text("DECIMAL(18,2)")),
+        "CONCAT": call("CONCAT", col("Code"), text("-"), col("SubCode")),
+        "TRIM": call("TRIM", col("Code")),
+        "REPLACE": call("REPLACE", col("Code"), text("-"), text(" ")),
+        "SOM": call("SOM", col("OpenDate")),
+        "EOM": call("EOM", col("OpenDate")),
+        "DATEDIFF": call("DATEDIFF", col("OpenDate"), col("CloseDate"), text("DAY")),
+        "TODATE": call("TODATE", text("2024-01-01")),
+        "ADDDAY": call("ADDDAY", col("OpenDate"), num(30)),
+        "ISEMPTY": call("ISEMPTY", col("Code")),
+        "ISNOTEMPTY": call("ISNOTEMPTY", col("Code")),
+        "MAX": call("MAX", col("Balance"), {"type": "LIST_LITERAL", "items": ["UCIF_ID"]}),
+        "MIN": call("MIN", col("Balance"), {"type": "LIST_LITERAL", "items": ["UCIF_ID"]}),
+        "ROUND": call("ROUND", col("Balance"), num(2)),
+        "ABS": call("ABS", col("Balance")),
+        "FLOOR": call("FLOOR", col("Balance"), num(1)),
+        "CEIL": call("CEIL", col("Balance"), num(1)),
+        "COALESCE": call("COALESCE", col("Balance"), num(0)),
+        "SUM": call("SUM", col("Balance")),
+        "COUNT": call("COUNT", num(1)),
+    }
+    assert not set(function_cases) - documented_functions, (
+        "test covers functions missing from the 4X reference: "
+        f"{sorted(set(function_cases) - documented_functions)}"
+    )
+
+    dpd_over_90 = compare(">", col("DPD"), num(90))
+    is_active = compare("==", col("Status"), text("ACTIVE"))
+    logical_cases = {
+        "AND": compare("AND", dpd_over_90, is_active),
+        "OR": compare("OR", dpd_over_90, compare("OR", is_active, call("ISEMPTY", col("Code")))),
+    }
+
+    membership_ops = ["IN", "NOTIN", "CONTAINS", "BEGINSWITH", "ENDSWITH", "DOESNOTCONTAINS"]
+    assert set(membership_ops) <= documented_membership_ops
+    membership_cases = {
+        op: {"type": "MEMBERSHIP_OP", "operator": op, "column": col("Code"), "values": ["SMA1", "SMA2"]}
+        for op in membership_ops
+    }
+
+    failures = []
+    for name, node in function_cases.items():
+        formula = compile_ast_to_4x_string(node)
+        if not formula.startswith(f"{name}("):
+            failures.append(f"{name}: compiled to unexpected shape {formula}")
+        result = validate_expression(formula)
+        if not result.valid:
+            failures.append(f"{name}: {formula} -> {result.error}")
+    for name, node in logical_cases.items():
+        formula = compile_ast_to_4x_string(node)
+        if not formula.startswith(f"{name}("):
+            failures.append(f"{name}: expected function form, got {formula}")
+        result = validate_expression(formula)
+        if not result.valid:
+            failures.append(f"{name}: {formula} -> {result.error}")
+    for op, node in membership_cases.items():
+        formula = compile_ast_to_4x_string(node)
+        if f" {op} [" not in formula:
+            failures.append(f"{op}: operator not preserved in {formula}")
+        result = validate_expression(formula)
+        if not result.valid:
+            failures.append(f"{op}: {formula} -> {result.error}")
+    assert not failures, "\n".join(failures)
+
+
+def test_cast_to_date_still_feeds_addday_heuristic():
+    node = parse_sql_expression_to_ast(
+        "CAST(OpenDate AS DATE) + 30", default_entity="AccountCal"
+    )
+    assert node["function_name"] == "ADDDAY"
+    assert node["arguments"][0]["function_name"] == "CONVERT"
+
+
+def test_from_join_clause_handles_outer_joins_hints_and_three_part_names():
+    from app.derivation.v2.sql_text import parse_from_join_clause
+
+    parsed = parse_from_join_clause(
+        "FROM DEMO.PRO.LoanAccount A WITH (NOLOCK) "
+        "LEFT OUTER JOIN PRO.CustomerMaster B WITH (NOLOCK) ON A.CustomerId = B.CustomerId "
+        "FULL OUTER JOIN PRO.Branch C ON C.BranchId = A.BranchId "
+        "WHERE B.IsNpa = 'Y'"
+    )
+    assert parsed == [
+        ("LoanAccount", "A", None),
+        ("CustomerMaster", "B", "A.CustomerId = B.CustomerId"),
+        ("Branch", "C", "C.BranchId = A.BranchId"),
+    ]
+    # A table hint without an alias must not become the alias "WITH".
+    assert parse_from_join_clause("FROM PRO.T WITH (NOLOCK)") == [("T", None, None)]
+
+
+def test_update_join_keys_feed_lineage_and_step_context():
+    sql = """
+    UPDATE A
+    SET A.AssetClass = B.NewClass
+    FROM PRO.LoanAccount A
+    INNER JOIN PRO.CustomerMaster B ON A.CustomerId = B.CustomerId
+    WHERE B.IsNpa = 'Y'
+    """
+    row, debug = generate_for_sql(sql, "LoanAccount", "AssetClass")
+    assert validate_expression(debug["formula"]).valid
+    assert '"LoanAccount"."CustomerMaster"."NewClass"' in debug["formula"]
+    refs = debug["mutations"][0]["dependency_refs"]
+    assert "LoanAccount.CustomerId" in refs and "CustomerMaster.CustomerId" in refs
+    assert row.execution_steps[0].join_conditions == [
+        "JOIN CustomerMaster ON LoanAccount.CustomerId = CustomerMaster.CustomerId"
+    ]
+
+
+@pytest.mark.parametrize(
+    "reset", ["TRUNCATE TABLE #Stage", "DELETE FROM #Stage", "DELETE #Stage"]
+)
+def test_table_reset_starts_a_fresh_derivation_pass(reset):
+    sql = f"""
+    INSERT INTO #Stage (AccountId, Bucket) SELECT AccountId, 'OLD' FROM PRO.Acct
+    UPDATE S SET S.Bucket = 'STALE' FROM #Stage S WHERE S.AccountId = '1'
+    {reset}
+    INSERT INTO #Stage (AccountId, Bucket) SELECT AccountId, 'NEW' FROM PRO.Acct WHERE Active = 'Y'
+    TRUNCATE TABLE #Stage
+    """
+    row, debug = generate_for_sql(sql, "Stage", "Bucket")
+    assert "OLD" not in debug["formula"] and "STALE" not in debug["formula"]
+    assert '"NEW"' in debug["formula"]
+    assert len(debug["mutations"]) == 1
+    # The trailing cleanup TRUNCATE (after the last write) does not wipe it.
+    assert any("cleared the table" in n for n in row.execution_steps[0].notes)
+
+
+def test_filtered_delete_and_other_table_resets_do_not_reset_the_target():
+    from app.derivation.v2.sql_text import extract_table_resets
+
+    sql = """
+    INSERT INTO #Stage (Bucket) SELECT 'OLD' FROM PRO.Acct
+    DELETE FROM #Stage WHERE Bucket = 'X'
+    DELETE S FROM #Stage S INNER JOIN PRO.Acct A ON A.Id = S.Id
+    TRUNCATE TABLE #Other
+    MERGE PRO.T AS T USING #Stage AS S ON T.Id = S.Id WHEN MATCHED THEN DELETE;
+    UPDATE S SET S.Bucket = 'NEW' FROM #Stage S WHERE S.Id = 1
+    """
+    assert [r["table"] for r in extract_table_resets(sql)] == ["#Other"]
+    _, debug = generate_for_sql(sql, "Stage", "Bucket")
+    assert len(debug["mutations"]) == 2
+
+
+def _sample_07() -> str:
+    return (ROOT / "samples" / "sql" / "07_DPD_Bucket_Classification.sql").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_catch_handler_is_not_folded_into_the_main_formula():
+    """TRY and CATCH updates guard on the same predicate; folding them as two
+    sequential UPDATEs produced IF(p)THEN(catch)ELSEIF(p)THEN(try) — an
+    unreachable success arm. The CATCH path must be kept separate."""
+    sql = _sample_07()
+    row, debug = generate_for_sql(sql, "ACLRUNNINGPROCESSSTATUS", "COMPLETED")
+    formula = debug["formula"]
+    assert formula == (
+        'IF("ACLRUNNINGPROCESSSTATUS"."RUNNINGPROCESSNAME" == "DPD_Bucket_Classification")'
+        'THEN("Y")ELSE("ACLRUNNINGPROCESSSTATUS"."COMPLETED")'
+    )
+    assert 'THEN("N")' in row.exception_handler_expression
+    assert [s.scope for s in row.execution_steps] == ["Main", "Exception handler (CATCH)"]
+
+    _, count = generate_for_sql(sql, "ACLRUNNINGPROCESSSTATUS", "COUNT")
+    assert "COALESCE(IF(" not in count["formula"]
+    assert "ELSEIF" not in count["formula"]
+    assert validate_expression(count["formula"]).valid
+
+
+def test_procedure_wide_exists_gate_stays_out_of_the_platform_formula():
+    """IF EXISTS(...) gates are run-level and have no platform equivalent. The
+    exported formula must use only real columns / parameters (row-level
+    projection of each branch); the gate itself goes to procedural context."""
+    sql = _sample_07()
+    row, debug = generate_for_sql(sql, "LoanAccountCal", "BucketWorsened")
+    formula = debug["formula"]
+    assert "WorkflowGate" not in formula and "Gate " not in formula
+    assert formula.startswith('IF("LoanAccountCal"."LastPaymentDueDate" >= "@GraceWindowStart")')
+    assert formula.endswith('ELSE("N")')
+    assert validate_expression(formula).valid
+    assert [g.split(" := ")[0] for g in row.workflow_gates] == ["Gate 1", "Gate 2"]
+    assert all("EXISTS" in gate for gate in row.workflow_gates)
+    assert any(note.startswith("Procedural context:") for note in row.advisory_notes)
+
+    _, grace = generate_for_sql(sql, "LoanAccountCal", "GracePeriodApplied")
+    assert "Gate" not in grace["formula"]
+
+    # Scalar variable conditions are already run-level; they stay inline.
+    scalar_sql = """
+    IF @TimeKey > 26267
+    BEGIN
+        UPDATE A SET A.Flag = 'Y' FROM PRO.AccountCal A WHERE A.Balance > 0
+    END
+    """
+    scalar_row, scalar = generate_for_sql(scalar_sql, "AccountCal", "Flag")
+    assert "@TimeKey" in scalar["formula"]
+    assert not scalar_row.workflow_gates
+
+
+def test_overwritten_not_applicable_bucket_is_reported_not_rewritten():
+    """Step 2 sets DpdBucket='NOT_APPLICABLE' AND DpdDays=0 for NULL due
+    dates; step 3 (WHERE DpdDays IS NOT NULL) then re-matches those rows and
+    assigns 'CURRENT'. The formula must show the executed result and the
+    overwrite must be surfaced, not silently hidden in a dead ELSEIF arm."""
+    sql = _sample_07()
+    row, debug = generate_for_sql(sql, "LoanAccountCal", "DpdBucket")
+    assert validate_expression(debug["formula"]).valid
+    steps = row.execution_steps
+    assert [s.assigned_value for s in steps][0] == '"NOT_APPLICABLE"'
+    assert len(steps) == 2
+    assert steps[0].notes and "Overwritten by step 2" in steps[0].notes[0]
+    assert '"CURRENT"' in steps[0].notes[0]
+    assert "DpdDays = 0" in steps[0].notes[0]
+    assert any("NOT_APPLICABLE" in note and "CURRENT" in note for note in row.advisory_notes)
+
+    # A later step that does not re-match the earlier rows is not an overwrite.
+    days_row, _ = generate_for_sql(sql, "LoanAccountCal", "DpdDays")
+    assert not any(step.notes for step in days_row.execution_steps)
+
+
+@pytest.mark.parametrize(
+    "entity,column,expected",
+    [
+        ("LoanAccountCal", "DpdBucket", "String"),
+        ("LoanAccountCal", "DpdDays", "Integer"),
+        ("LoanAccountCal", "PenalInterestAmount", "Decimal"),
+        ("LoanAccountCal", "BucketWorsened", "String"),
+        ("DpdStaging", "AdjustedPenalty", "Decimal"),
+        ("DpdStaging", "DpdBucket", "String"),
+        ("DpdBucketHistory", "LastUpdatedDate", "Date"),
+        ("CollectionsQueue", "EscalationDate", "Date"),
+        ("ACLRUNNINGPROCESSSTATUS", "COUNT", "Integer"),
+        ("ACLRUNNINGPROCESSSTATUS", "ERRORDATE", "Date"),
+    ],
+)
+def test_data_type_is_inferred_from_values_not_name_fragments(entity, column, expected):
+    row, _ = generate_for_sql(_sample_07(), entity, column)
+    assert row.data_type == expected
+
+
+def test_export_reconciles_data_type_against_formula_outputs():
+    from app.report.dd_export import reconcile_data_type
+
+    bucket = 'IF("T"."DpdDays" == 0)THEN("CURRENT")ELSE("BUCKET_90_PLUS")'
+    assert reconcile_data_type("Decimal", bucket, "DpdBucket") == "String"
+    assert reconcile_data_type("Integer", 'IF("T"."X" > 1)THEN(0)ELSE(1)', "DpdDays") == "Integer"
+    assert reconcile_data_type("String", 'IF("T"."X" > 1)THEN(1)ELSE(0)', "RetryCount") == "Integer"
+    # A "@Var" token is a variable, not text; no literal outputs → unchanged.
+    assert reconcile_data_type("Date", 'IF("T"."X" > 1)THEN("@ProcessDate")ELSE("T"."D")', "D") == "Date"
+
+
+def test_report_and_qa_list_rules_in_execution_order(tmp_path):
+    from datetime import date as _date
+
+    from app.models.core import (
+        CanonicalModel,
+        ColumnType,
+        DDRow,
+        DDStatus,
+        DerivationOption,
+        Dialect,
+        Intent,
+        JobPlan,
+        ObjectType,
+        SQLObject,
+    )
+    from app.report.dd_export import write_qa_coverage_report
+    from app.report.report_generator import generate_report
+
+    def row(entity, column, order):
+        return DDRow(
+            entity_name=entity,
+            column_name=column,
+            column_type=ColumnType.PHYSICAL,
+            derivation_option=DerivationOption.FORMULA_EXPRESSION,
+            display_derivation_expression=f'IF("{entity}"."K" == 1)THEN("A")ELSE("{entity}"."{column}")',
+            effective_start_date=_date(2026, 1, 1),
+            status=DDStatus.ACTIVE,
+            data_type="String",
+            source_chain_id="c1",
+            source_object_ids=["obj-1"],
+            execution_order=order,
+        )
+
+    # Deliberately alphabetical and entity-grouped input; execution order differs.
+    rows = [row("Alpha", "Late", 300), row("Zulu", "First", 10), row("Alpha", "Middle", 150)]
+    model = CanonicalModel(chain_id="c1", job_id="j", object_ids=["obj-1"],
+                           technical_summary="", business_summary="")
+    plan = JobPlan(job_id="j", intent=Intent.GENERATE_DD, company="x", platform="4X")
+    obj = SQLObject(object_id="obj-1", name="P", object_type=ObjectType.PROCEDURE,
+                    dialect=Dialect.SQLSERVER, raw_sql="", source_file="p.sql")
+    text = generate_report(plan, [model], rows, tmp_path / "report.md",
+                           objects={"obj-1": obj}).read_text(encoding="utf-8")
+    positions = [text.index(f"#### Determine {c} (") for c in ("First", "Middle", "Late")]
+    assert positions == sorted(positions)
+    assert "| 1 | [Determine First (Zulu)]" in text
+
+    qa = write_qa_coverage_report(rows, tmp_path / "qa.md").read_text(encoding="utf-8")
+    qa_positions = [qa.index(f"| {e} | {c} |") for e, c in
+                    (("Zulu", "First"), ("Alpha", "Middle"), ("Alpha", "Late"))]
+    assert qa_positions == sorted(qa_positions)

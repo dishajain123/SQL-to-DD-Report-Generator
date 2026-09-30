@@ -31,7 +31,9 @@ DEFAULT_FUNCTION_REFERENCE = Path("samples/platform_docs/4x_functions_operators.
 def _read_text(path: Path) -> str:
     if not path.exists():
         raise FileNotFoundError(f"File not found: {path}")
-    return path.read_text(encoding="utf-8")
+    from app.utils.text_encoding import read_sql_file
+
+    return read_sql_file(path)
 
 
 def _print_section(title: str, content: str) -> None:

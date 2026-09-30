@@ -36,8 +36,8 @@ def test_input_guardrail_accepts_valid_sql():
 
 def test_job_plan_guardrail_requires_company_and_platform():
     assert not check_job_plan("", "PlatformX").passed
-    assert not check_job_plan("Acme", "").passed
-    assert check_job_plan("Acme", "PlatformX").passed
+    assert not check_job_plan("Default", "").passed
+    assert check_job_plan("Default", "PlatformX").passed
 
 
 def test_structural_guardrail_flags_low_confidence():

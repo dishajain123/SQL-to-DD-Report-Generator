@@ -23,8 +23,16 @@ def check_structural_info(info: StructuralInfo) -> GuardrailResult:
     if info.has_dynamic_sql:
         errors.append("Dynamic SQL (EXECUTE IMMEDIATE) detected — cannot be statically analyzed")
 
-    if info.unsupported_constructs:
-        errors.append(f"{len(info.unsupported_constructs)} unparseable statement(s) found")
+    # Only genuine parse failures are "unparseable". unsupported_constructs also
+    # carries coverage-ledger items (IF branches, temp staging, MERGE, CATCH,
+    # source anomalies) for well-formed statements; those are reported by the
+    # ledger itself, and counting them here mislabelled parsed UPDATE…JOINs.
+    if info.parse_failures:
+        errors.append(
+            f"{len(info.parse_failures)} unparseable statement(s) found: "
+            + "; ".join(info.parse_failures[:5])
+            + ("; …" if len(info.parse_failures) > 5 else "")
+        )
 
     if info.statements and not info.smart_chunks:
         errors.append("No smart chunks were derived for a non-empty object")

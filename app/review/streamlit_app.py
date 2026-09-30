@@ -482,7 +482,7 @@ def _render_submission_tab() -> None:
         )
         st.session_state["preferred_dialect"] = DIALECT_OPTIONS[dialect_label]
         st.divider()
-        st.caption("Company / platform defaults come from `.env`.")
+        st.caption("Platform defaults come from `.env`.")
 
     st.subheader("1. Provide a DB object")
     st.caption("Upload, paste, or pick a bundled sample — then run extraction against the API.")
@@ -718,7 +718,7 @@ def _render_review_tab() -> None:
         default_job = job_options[0]
 
     job_labels = {
-        job["job_id"]: f"{job['job_id']} - {job['company']} ({job['status']})"
+        job["job_id"]: f"{job['job_id']} ({job['status']})"
         for job in jobs
     }
 
@@ -740,7 +740,7 @@ def _render_review_tab() -> None:
     m3.metric("Artifacts ready", "Yes" if selected_job_row.get("report_path") else "No")
 
     st.caption(
-        f"Run #{selected_job_row.get('run_number', '-') or '-'} | Company: {selected_job_row['company']} | "
+        f"Run #{selected_job_row.get('run_number', '-') or '-'} | "
         f"Platform: {selected_job_row['platform']} | Intent: {selected_job_row['intent']}"
     )
 

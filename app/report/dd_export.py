@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from datetime import date
 from pathlib import Path
 
@@ -45,6 +46,60 @@ _COLUMN_KEYS = {
 }
 
 
+_STRING_TYPE_LABELS = {"STRING", "TEXT", "VARCHAR", "CHAR", "NVARCHAR"}
+_NUMERIC_TYPE_LABELS = {"DECIMAL", "INTEGER", "INT", "NUMBER", "NUMERIC", "FLOAT", "DOUBLE"}
+_DATE_TYPE_LABELS = {"DATE", "DATETIME", "TIMESTAMP"}
+# A value payload that is a bare literal: THEN("X") / ELSE(12.5). A column
+# path ("E"."C") never matches because a "." follows its first quoted part.
+_OUTPUT_LITERAL_RE = re.compile(r'(?:THEN|ELSE)\((?P<lit>-?\d+(?:\.\d+)?|"[^"]*")\)')
+
+
+def _output_literals(expression: str) -> list[str]:
+    text = (expression or "").strip()
+    literals = [m.group("lit") for m in _OUTPUT_LITERAL_RE.finditer(text)]
+    if re.fullmatch(r'-?\d+(?:\.\d+)?|"[^"]*"', text):
+        literals.append(text)
+    # "@ProcessDate"-style tokens are T-SQL variables, not string values.
+    return [lit for lit in literals if not lit.startswith('"@')]
+
+
+def reconcile_data_type(data_type: str, expression: str, column_name: str = "") -> str:
+    """Validate a row's data type against the values its formula can output.
+
+    Inference upstream is AST-based; this is the last check before a row is
+    written. It only corrects contradictions it can prove from the formula:
+    a numeric/date type whose formula returns quoted text is a String column,
+    and a String type whose formula only returns numbers (for a column whose
+    name also says it is numeric) is numeric.
+    """
+    from app.derivation.v2.ast_compiler import (
+        DATA_TYPE_DECIMAL,
+        DATA_TYPE_INTEGER,
+        DATA_TYPE_STRING,
+        data_type_from_column_name,
+    )
+
+    label = (data_type or "").strip()
+    literals = _output_literals(expression)
+    if not literals:
+        return label
+    strings = [lit for lit in literals if lit.startswith('"')]
+    numbers = [lit for lit in literals if not lit.startswith('"')]
+    upper = label.upper()
+    if strings and (upper in _NUMERIC_TYPE_LABELS or upper in _DATE_TYPE_LABELS):
+        return DATA_TYPE_STRING
+    if (
+        numbers
+        and not strings
+        and (upper in _STRING_TYPE_LABELS or not upper)
+        and data_type_from_column_name(column_name) in {DATA_TYPE_INTEGER, DATA_TYPE_DECIMAL}
+    ):
+        return DATA_TYPE_DECIMAL if any("." in n for n in numbers) else (
+            data_type_from_column_name(column_name) or DATA_TYPE_INTEGER
+        )
+    return label
+
+
 def dd_row_to_dict(dd: DDRow) -> dict:
     return {
         "entity_name": dd.entity_name,
@@ -54,7 +109,9 @@ def dd_row_to_dict(dd: DDRow) -> dict:
         "display_derivation_expression": dd.display_derivation_expression,
         "effective_start_date": dd.effective_start_date.strftime("%d-%m-%Y"),
         "status": dd.status.value,
-        "data_type": dd.data_type,
+        "data_type": reconcile_data_type(
+            dd.data_type, dd.display_derivation_expression, dd.column_name
+        ),
         "decision_table_json": dd.decision_table_json or "",
         "conditional_json": dd.conditional_json or "",
     }
@@ -155,6 +212,10 @@ def _row_dict_to_dd_row(row: dict) -> DDRow:
         confidence=float(merged.get("confidence") or 0.0),
         validation_errors=list(validation_errors),
         advisory_notes=list(advisory_notes),
+        execution_order=merged.get("execution_order"),
+        execution_steps=list(merged.get("execution_steps") or []),
+        workflow_gates=list(merged.get("workflow_gates") or []),
+        exception_handler_expression=str(merged.get("exception_handler_expression") or ""),
     )
 
 
@@ -399,6 +460,42 @@ def export_reviewed_dd_rows_for_job_excel(
     return export_dd_rows_excel(dd_rows, output_path)
 
 
+def execution_ordered(rows: list[DDRow]) -> list[DDRow]:
+    """Rows in SQL execution order: by source object (first-seen order), then
+    by the position of each column's first write. Rows without a position
+    keep their relative order after the positioned ones of the same object."""
+    object_rank: dict[str, int] = {}
+    for row in rows:
+        oid = row.source_object_ids[0] if row.source_object_ids else ""
+        object_rank.setdefault(oid, len(object_rank))
+
+    def key(row: DDRow) -> tuple:
+        oid = row.source_object_ids[0] if row.source_object_ids else ""
+        order = row.execution_order
+        return (object_rank[oid], order is None, order or 0)
+
+    return sorted(rows, key=key)
+
+
+def _row_scope(row: DDRow) -> str:
+    scopes = {step.scope for step in row.execution_steps}
+    parts: list[str] = []
+    if scopes and scopes <= {"Exception handler (CATCH)"}:
+        parts.append("CATCH only")
+    elif row.exception_handler_expression:
+        parts.append("Main + separate CATCH path")
+    else:
+        parts.append("Main")
+    gates = [g.partition(" := ")[0] for g in row.workflow_gates]
+    if gates:
+        parts.append("under procedure-wide " + ", ".join(gates))
+    return "; ".join(parts)
+
+
+def _table_cell(text: str) -> str:
+    return " ".join((text or "").split()).replace("|", "\\|")
+
+
 def write_qa_coverage_report(
     dd_rows: list[DDRow],
     output_path: str | Path,
@@ -415,27 +512,88 @@ def write_qa_coverage_report(
         getattr(r, "review_state", None) and r.review_state.value == "APPROVED" for r in dd_rows
     ) if dd_rows else False
 
+    ordered = execution_ordered(dd_rows)
     lines = [
         f"# QA / coverage report{f' — {job_id}' if job_id else ''}",
         "",
         f"Ready to present: **{'yes' if ready else 'no'}**",
-        f"Rows: {len(dd_rows)}",
+        f"Rows: {len(dd_rows)} (listed in SQL execution order)",
         "",
-        "| Entity | Column | Review state | Platform status | Confidence | Expression | Validation | Advisory | Source refs |",
-        "|--------|--------|--------------|-----------------|------------|------------|------------|----------|-------------|",
+        "| Step | Entity | Column | Scope | Review state | Platform status | Confidence | Expression | Validation | Advisory | Source refs |",
+        "|------|--------|--------|-------|--------------|-----------------|------------|------------|------------|----------|-------------|",
     ]
-    for row in dd_rows:
-        expr = (row.display_derivation_expression or "").replace("|", "\\|").replace("\n", " ")
+    for position, row in enumerate(ordered, 1):
+        expr = _table_cell(row.display_derivation_expression or "")
         if len(expr) > 120:
             expr = expr[:117] + "..."
         lines.append(
-            f"| {row.entity_name} | {row.column_name} | "
+            f"| {position} | {row.entity_name} | {row.column_name} | {_row_scope(row)} | "
             f"{getattr(row.review_state, 'value', row.review_state)} | {row.status.value} | "
             f"{row.confidence:.3f} | `{expr}` | "
-            f"{'; '.join(row.validation_errors) or '—'} | "
-            f"{'; '.join(row.advisory_notes) or '—'} | "
-            f"{'; '.join(row.source_statement_refs) or '—'} |"
+            f"{_table_cell('; '.join(row.validation_errors)) or '—'} | "
+            f"{_table_cell('; '.join(row.advisory_notes)) or '—'} | "
+            f"{_table_cell('; '.join(row.source_statement_refs)) or '—'} |"
         )
+
+    gates = list(dict.fromkeys(g for row in ordered for g in row.workflow_gates))
+    if gates:
+        lines.extend([
+            "",
+            "## Procedural context — procedure-wide gates",
+            "",
+            "SQL Server evaluates each gate once per run against the whole table and "
+            "runs only the first branch that holds. The exported formulas cannot "
+            "reference a run-level test, so they apply each branch's condition row by "
+            "row; the gates below need a platform workflow step for exact behaviour.",
+            "",
+        ])
+        for gate in gates:
+            name, _, condition = gate.partition(" := ")
+            users = [f"{r.entity_name}.{r.column_name}" for r in ordered if gate in r.workflow_gates]
+            lines.append(f"- {name}: `{condition}` — affects {', '.join(users)}")
+
+    handlers = [row for row in ordered if row.exception_handler_expression]
+    if handlers:
+        lines.extend([
+            "",
+            "## Exception handler (CATCH) paths",
+            "",
+            "These writes run only when the main (TRY) path fails. They are kept out of "
+            "the exported formula, which describes the successful run.",
+            "",
+            "| Entity | Column | CATCH formula |",
+            "|--------|--------|---------------|",
+        ])
+        for row in handlers:
+            lines.append(
+                f"| {row.entity_name} | {row.column_name} | "
+                f"`{_table_cell(row.exception_handler_expression)}` |"
+            )
+
+    sequenced = [
+        row for row in ordered
+        if len(row.execution_steps) > 1
+        or any(step.join_conditions or step.notes for step in row.execution_steps)
+    ]
+    if sequenced:
+        lines.extend(["", "## Step lineage (multi-step, joined, or reset columns)", ""])
+        for row in sequenced:
+            lines.append(f"**{row.entity_name}.{row.column_name}**")
+            lines.append("")
+            lines.append("| Step | Line | Scope | Gate | Row condition | Joined via | Value | Notes |")
+            lines.append("|------|------|-------|------|---------------|------------|-------|-------|")
+            for step in row.execution_steps:
+                joins = _table_cell("; ".join(step.join_conditions))
+                lines.append(
+                    f"| {step.step} | {step.source_line or '—'} | {step.scope} | "
+                    f"{_table_cell(step.workflow_gate or '') or '—'} | "
+                    f"`{_table_cell(step.row_condition) or '(all rows)'}` | "
+                    f"{('`' + joins + '`') if joins else '—'} | "
+                    f"`{_table_cell(step.assigned_value)}` | "
+                    f"{_table_cell(' '.join(step.notes)) or '—'} |"
+                )
+            lines.append("")
+
     if blockers:
         lines.extend(["", "## Blockers", ""])
         for b in blockers:

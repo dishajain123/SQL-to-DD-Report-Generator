@@ -11,7 +11,11 @@ from __future__ import annotations
 import re
 from typing import Any, Optional
 
-from app.derivation.v2.phase2_mutation_folder import MutationPass, prune_redundant_ast
+from app.derivation.v2.phase2_mutation_folder import (
+    MutationPass,
+    _ast_signature,
+    prune_redundant_ast,
+)
 from app.derivation.v2.sql_text import (
     bare_ident,
     extract_subquery_dependency_refs,
@@ -105,6 +109,26 @@ _NUMERIC_COLUMN_HINTS = (
     "RUN",
 )
 
+# T-SQL function name -> documented 4X equivalent
+# (samples/platform_docs/4x_functions_operators.md).
+_TSQL_TO_4X_FUNCTION_NAMES = {
+    "SUBSTRING": "SUBSTR",
+    "TRIM": "TRIM",
+    "LTRIM": "TRIM",
+    "RTRIM": "TRIM",
+    "REPLACE": "REPLACE",
+    "FLOOR": "FLOOR",
+    "CEILING": "CEIL",
+}
+
+# CONVERT target types (base name, before any precision) by value family —
+# lets the ADDDAY-vs-numeric heuristics see through a conversion.
+_NUMERIC_SQL_TYPES = {
+    "INT", "INTEGER", "BIGINT", "SMALLINT", "TINYINT", "DECIMAL", "NUMERIC",
+    "NUMBER", "FLOAT", "REAL", "MONEY", "SMALLMONEY",
+}
+_DATE_SQL_TYPES = {"DATE", "DATETIME", "DATETIME2", "SMALLDATETIME", "DATETIMEOFFSET"}
+
 
 def generate_ast(
     mutations: list[MutationPass],
@@ -170,13 +194,35 @@ def build_ast_from_mutations(
     # write in this fold is conditional or not.
     ast: dict[str, Any] = _column_ref(target_entity, target_column)
 
+    # Raw (pre-substitution) (condition, assigned-value) pairs for a run of
+    # consecutive self-referential passes that fold flat instead of nesting
+    # -- see ``_self_ref_guard_shape`` for the two provably-sound shapes
+    # ("A": identical guard + identical value -> OR; "B": guard reads the
+    # column only via ISEMPTY(self) and every pass writes a definite
+    # non-empty literal -> priority-ordered ELSEIF cascade). A chain only
+    # ever extends while every pass keeps classifying the same way;
+    # anything else (e.g. a guard comparing the column to a specific value
+    # another pass in the same chain just wrote) is Class C and always
+    # falls back to the general prior-value substitution below.
+    # ``self_ref_chain_base`` is the AST state as of just BEFORE the
+    # chain's first pass -- whatever the column already held at that
+    # point, not necessarily the bare column ref (an earlier, unrelated
+    # guarded write could already have layered something on).
+    self_ref_chain: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    self_ref_chain_base: dict[str, Any] | None = None
+    self_ref_chain_class: str | None = None
+
     for segment in _segment_mutations_by_control_flow(mutations):
         group_id = segment[0].control_branch_group if segment else None
         if group_id and all(m.control_branch_group == group_id for m in segment):
             ast = _fold_control_branch_group(segment, target_entity, target_column, ast)
+            self_ref_chain = []
+            self_ref_chain_base = None
+            self_ref_chain_class = None
             continue
 
         for mutation in segment:
+            ast_before_this_pass = ast
             then_node = parse_sql_expression_to_ast(
                 mutation.assigned_expression,
                 default_entity=target_entity,
@@ -190,28 +236,265 @@ def build_ast_from_mutations(
             if _is_self_column_ref(then_node, target_entity, target_column):
                 continue
 
-            then_node = _substitute_prior_value(then_node, ast, target_entity, target_column)
             cond_sql = mutation.effective_condition
             if cond_sql:
-                cond = parse_sql_expression_to_ast(
+                raw_cond = parse_sql_expression_to_ast(
                     cond_sql,
                     default_entity=target_entity,
                     target_column=target_column,
                     as_condition=True,
                 )
-                cond = _substitute_prior_value(cond, ast, target_entity, target_column)
+                collapsed_ast = None
+                if self_ref_chain and self_ref_chain_base is not None:
+                    if self_ref_chain_class == "A":
+                        collapsed_ast = _try_collapse_class_a(
+                            raw_cond, then_node, self_ref_chain, self_ref_chain_base,
+                            target_entity, target_column,
+                        )
+                    elif self_ref_chain_class == "B":
+                        collapsed_ast = _try_collapse_class_b(
+                            raw_cond, then_node, self_ref_chain, self_ref_chain_base,
+                            target_entity, target_column,
+                        )
+                if collapsed_ast is not None:
+                    ast = collapsed_ast
+                    self_ref_chain.append((raw_cond, then_node))
+                    continue
+
+                then_node_sub = _substitute_prior_value(
+                    then_node, ast, target_entity, target_column
+                )
+                cond = _substitute_prior_value(raw_cond, ast, target_entity, target_column)
                 ast = {
                     "type": "IF_THEN_ELSE",
                     "condition": cond,
-                    "then_branch": then_node,
+                    "then_branch": then_node_sub,
                     "else_branch": ast,
                 }
+                shape = _self_ref_guard_shape(raw_cond, then_node, target_entity, target_column)
+                if shape is not None:
+                    self_ref_chain = [(raw_cond, then_node)]
+                    self_ref_chain_base = ast_before_this_pass
+                    self_ref_chain_class = shape
+                else:
+                    self_ref_chain = []
+                    self_ref_chain_base = None
+                    self_ref_chain_class = None
             else:
                 # Unguarded pass resets the base value for subsequent guards.
-                ast = then_node
+                ast = _substitute_prior_value(then_node, ast, target_entity, target_column)
+                self_ref_chain = []
+                self_ref_chain_base = None
+                self_ref_chain_class = None
 
     pruned = prune_redundant_ast(ast)
     return pruned if isinstance(pruned, dict) else ast
+
+
+def _contains_self_column_ref(node: Any, entity: str, column: str) -> bool:
+    """True if ``node`` reads the column being derived anywhere in its tree."""
+    if isinstance(node, dict):
+        if _is_self_column_ref(node, entity, column):
+            return True
+        return any(
+            _contains_self_column_ref(v, entity, column)
+            for k, v in node.items()
+            if not str(k).startswith("_")
+        )
+    if isinstance(node, list):
+        return any(_contains_self_column_ref(v, entity, column) for v in node)
+    return False
+
+
+def _self_ref_guard_shape(
+    raw_cond: dict[str, Any],
+    then_node: dict[str, Any],
+    entity: str,
+    column: str,
+) -> str | None:
+    """Classify a single self-referential guarded pass as Class A, B, or
+    neither (Class C -- always handled by the general substitution fold).
+
+    Both flattenings below only ever apply while EVERY pass extending the
+    chain keeps classifying the same way (checked by the caller); this
+    function only says what a single pass, in isolation, is eligible for.
+
+    - **Class A** -- the guard reads the column in any shape at all (a
+      plain equality is the common case), and every pass in the eventual
+      chain assigns the textually IDENTICAL value. Once any pass fires,
+      the guard's outcome for that row can never flip back (the row's
+      value is now the one every other pass in the chain would also have
+      written), so a flat ``OR`` of the raw guards is exact -- see
+      ``_try_collapse_class_a``.
+    - **Class B** -- the guard reads the column ONLY via ``ISEMPTY(self)``
+      (never bare, never under ``ISNOTEMPTY``, never as a comparison
+      operand -- see ``_self_refs_only_via_isempty``), AND this pass's
+      assigned value is a literal statically guaranteed non-empty. Once
+      such a pass fires, ``ISEMPTY(self)`` becomes permanently false for
+      that row, so a later pass with the same shape can never re-match it
+      -- the chronological "first UPDATE that matches wins" behaviour is
+      then identical to evaluating every guard, in order, against the
+      chain's ORIGINAL state, i.e. a priority-ordered ``ELSEIF`` cascade
+      using each pass's raw condition -- see ``_try_collapse_class_b``.
+
+      The non-empty-literal requirement is load-bearing: a pass that
+      writes ``NULL`` (or any non-literal, whose emptiness can't be
+      proven statically) leaves ``ISEMPTY(self)`` still true, so a
+      following same-shaped guard would ALSO still match that row in the
+      real chronological execution -- collapsing that pair into mutually
+      exclusive ELSEIF arms would silently drop the second pass's write.
+      Such a pass is therefore never eligible for Class B, in either
+      direction (it can't seed one or extend one), and always falls
+      through to Class C's exact general-substitution handling instead.
+    """
+    if _contains_self_column_ref(then_node, entity, column):
+        return None
+    if not _contains_self_column_ref(raw_cond, entity, column):
+        return None
+    if (
+        _self_refs_only_via_isempty(raw_cond, entity, column)
+        and _is_definite_nonempty_literal(then_node)
+    ):
+        return "B"
+    return "A"
+
+
+def _self_refs_only_via_isempty(node: Any, entity: str, column: str, under_isempty: bool = False) -> bool:
+    """True if every self-column-ref in ``node`` sits directly inside an
+    ``ISEMPTY(...)`` call's argument (never bare, never under
+    ``ISNOTEMPTY``, never as a comparison/arithmetic operand elsewhere).
+    """
+    if isinstance(node, dict):
+        if _is_self_column_ref(node, entity, column):
+            return under_isempty
+        is_isempty = (
+            node.get("type") == "FUNCTION_CALL"
+            and str(node.get("function_name") or "").upper() == "ISEMPTY"
+        )
+        for key, value in node.items():
+            if str(key).startswith("_"):
+                continue
+            child_flag = True if (key == "arguments" and is_isempty) else under_isempty
+            if not _self_refs_only_via_isempty(value, entity, column, child_flag):
+                return False
+        return True
+    if isinstance(node, list):
+        return all(_self_refs_only_via_isempty(v, entity, column, under_isempty) for v in node)
+    return True
+
+
+def _is_definite_nonempty_literal(node: Any) -> bool:
+    """True only for a literal statically guaranteed non-empty (a
+    non-empty STRING or a NUMBER) -- never NULL, never a COLUMN_REF or
+    FUNCTION_CALL whose runtime value can't be proven non-empty here."""
+    if not isinstance(node, dict) or node.get("type") != "LITERAL":
+        return False
+    value_type = str(node.get("value_type") or "").upper()
+    if value_type == "NULL":
+        return False
+    value = node.get("value")
+    if value is None:
+        return False
+    if value_type == "STRING" and str(value) == "":
+        return False
+    return True
+
+
+def _try_collapse_class_a(
+    raw_cond: dict[str, Any],
+    then_node: dict[str, Any],
+    chain: list[tuple[dict[str, Any], dict[str, Any]]],
+    base_else: dict[str, Any],
+    target_entity: str,
+    target_column: str,
+) -> dict[str, Any] | None:
+    """OR consecutive self-referential guards instead of nesting them.
+
+    A chain of ``UPDATE ... SET Col = <same value> WHERE <predicate reading
+    Col>`` passes (each gated by a different JOIN/population, but with
+    textually identical guard and assigned value -- e.g. several UPDATEs all
+    doing ``SET ASSET_NORM = 'CONDI_STD' WHERE ASSET_NORM = 'ALWYS_STD'``
+    against different cohorts) is semantically an OR of the guards: once any
+    pass fires, later passes in the chain no longer match (their own guard
+    reads the column they just changed), so the *outcome* for any row is
+    "matches guard N for some N in the chain -> same value; otherwise
+    unchanged". Folding each pass by substituting the full accumulated prior
+    AST into its own guard is precise in the general case, but for this
+    identical-condition/identical-value shape it only produces deeper and
+    deeper nesting -- an IF_THEN_ELSE tree embedded as a comparison operand
+    -- for no semantic gain, and can grow large enough to fail formula
+    generation. Collapsing to a flat OR is exact, not an approximation, and
+    keeps the formula small.
+
+    Only applies when the assigned value is a LITERAL (not a column read or
+    function call) that is structurally identical across the whole chain.
+    The literal-only requirement matters: the soundness argument is "every
+    pass in the chain assigns the exact same value, so it doesn't matter
+    which guard fires first" -- which only holds unconditionally for a
+    literal. A shared COLUMN_REF (e.g. two passes both doing
+    ``SET Col = Other.Col``) reads whatever ``Other.Col`` holds AT THE TIME
+    of each statement; if anything between those two passes writes
+    ``Other.Col``, the two reads can differ even though their AST shape
+    looks identical, and OR-ing the guards would then silently use
+    whichever pass happened to be evaluated, rather than reproducing SQL's
+    actual last-write-wins order. Returns the collapsed ``IF_THEN_ELSE``,
+    or ``None`` when the chain doesn't apply and the caller should fall
+    back to the general prior-value substitution.
+    """
+    if not chain:
+        return None
+    if not isinstance(then_node, dict) or then_node.get("type") != "LITERAL":
+        return None
+    if _contains_self_column_ref(then_node, target_entity, target_column):
+        return None
+    if not _contains_self_column_ref(raw_cond, target_entity, target_column):
+        return None
+    then_sig = _ast_signature(then_node)
+    if any(_ast_signature(v) != then_sig for _, v in chain):
+        return None
+
+    or_condition = raw_cond
+    for cond, _ in reversed(chain):
+        or_condition = {"type": "BINARY_OP", "operator": "OR", "left": or_condition, "right": cond}
+    return {
+        "type": "IF_THEN_ELSE",
+        "condition": or_condition,
+        "then_branch": then_node,
+        "else_branch": base_else,
+    }
+
+
+def _try_collapse_class_b(
+    raw_cond: dict[str, Any],
+    then_node: dict[str, Any],
+    chain: list[tuple[dict[str, Any], dict[str, Any]]],
+    base_else: dict[str, Any],
+    target_entity: str,
+    target_column: str,
+) -> dict[str, Any] | None:
+    """Flatten a chain of ``ISEMPTY(self)``-guarded passes into one
+    priority-ordered ``ELSEIF`` cascade using each pass's RAW (never
+    prior-value-substituted) condition, instead of nesting each guard
+    around the full accumulated prior AST.
+
+    See ``_self_ref_guard_shape`` for the soundness argument and the
+    non-empty-literal requirement this depends on; the caller only invokes
+    this once every pass so far (including this one) has already
+    classified as Class B, so no shape re-checking happens here beyond
+    this pass's own eligibility.
+    """
+    if not chain:
+        return None
+    if not _self_refs_only_via_isempty(raw_cond, target_entity, target_column):
+        return None
+    if not _is_definite_nonempty_literal(then_node):
+        return None
+
+    arms = list(chain) + [(raw_cond, then_node)]
+    ast: dict[str, Any] = base_else
+    for cond, value in reversed(arms):
+        ast = {"type": "IF_THEN_ELSE", "condition": cond, "then_branch": value, "else_branch": ast}
+    return ast
 
 
 def _segment_mutations_by_control_flow(
@@ -490,9 +773,9 @@ def parse_sql_expression_to_ast(
                 items.append(name)
         return {"type": "LIST_LITERAL", "items": items}
 
-    # CAST(expr AS type) — 4X has no explicit cast; drop the type and parse
-    # the inner expression (tried early so a cast wrapping a CASE/DATEADD/
-    # arithmetic expression still resolves that inner shape correctly).
+    # CAST(expr AS type) / CONVERT(type, expr) → CONVERT(expr, type) (tried
+    # early so a cast wrapping a CASE/DATEADD/arithmetic expression still
+    # resolves that inner shape correctly).
     cast_node = _try_parse_cast(text, default_entity, target_column)
     if cast_node is not None:
         return cast_node
@@ -725,14 +1008,20 @@ def parse_sql_expression_to_ast(
         )
         if mapped is not None:
             return mapped
+        # No fixed-literal pattern to map onto CONTAINS/etc, and the 4X
+        # grammar has no LIKE token at all -- emitting BINARY_OP "NOT LIKE"
+        # here used to compile to a string the grammar can't parse (a
+        # cryptic Lark "No terminal matches ..." error instead of a clear
+        # validation message). Raise the same unsupported-construct
+        # sentinel used elsewhere (e.g. ROW_NUMBER/OVER) so this surfaces
+        # as an honest, actionable error.
         return {
-            "type": "BINARY_OP",
-            "operator": "NOT LIKE",
-            "left": parse_sql_expression_to_ast(
-                lhs_sql.strip(), default_entity=default_entity, target_column=target_column
-            ),
-            "right": parse_sql_expression_to_ast(
-                rhs_sql.strip(), default_entity=default_entity, target_column=target_column
+            "type": "FUNCTION_CALL",
+            "function_name": "__UNSUPPORTED_SQL__",
+            "arguments": [],
+            "_validation_error": (
+                f"NOT LIKE with a dynamic (non-literal) pattern has no 4X "
+                f"equivalent: {text}"
             ),
         }
     like_split = _split_top_level_keyword(text, "LIKE")
@@ -745,13 +1034,12 @@ def parse_sql_expression_to_ast(
         if mapped is not None:
             return mapped
         return {
-            "type": "BINARY_OP",
-            "operator": "LIKE",
-            "left": parse_sql_expression_to_ast(
-                lhs_sql.strip(), default_entity=default_entity, target_column=target_column
-            ),
-            "right": parse_sql_expression_to_ast(
-                rhs_sql.strip(), default_entity=default_entity, target_column=target_column
+            "type": "FUNCTION_CALL",
+            "function_name": "__UNSUPPORTED_SQL__",
+            "arguments": [],
+            "_validation_error": (
+                f"LIKE with a dynamic (non-literal) pattern has no 4X "
+                f"equivalent: {text}"
             ),
         }
 
@@ -805,6 +1093,28 @@ def parse_sql_expression_to_ast(
             for a in _split_top_level(least_greatest_fn.group("args"), ",")
         ]
         return {"type": "FUNCTION_CALL", "function_name": mapped_fn, "arguments": args}
+
+    # T-SQL string/math functions → their 4X names (arguments keep their order;
+    # 4X has a single TRIM covering LTRIM/RTRIM).
+    renamed_fn = re.match(
+        r"(?is)^(?P<fn>SUBSTRING|TRIM|LTRIM|RTRIM|REPLACE|FLOOR|CEILING)\s*\((?P<args>.*)\)$",
+        text,
+    )
+    if renamed_fn and _balanced(renamed_fn.group("args")):
+        fn = renamed_fn.group("fn").upper()
+        parts = _split_top_level(renamed_fn.group("args"), ",")
+        expected_arity = {"SUBSTRING": 3, "REPLACE": 3}.get(fn, 1)
+        if len(parts) == expected_arity:
+            return {
+                "type": "FUNCTION_CALL",
+                "function_name": _TSQL_TO_4X_FUNCTION_NAMES[fn],
+                "arguments": [
+                    parse_sql_expression_to_ast(
+                        a, default_entity=default_entity, target_column=target_column
+                    )
+                    for a in parts
+                ],
+            }
 
     # Generic known functions: MIN/MAX/SUM/COUNT/ABS/ROUND/CONCAT/...
     gen_fn = re.match(
@@ -996,32 +1306,53 @@ def _find_top_level_as(text: str) -> int | None:
     return None
 
 
+def _datatype_literal(sql_type: str) -> dict[str, Any]:
+    """SQL type text (``decimal (18, 2)``) -> normalized STRING literal (``DECIMAL(18,2)``)."""
+    normalized = re.sub(r"\s*([(),])\s*", r"\1", " ".join(sql_type.split())).upper()
+    return {"type": "LITERAL", "value_type": "STRING", "value": normalized}
+
+
 def _try_parse_cast(
     text: str,
     default_entity: str,
     target_column: str,
 ) -> dict[str, Any] | None:
-    """``CAST(expr AS type)`` -> the inner expr's AST.
+    """``CAST(expr AS type)`` / ``CONVERT(type, expr[, style])`` -> ``CONVERT(expr, type)``.
 
-    4X has no explicit cast operator; the target SQL type carries no
-    derivation-relevant information, so it is dropped and the wrapped
-    expression is parsed on its own. Without this, the entire cast
-    (including the type/precision) fell through to the final fallback and
-    became a STRING literal of the raw SQL text.
+    4X's ``CONVERT(<FieldName>,<toWhichDataType>)`` takes the value first and
+    the type second -- the reverse of T-SQL's CONVERT. The T-SQL style code
+    (third argument) has no platform equivalent and is dropped.
     """
     m = re.match(r"(?is)^CAST\s*\((?P<inner>.*)\)\s*$", text)
-    if not m or not _balanced(m.group("inner")):
-        return None
-    inner = m.group("inner")
-    split_at = _find_top_level_as(inner)
-    if split_at is None:
-        return None
-    expr_sql = inner[:split_at].strip()
-    if not expr_sql:
-        return None
-    return parse_sql_expression_to_ast(
-        expr_sql, default_entity=default_entity, target_column=target_column
-    )
+    if m and _balanced(m.group("inner")):
+        inner = m.group("inner")
+        split_at = _find_top_level_as(inner)
+        if split_at is None:
+            return None
+        expr_sql = inner[:split_at].strip()
+        type_sql = inner[split_at + 2 :].strip()
+        if not expr_sql or not type_sql:
+            return None
+    else:
+        m = re.match(r"(?is)^CONVERT\s*\((?P<inner>.*)\)\s*$", text)
+        if not m or not _balanced(m.group("inner")):
+            return None
+        parts = _split_top_level(m.group("inner"), ",")
+        if len(parts) not in {2, 3}:
+            return None
+        type_sql, expr_sql = parts[0].strip(), parts[1].strip()
+        if not expr_sql or not type_sql:
+            return None
+    return {
+        "type": "FUNCTION_CALL",
+        "function_name": "CONVERT",
+        "arguments": [
+            parse_sql_expression_to_ast(
+                expr_sql, default_entity=default_entity, target_column=target_column
+            ),
+            _datatype_literal(type_sql),
+        ],
+    }
 
 
 def _try_parse_dateadd(
@@ -1324,6 +1655,8 @@ def _node_looks_numeric(node: dict[str, Any] | None) -> bool:
             if func in {"COUNT", "SUM"}:
                 return True
             return any(_node_looks_numeric(a) for a in args)
+        if func == "CONVERT":
+            return _convert_target_base_type(node) in _NUMERIC_SQL_TYPES
         return False
     if node.get("type") == "COLUMN_REF":
         return _is_numeric_column_name(str(node.get("column") or ""))
@@ -1342,7 +1675,17 @@ def _node_looks_date_valued(node: dict[str, Any] | None) -> bool:
         if func == "COALESCE":
             args = node.get("arguments") or []
             return bool(args) and _node_looks_date_valued(args[0])
+        if func == "CONVERT":
+            return _convert_target_base_type(node) in _DATE_SQL_TYPES
     return False
+
+
+def _convert_target_base_type(node: dict[str, Any]) -> str:
+    """``CONVERT(expr, "DECIMAL(18,2)")`` -> ``"DECIMAL"`` (empty when not a literal type)."""
+    args = node.get("arguments") or []
+    if len(args) < 2 or not _is_string_literal_node(args[1]):
+        return ""
+    return str(args[1].get("value") or "").split("(", 1)[0].strip().upper()
 
 
 def _sanitize_addday_misuse(node: dict[str, Any], target_column: str) -> dict[str, Any]:

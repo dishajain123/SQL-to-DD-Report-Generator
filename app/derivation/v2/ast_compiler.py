@@ -452,6 +452,177 @@ def _compile_if_then_else(node: dict[str, Any]) -> str:
     return "".join(parts)
 
 
+# --- Data type inference ------------------------------------------------------
+#
+# The DD "Data Type" column describes the VALUE a formula produces, so it is
+# inferred from the AST's value leaves (THEN/ELSE payloads), never from its
+# conditions. Precedence when branches disagree: String > Date > Decimal >
+# Integer — a column that can hold 'NOT_APPLICABLE' is a String column even
+# if another branch returns 0.
+
+DATA_TYPE_STRING = "String"
+DATA_TYPE_INTEGER = "Integer"
+DATA_TYPE_DECIMAL = "Decimal"
+DATA_TYPE_DATE = "Date"
+_TYPE_PRECEDENCE = (DATA_TYPE_STRING, DATA_TYPE_DATE, DATA_TYPE_DECIMAL, DATA_TYPE_INTEGER)
+
+_SQL_TYPE_FAMILIES = {
+    DATA_TYPE_STRING: {"VARCHAR", "NVARCHAR", "CHAR", "NCHAR", "TEXT", "NTEXT", "VARCHAR2",
+                       "NVARCHAR2", "CLOB", "STRING", "UNIQUEIDENTIFIER"},
+    DATA_TYPE_INTEGER: {"INT", "INTEGER", "BIGINT", "SMALLINT", "TINYINT", "BIT"},
+    DATA_TYPE_DECIMAL: {"DECIMAL", "NUMERIC", "NUMBER", "MONEY", "SMALLMONEY", "FLOAT",
+                        "REAL", "DOUBLE"},
+    DATA_TYPE_DATE: {"DATE", "DATETIME", "DATETIME2", "SMALLDATETIME", "DATETIMEOFFSET",
+                     "TIMESTAMP", "TIME"},
+}
+
+# Column-name hints, checked in this order (first match wins). Suffix-anchored
+# where a token is ambiguous: "AssetClassAlt_Key" is an integer key, not a
+# class code; "DpdDays" is a count of days, not a date.
+_NAME_TYPE_HINTS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    # "IsUpdatedFlag" / "IsValidated" / "Candidate" are not dates;
+    # "LastUpdatedDate" still matches on its trailing "Date".
+    (DATA_TYPE_DATE, re.compile(
+        r"(?i)((?<!UP)(?<!LI)(?<!DI)DATE|TIMESTAMP|_DT$|(?<=[a-z])DT$|DOB$)"
+    )),
+    (DATA_TYPE_INTEGER, re.compile(
+        # (?<!AC)(?<!DIS): "Account" / "Discount" are not counters.
+        r"(?i)(DAYS$|_DAYS_|(?<!AC)(?<!DIS)COUNT$|CNT$|_KEY$|ALTKEY$|TIMEKEY|QTY$|"
+        r"SEQ$|STEP$|RANK$|YEARS$|MONTHS$)"
+    )),
+    (DATA_TYPE_DECIMAL, re.compile(
+        r"(?i)(AMT|AMOUNT|(?<!GLO)BAL$|BALANCE|PENAL|INTEREST|RATE$|PCT|PERCENT|RATIO|PRINCIPAL|"
+        r"EXPOSURE|PROVISION|LIMIT$|VALUE$|PRICE|FEE$|FEES$|CHARGE)"
+    )),
+    (DATA_TYPE_STRING, re.compile(
+        r"(?i)(FLAG|FLG$|YN$|CODE$|TYPE$|BUCKET|STATUS|NAME$|CLASS$|REASON|DESC|MESSAGE|"
+        r"COMMENT|REMARK|CATEGORY|SEGMENT|COMPLETED$|WORSENED$|APPLIED$)"
+    )),
+)
+
+_INTEGER_FUNCTIONS = {"DATEDIFF", "DATEPART", "LEN", "COUNT"}
+_DATE_FUNCTIONS = {"ADDDAY", "TODATE", "SOM", "EOM", "SOY", "EOY", "SOFY", "EOFY", "SOQ", "EOQ"}
+_STRING_FUNCTIONS = {"CONCAT", "SUBSTR", "UPPER", "LOWER", "TRIM", "REPLACE", "REGEX"}
+_PASSTHROUGH_FUNCTIONS = {"COALESCE", "MAX", "MIN", "ABS", "SUM"}
+
+
+def sql_type_to_data_type(sql_type: str | None) -> str | None:
+    """Map a declared SQL type (``DECIMAL(18,2)``, ``varchar``) to a DD data type."""
+    base = re.split(r"[\s(]", (sql_type or "").strip().upper(), maxsplit=1)[0]
+    for family, names in _SQL_TYPE_FAMILIES.items():
+        if base in names:
+            return family
+    return None
+
+
+def data_type_from_column_name(name: str | None) -> str | None:
+    text = (name or "").strip().strip('"').lstrip("@#")
+    for family, pattern in _NAME_TYPE_HINTS:
+        if pattern.search(text):
+            return family
+    return None
+
+
+def _combine_types(types: list[str | None]) -> str | None:
+    present = {t for t in types if t}
+    for family in _TYPE_PRECEDENCE:
+        if family in present:
+            return family
+    return None
+
+
+def column_type_key(entity: str | None, column: str | None) -> str:
+    return f"{(entity or '').strip().lstrip('#').upper()}.{(column or '').strip().upper()}"
+
+
+def infer_value_data_type(
+    node: dict[str, Any] | None,
+    *,
+    target_entity: str,
+    target_column: str,
+    known_types: dict[str, str] | None = None,
+    scalar_types: dict[str, str] | None = None,
+) -> str | None:
+    """Infer the data type of the value an AST produces (``None`` = unknown).
+
+    ``known_types`` maps :func:`column_type_key` → data type for other DD
+    columns (so a pure copy ``SET DpdBucket = Source.DpdBucket`` inherits the
+    source column's type); ``scalar_types`` maps upper-cased ``@VAR`` → declared
+    SQL type. Reads of the target column itself are pass-through and ignored.
+    """
+    known = known_types or {}
+    scalars = {k.upper(): v for k, v in (scalar_types or {}).items()}
+    self_key = column_type_key(target_entity, target_column)
+
+    def ref_type(entity: str, column: str) -> str | None:
+        if column.startswith("@") or entity.startswith("@"):
+            name = column if column.startswith("@") else entity
+            return sql_type_to_data_type(scalars.get(name.upper())) or data_type_from_column_name(name)
+        return known.get(column_type_key(entity, column)) or data_type_from_column_name(column)
+
+    def walk(n: Any) -> str | None:
+        if not isinstance(n, dict):
+            return None
+        kind = n.get("type")
+        if kind == "IF_THEN_ELSE":
+            return _combine_types([walk(n.get("then_branch")), walk(n.get("else_branch"))])
+        if kind == "LITERAL":
+            value_type = str(n.get("value_type") or "").upper()
+            value = n.get("value")
+            if value_type == "NULL" or value is None:
+                return None
+            if value_type == "STRING":
+                return DATA_TYPE_STRING
+            if _is_numeric_value(value):
+                text = str(value).strip().lower()
+                return DATA_TYPE_DECIMAL if ("." in text or "e" in text) else DATA_TYPE_INTEGER
+            return None
+        if kind == "VARIABLE_REF":
+            name = str(n.get("name") or n.get("variable") or "")
+            return ref_type(name, name)
+        if kind == "COLUMN_REF":
+            entity = str(n.get("relationship") or n.get("entity") or "")
+            column = str(n.get("column") or "")
+            if not n.get("relationship") and column_type_key(entity, column) == self_key:
+                return None
+            return ref_type(entity, column)
+        if kind == "BINARY_OP":
+            op = str(n.get("operator") or "").strip()
+            if op not in {"+", "-", "*", "/"}:
+                return None  # comparison/logical: a condition, not a value
+            left, right = walk(n.get("left")), walk(n.get("right"))
+            if DATA_TYPE_STRING in {left, right} and op == "+":
+                return DATA_TYPE_STRING
+            if DATA_TYPE_DATE in {left, right} and op in {"+", "-"}:
+                return DATA_TYPE_DATE
+            if op == "/" or DATA_TYPE_DECIMAL in {left, right}:
+                return DATA_TYPE_DECIMAL
+            if left == DATA_TYPE_INTEGER and right in {DATA_TYPE_INTEGER, None}:
+                return DATA_TYPE_INTEGER
+            if right == DATA_TYPE_INTEGER and left is None:
+                return DATA_TYPE_INTEGER
+            return DATA_TYPE_DECIMAL
+        if kind == "FUNCTION_CALL":
+            func = str(n.get("function_name") or "").upper()
+            args = n.get("arguments") or []
+            if func in _INTEGER_FUNCTIONS:
+                return DATA_TYPE_INTEGER
+            if func in _DATE_FUNCTIONS:
+                return DATA_TYPE_DATE
+            if func in _STRING_FUNCTIONS:
+                return DATA_TYPE_STRING
+            if func == "ROUND":
+                return walk(args[0]) if args else DATA_TYPE_DECIMAL
+            if func == "CONVERT" and len(args) >= 2 and isinstance(args[1], dict):
+                return sql_type_to_data_type(str(args[1].get("value") or "")) or walk(args[0])
+            if func in _PASSTHROUGH_FUNCTIONS:
+                return _combine_types([walk(a) for a in args])
+            return None
+        return None
+
+    return walk(node)
+
+
 def _compile_membership_value(value: Any) -> str:
     if isinstance(value, dict):
         # A MEMBERSHIP_OP value can itself be an uncompiled AST node (e.g. a

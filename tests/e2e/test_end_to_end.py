@@ -13,7 +13,7 @@ def test_full_pipeline_generate_dd(
     db.init_db(tmp_db_path)
 
     job_plan = JobPlan(
-        job_id="job-e2e-1", intent=Intent.GENERATE_DD, company="Acme Bank",
+        job_id="job-e2e-1", intent=Intent.GENERATE_DD, company="Default",
         platform="4X",
     )
     pipeline = build_pipeline(llm_client=mock_llm_client)
@@ -70,7 +70,7 @@ def test_full_pipeline_skips_dd_generation_for_explain_intent(
     db.init_db(tmp_db_path)
 
     job_plan = JobPlan(
-        job_id="job-e2e-2", intent=Intent.EXPLAIN, company="Acme Bank", platform="4X",
+        job_id="job-e2e-2", intent=Intent.EXPLAIN, company="Default", platform="4X",
     )
     pipeline = build_pipeline(llm_client=mock_llm_client)
 
@@ -96,7 +96,7 @@ def test_full_pipeline_persists_dd_rows_for_review(
     db.init_db(tmp_db_path)
 
     job_plan = JobPlan(
-        job_id="job-e2e-3", intent=Intent.GENERATE_DD, company="Acme Bank", platform="4X",
+        job_id="job-e2e-3", intent=Intent.GENERATE_DD, company="Default", platform="4X",
     )
     pipeline = build_pipeline(llm_client=broken_llm_client)
     result = pipeline.invoke(

@@ -55,6 +55,17 @@ In a second terminal:
 .venv/bin/streamlit run app/review/streamlit_app.py
 ```
 
+To run a whole folder (or `.zip`) of procedures without the UI or API:
+
+```bash
+python -m pipeline --input-dir PRO_SPs/ --output-dir dist/
+```
+
+Files may be UTF-8, UTF-8 with BOM, UTF-16 LE/BE (SSMS "Unicode", with or
+without BOM) or cp1252. Each file gets its own job folder under `dist/`, and
+`dist/batch_summary.md` lists the detected encoding, row counts and any genuine
+parse failures per file. No API key is needed.
+
 If you want to run the LLM-backed steps for real, set these in `.env` before
 starting the app:
 
@@ -128,7 +139,7 @@ cp .env.example .env
 Then edit `.env` and set:
 
 ```env
-DEFAULT_COMPANY_NAME=Acme Bank
+DEFAULT_COMPANY_NAME=Default
 DEFAULT_PLATFORM_NAME=4X
 DEFAULT_INTENT=Generate DD
 DEFAULT_FUNCTION_REFERENCE_PATH=samples/platform_docs/4x_functions_operators.md
@@ -251,7 +262,7 @@ with open('samples/sql/PRO_MaxDPD_ReferencePeriod_Calculation_StoredProcedure.sq
 with open('samples/sql/PRO_NPA_Date_Calculation_StoredProcedure_1.sql') as f: npa = f.read()
 with open('samples/platform_docs/4x_functions_operators.md') as f: func_ref = f.read()
 
-job_plan = JobPlan(job_id='sample-job-1', intent=Intent.GENERATE_DD, company='Acme Bank', platform='4X', include_dd_excel=True)
+job_plan = JobPlan(job_id='sample-job-1', intent=Intent.GENERATE_DD, company='Default', platform='4X', include_dd_excel=True)
 pipeline = build_pipeline(llm_client=MockLLMClient())
 result = pipeline.invoke({
     'job_plan': job_plan,

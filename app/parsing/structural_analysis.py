@@ -76,6 +76,12 @@ def analyze_object(obj: SQLObject) -> StructuralInfo:
     parsed_ok_count = sum(1 for s in dml_statements if s.parsed_ok)
     confidence = parsed_ok_count / len(dml_statements) if dml_statements else 1.0
 
+    parse_failures = [
+        f"stmt #{s.statement_index} {s.statement_type}"
+        f"{' → ' + ', '.join(s.tables_written) if s.tables_written else ''}: {s.parse_error}"
+        for s in dml_statements
+        if not s.parsed_ok and s.parse_error
+    ]
     unsupported = [s.parse_error for s in dml_statements if not s.parsed_ok and s.parse_error]
     smart_chunks = build_smart_chunks(obj.object_id, statements)
     chunk_confidence = min((chunk.confidence for chunk in smart_chunks), default=1.0)
@@ -112,6 +118,7 @@ def analyze_object(obj: SQLObject) -> StructuralInfo:
         smart_chunks=smart_chunks,
         confidence=round(min(confidence, chunk_confidence), 3),
         unsupported_constructs=unsupported,
+        parse_failures=parse_failures,
     )
 
 

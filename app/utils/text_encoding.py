@@ -37,8 +37,57 @@ class DecodedText:
     encoding: str
 
 
+_BOMS = (
+    (b"\xef\xbb\xbf", "utf-8-sig"),
+    (b"\xff\xfe", "utf-16"),  # UTF-16 LE (SSMS "Unicode")
+    (b"\xfe\xff", "utf-16"),  # UTF-16 BE
+)
+
+
+def _bomless_utf16_encoding(data: bytes) -> str | None:
+    """Detect UTF-16 without a BOM from its NUL-byte pattern.
+
+    ASCII-range SQL saved as UTF-16 LE has a NUL in (almost) every odd byte;
+    BE has them in even bytes. Real single-byte text has essentially none.
+    """
+    sample = data[:4096]
+    if len(sample) < 4:
+        return None
+    even_nuls = sample[0::2].count(0)
+    odd_nuls = sample[1::2].count(0)
+    half = len(sample) / 2
+    if odd_nuls >= 0.4 * half and even_nuls <= 0.05 * half:
+        return "utf-16-le"
+    if even_nuls >= 0.4 * half and odd_nuls <= 0.05 * half:
+        return "utf-16-be"
+    return None
+
+
 def decode_text_bytes(data: bytes) -> DecodedText:
-    """Decode bytes into text using common SQL-friendly encodings."""
+    """Decode bytes into text using common SQL-friendly encodings.
+
+    A byte-order mark decides the encoding outright. Without one, UTF-16 is
+    recognised by its NUL-byte pattern before any single-byte codec is tried:
+    cp1252/latin-1 accept every byte, so trying them first would turn a
+    UTF-16 file into NUL-interleaved text instead of failing.
+    """
+    for bom, encoding in _BOMS:
+        if data.startswith(bom):
+            try:
+                text = data.decode(encoding)
+            except UnicodeDecodeError:
+                break  # a truncated / corrupt file: fall back to the heuristics below
+            return DecodedText(text=_normalize_exotic_whitespace(text), encoding=encoding)
+    bomless = _bomless_utf16_encoding(data)
+    if bomless:
+        try:
+            text = data.decode(bomless)
+        except UnicodeDecodeError:
+            pass
+        else:
+            if _looks_like_text(text):
+                return DecodedText(text=_normalize_exotic_whitespace(text), encoding=bomless)
+
     last_error: UnicodeDecodeError | None = None
     for encoding in _COMMON_ENCODINGS:
         try:
@@ -75,6 +124,40 @@ def decode_text_bytes(data: bytes) -> DecodedText:
         min(len(data), 1),
         "Could not decode uploaded file as readable text using common encodings",
     )
+
+
+def read_sql_file(path) -> str:
+    """Read a SQL file from disk in whatever encoding it was saved in."""
+    from pathlib import Path
+
+    return decode_text_bytes(Path(path).read_bytes()).text
+
+
+def normalize_sql_text(text: str) -> str:
+    """Repair SQL text that was already decoded with the wrong codec.
+
+    Text arriving through the API is a ``str`` decoded by the client. A client
+    that read a UTF-16 file as latin-1/cp1252 delivers ``"U\\x00P\\x00…"``
+    (with ``"ÿþ"`` in front); that is re-encoded and decoded as UTF-16. A
+    stray BOM character left by a UTF-8-sig or UTF-16 decode is dropped.
+    """
+    if not text:
+        return text
+    if "\x00" in text:
+        for codec in ("latin-1", "cp1252"):
+            try:
+                raw = text.encode(codec)
+            except UnicodeEncodeError:
+                continue
+            try:
+                repaired = decode_text_bytes(raw).text
+            except UnicodeDecodeError:
+                continue
+            if "\x00" not in repaired:
+                text = repaired
+                break
+        text = text.replace("\x00", "")
+    return text.lstrip("﻿")
 
 
 _NON_TEXT_UNICODE_CATEGORIES = {"Cc", "Cf", "Co", "Cs", "Cn"}

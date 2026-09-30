@@ -285,10 +285,9 @@ def sample_sql_paths(root: Path | None = None) -> list[Path]:
 
 
 def read_sql_file(path: Path) -> str:
-    raw = path.read_bytes()
-    for encoding in ("utf-8-sig", "utf-16", "utf-16-le", "latin-1"):
-        try:
-            return raw.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    return raw.decode("utf-8", errors="replace")
+    # One decoder for every reader. The previous chain tried "utf-16" before
+    # "latin-1", and UTF-16 decoding accepts almost any even-length byte
+    # string — so a cp1252 file with one non-UTF-8 byte came back as CJK noise.
+    from app.utils.text_encoding import read_sql_file as _read
+
+    return _read(path)

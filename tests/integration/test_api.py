@@ -38,7 +38,7 @@ def test_submit_job_rejects_bad_file_extension(client):
     response = client.post(
         "/api/jobs",
         json={
-            "company": "Acme",
+            "company": "Default",
             "platform": "4X",
             "intent": "Explain",
             "files": {"notes.txt": "hello"},
@@ -51,7 +51,7 @@ def test_submit_job_rejects_empty_file_list(client):
     response = client.post(
         "/api/jobs",
         json={
-            "company": "Acme",
+            "company": "Default",
             "platform": "4X",
             "intent": "Explain",
             "files": {},
@@ -74,7 +74,7 @@ def test_submit_job_passes_optional_context_to_pipeline(client, dpd_calculation_
     response = client.post(
         "/api/jobs",
         json={
-            "company": "Acme",
+            "company": "Default",
             "platform": "4X",
             "intent": "Generate DD",
             "function_reference": "IF / THEN / ELSE reference",

@@ -11,7 +11,9 @@ load_dotenv()
 
 @dataclass(frozen=True)
 class Settings:
-    default_company_name: str = os.getenv("DEFAULT_COMPANY_NAME", "Acme Bank")
+    # Neutral placeholder: the company is a required job field but is never
+    # shown in the UI or reports. An empty env value falls back to it too.
+    default_company_name: str = os.getenv("DEFAULT_COMPANY_NAME") or "Default"
     default_platform_name: str = os.getenv("DEFAULT_PLATFORM_NAME", "4X")
     default_intent: str = os.getenv("DEFAULT_INTENT", "Generate DD")
     default_function_reference_path: str = os.getenv(

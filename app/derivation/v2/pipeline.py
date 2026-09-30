@@ -5,19 +5,31 @@ objects compatible with the existing report / export / review stack.
 """
 from __future__ import annotations
 
+import re
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import date
 from typing import Any, Optional
 
-from app.derivation.v2.ast_compiler import compile_ast_to_4x_string
+from app.derivation.v2.ast_compiler import (
+    DATA_TYPE_STRING,
+    column_type_key,
+    compile_ast_to_4x_string,
+    data_type_from_column_name,
+    infer_value_data_type,
+    sql_type_to_data_type,
+)
+from app.derivation.v2.execution_steps import build_execution_steps, is_identity_write
 from app.derivation.v2.phase1_lineage import LineageMap, build_lineage_map
 from app.derivation.v2.phase2_mutation_folder import MutationPass, fold_column_mutations
 from app.derivation.v2.phase3_ast_generator import generate_ast
 from app.derivation.v2.phase4_metadata import build_metadata, metadata_to_dd_row
 from app.derivation.v2.semantic_checks import mutation_semantic_errors
+from app.derivation.v2.sql_text import extract_declared_column_types, normalize_table_name
 from app.models.core import (
     CanonicalModel,
     DDRow,
+    ExecutionStep,
     LineageChain,
     SQLObject,
     StructuralInfo,
@@ -67,18 +79,20 @@ def generate_dd_rows_for_chains(
         return []
 
     max_workers = max(1, min(settings.dd_generation_max_workers, len(jobs)))
+    results: list[tuple[DDRow, _DerivedColumn | None]] = []
     if max_workers == 1:
-        rows: list[DDRow] = []
         for job in jobs:
-            rows.extend(_run_column_job(*job))
-        return rows
+            results.extend(_run_column_job(*job))
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_run_column_job, *job) for job in jobs]
+            for fut in futures:
+                results.extend(fut.result())
 
-    results: list[DDRow] = []
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(_run_column_job, *job) for job in jobs]
-        for fut in futures:
-            results.extend(fut.result())
-    return results
+    _resolve_copied_data_types(results)
+    rows = [row for row, _ in results]
+    rows.sort(key=_execution_sort_key(chains))
+    return rows
 
 
 def generate_dd_rows(
@@ -120,62 +134,207 @@ def generate_for_sql(
 ) -> tuple[DDRow, dict[str, Any]]:
     """Run phases 1–4 for one entity.column against raw SQL (CLI / tests)."""
     lineage = build_lineage_map(sql_text, entity_map)
-    mutations = fold_column_mutations(
-        sql_text, target_entity, target_column, lineage, entity_map
-    )
-    ast = generate_ast(
-        mutations,
-        target_entity=resolve_entity_name(target_entity, entity_map) or target_entity,
-        target_column=target_column,
-        llm_client=llm_client,
-    )
-    try:
-        formula = compile_ast_to_4x_string(ast)
-    except Exception as exc:
-        logger.exception("AST compile failed for %s.%s", target_entity, target_column)
-        formula = ""
-        compile_error = str(exc)
-    else:
-        compile_error = None
-
     entity = resolve_entity_name(target_entity, entity_map) or target_entity
-    mutation_deps: list[str] = []
-    for m in mutations:
-        mutation_deps.extend(m.dependency_refs or [])
+    derived = _derive_column(
+        sql_text,
+        entity,
+        target_column,
+        lineage,
+        entity_map,
+        fold_entity=target_entity,
+        llm_client=llm_client,
+        business_summary=business_summary,
+        timekey_map=timekey_map,
+        statement_label="",
+    )
+    row = metadata_to_dd_row(
+        derived.meta,
+        source_chain_id=source_chain_id,
+        source_object_ids=list(source_object_ids or []),
+        source_statement_refs=[
+            f"stmt #{m.statement_index} (ordinal={m.ordinal})" for m in derived.mutations
+        ],
+        source_statement_sql=[m.raw_sql for m in derived.mutations],
+        data_type=derived.data_type,
+    )
+    derived.apply_to(row)
+    debug = {
+        "lineage": lineage.as_dict(),
+        "mutations": [m.as_dict() for m in derived.mutations],
+        "ast": derived.ast,
+        "formula": derived.formula,
+        "exception_handler_formula": derived.exception_formula,
+        "metadata": derived.meta.as_platform_dict(),
+    }
+    return row, debug
+
+
+@dataclass
+class _DerivedColumn:
+    """Everything phases 2–4 produce for one column, before it becomes a DDRow."""
+
+    mutations: list[MutationPass]
+    ast: dict[str, Any]
+    formula: str
+    exception_formula: str
+    meta: Any
+    data_type: str
+    declared_type: str | None
+    scalar_types: dict[str, str]
+    execution_order: int | None
+    steps: list[ExecutionStep]
+    advisories: list[str]
+    workflow_gates: list[str]
+
+    def apply_to(self, row: DDRow) -> None:
+        row.execution_order = self.execution_order
+        row.execution_steps = list(self.steps)
+        row.workflow_gates = list(self.workflow_gates)
+        row.exception_handler_expression = self.exception_formula
+        row.advisory_notes = list(dict.fromkeys([*row.advisory_notes, *self.advisories]))
+
+
+def _compile(ast: dict[str, Any]) -> tuple[str, str | None]:
+    try:
+        return compile_ast_to_4x_string(ast), None
+    except Exception as exc:
+        return "", str(exc)
+
+
+def _derive_column(
+    sql_text: str,
+    entity: str,
+    column: str,
+    lineage: LineageMap,
+    entity_map: dict[str, str] | None,
+    *,
+    fold_entity: str | None = None,
+    llm_client: Any = None,
+    business_summary: str = "",
+    timekey_map: dict[int, date] | None = None,
+    statement_label: str = "",
+) -> _DerivedColumn:
+    mutations = fold_column_mutations(
+        sql_text, fold_entity or entity, column, lineage, entity_map
+    )
+    # The CATCH handler only runs when the main path fails, so its writes are
+    # never folded into the main formula as if they were later UPDATEs.
+    # A column written only inside CATCH keeps that handler as its formula.
+    main = [m for m in mutations if not m.is_exception_handler]
+    handler = [m for m in mutations if m.is_exception_handler]
+    primary = main or handler
+
+    ast = generate_ast(primary, target_entity=entity, target_column=column, llm_client=llm_client)
+    formula, compile_error = _compile(ast)
+    exception_formula = ""
+    handler_ast: dict[str, Any] | None = None
+    if main and handler:
+        handler_ast = generate_ast(handler, target_entity=entity, target_column=column)
+        exception_formula, _ = _compile(handler_ast)
+
     meta = build_metadata(
         target_entity=entity,
-        target_column=target_column,
+        target_column=column,
         formula=formula,
         ast=ast,
         source_sql=sql_text,
-        mutation_count=len(mutations),
+        mutation_count=len(primary),
         timekey_map=timekey_map,
         business_summary=business_summary,
         mutation_sql_fragments=[m.raw_sql for m in mutations if m.raw_sql],
-        mutation_dependency_refs=mutation_deps,
+        mutation_dependency_refs=[ref for m in mutations for ref in (m.dependency_refs or [])],
     )
-    meta.validation_errors.extend(mutation_semantic_errors(mutations, sql_text))
+    meta.validation_errors.extend(mutation_semantic_errors(primary, sql_text))
     if compile_error:
         meta.validation_errors.append(f"AST compile error: {compile_error}")
         meta.confidence = min(meta.confidence, 0.2)
 
-    row = metadata_to_dd_row(
-        meta,
-        source_chain_id=source_chain_id,
-        source_object_ids=list(source_object_ids or []),
-        source_statement_refs=[
-            f"stmt #{m.statement_index} (ordinal={m.ordinal})" for m in mutations
-        ],
-        source_statement_sql=[m.raw_sql for m in mutations],
+    steps, advisories = build_execution_steps(
+        mutations,
+        sql_text=sql_text,
+        target_entity=entity,
+        target_column=column,
+        statement_label=statement_label,
     )
-    debug = {
-        "lineage": lineage.as_dict(),
-        "mutations": [m.as_dict() for m in mutations],
-        "ast": ast,
-        "formula": formula,
-        "metadata": meta.as_platform_dict(),
-    }
-    return row, debug
+    if handler and not main:
+        advisories.append(
+            f"{entity}.{column} is written only inside the BEGIN CATCH exception handler; "
+            "this formula applies only when the procedure fails."
+        )
+
+    gates: list[str] = []
+    for m in primary:
+        if m.workflow_gate:
+            label = f"{m.workflow_gate} := IF {m.workflow_gate_condition}"
+            if label not in gates:
+                gates.append(label)
+    if gates:
+        advisories.append(
+            f"Procedural context: {entity}.{column} is written inside procedure-wide "
+            f"branches ({'; '.join(gates)}). SQL Server evaluates each gate once for the "
+            "whole table and runs only the first branch that holds; the formula applies "
+            "each branch's condition row by row instead. Rows that satisfy a later "
+            "branch's condition while an earlier gate holds for the run can differ, so "
+            "exact behaviour needs a platform workflow step that evaluates the gate."
+        )
+
+    declared_types = extract_declared_column_types(sql_text)
+    declared = _declared_column_type(declared_types, fold_entity or entity, entity, column=column)
+    data_type = (
+        sql_type_to_data_type(declared)
+        or infer_value_data_type(
+            ast, target_entity=entity, target_column=column,
+            scalar_types=declared_types.get("@"),
+        )
+        or (handler_ast and infer_value_data_type(
+            handler_ast, target_entity=entity, target_column=column,
+            scalar_types=declared_types.get("@"),
+        ))
+        or data_type_from_column_name(column)
+        or DATA_TYPE_STRING
+    )
+
+    return _DerivedColumn(
+        mutations=mutations,
+        ast=ast,
+        formula=formula,
+        exception_formula=exception_formula,
+        meta=meta,
+        data_type=data_type,
+        declared_type=declared,
+        scalar_types=declared_types.get("@", {}),
+        execution_order=_execution_order(
+            [m for m in mutations if not is_identity_write(m, entity, column)] or mutations,
+            column,
+        ),
+        steps=steps,
+        advisories=advisories,
+        workflow_gates=gates,
+    )
+
+
+def _declared_column_type(
+    declared: dict[str, dict[str, str]], *entity_names: str, column: str
+) -> str | None:
+    for name in entity_names:
+        table = normalize_table_name(name or "").upper()
+        for key in (table, f"#{table.lstrip('#')}", table.lstrip("#")):
+            found = declared.get(key, {}).get(column.upper())
+            if found:
+                return found
+    return None
+
+
+def _execution_order(mutations: list[MutationPass], column: str) -> int | None:
+    """Offset of the column's first assignment (statement start + column offset).
+
+    Columns set in the same statement keep their SET / column-list order.
+    """
+    if not mutations:
+        return None
+    first = min(mutations, key=lambda m: m.source_position)
+    match = re.search(rf"(?i)\b{re.escape(column)}\b", first.raw_sql or "")
+    return first.source_position + (match.start() if match else 0)
 
 
 def _build_column_jobs(
@@ -237,56 +396,32 @@ def _run_column_job(
     llm_client: Any,
     entity_name_map: dict[str, str] | None,
     timekey_map: dict[int, date] | None,
-) -> list[DDRow]:
+) -> list[tuple[DDRow, _DerivedColumn | None]]:
     try:
-        mutations = fold_column_mutations(
-            obj.raw_sql, entity, column, lineage, entity_name_map
-        )
-
-        ast = generate_ast(
-            mutations,
-            target_entity=entity,
-            target_column=column,
+        derived = _derive_column(
+            obj.raw_sql,
+            entity,
+            column,
+            lineage,
+            entity_name_map,
             llm_client=llm_client,
-        )
-        try:
-            formula = compile_ast_to_4x_string(ast)
-            compile_error = None
-        except Exception as exc:
-            formula = ""
-            compile_error = str(exc)
-
-        meta = build_metadata(
-            target_entity=entity,
-            target_column=column,
-            formula=formula,
-            ast=ast,
-            source_sql=obj.raw_sql,
-            mutation_count=len(mutations),
-            timekey_map=timekey_map,
             business_summary=canonical_model.business_summary or "",
-            mutation_sql_fragments=[m.raw_sql for m in mutations if m.raw_sql],
-            mutation_dependency_refs=[
-                ref for m in mutations for ref in (m.dependency_refs or [])
-            ],
+            timekey_map=timekey_map,
+            statement_label=f"{obj.source_file} ",
         )
-        meta.validation_errors.extend(mutation_semantic_errors(mutations, obj.raw_sql))
-        if compile_error:
-            meta.validation_errors.append(f"AST compile error: {compile_error}")
-            meta.confidence = min(meta.confidence, 0.2)
-
         row = metadata_to_dd_row(
-            meta,
+            derived.meta,
             source_chain_id=chain.chain_id,
             source_object_ids=[obj.object_id],
             source_statement_refs=[
                 f"{obj.source_file} stmt #{m.statement_index} (ordinal={m.ordinal})"
-                for m in mutations
+                for m in derived.mutations
             ],
-            source_statement_sql=[m.raw_sql for m in mutations],
-            data_type=_guess_data_type(column, formula),
+            source_statement_sql=[m.raw_sql for m in derived.mutations],
+            data_type=derived.data_type,
         )
-        return [row]
+        derived.apply_to(row)
+        return [(row, derived)]
     except Exception as exc:  # pragma: no cover - never crash the whole job
         logger.exception(
             "v2 derivation failed for %s.%s in %s: %s",
@@ -298,8 +433,10 @@ def _run_column_job(
         meta = build_metadata(target_entity=entity, target_column=column,
                               formula="", source_sql=obj.raw_sql)
         meta.validation_errors.append(f"Generation failed: {exc}")
-        return [metadata_to_dd_row(meta, source_chain_id=chain.chain_id,
-                                   source_object_ids=[obj.object_id])]
+        return [(metadata_to_dd_row(meta, source_chain_id=chain.chain_id,
+                                    source_object_ids=[obj.object_id],
+                                    data_type=data_type_from_column_name(column)
+                                    or DATA_TYPE_STRING), None)]
 
 
 def _is_non_derivation_table(entity: str) -> bool:
@@ -312,14 +449,47 @@ def _is_non_derivation_table(entity: str) -> bool:
     }
 
 
-def _guess_data_type(column: str, formula: str) -> str:
-    name = (column or "").upper()
-    if any(tok in name for tok in ("DATE", "DT", "TIME")):
-        return "Date"
-    if any(tok in name for tok in ("FLAG", "FLG", "YN")):
-        return "String"
-    if any(tok in name for tok in ("AMT", "AMOUNT", "PCT", "PERCENT", "BAL", "DPD")):
-        return "Decimal"
-    if formula and any(ch.isdigit() for ch in formula) and "IF(" not in formula.upper():
-        return "Decimal"
-    return "String"
+def _resolve_copied_data_types(results: list[tuple[DDRow, _DerivedColumn | None]]) -> None:
+    """Let a column that copies another DD column inherit that column's type.
+
+    ``SET S.DpdBucket = A.DpdBucket`` carries no literal to infer from; once
+    every row has a first-pass type, re-infer with the other rows' types
+    known. Declared (CREATE TABLE) types are never overridden.
+    """
+    for _ in range(2):  # a second pass settles copy-of-a-copy chains
+        known = {
+            column_type_key(row.entity_name, row.column_name): row.data_type
+            for row, _ in results
+        }
+        for row, derived in results:
+            if derived is None or derived.declared_type:
+                continue
+            others = {k: v for k, v in known.items()
+                      if k != column_type_key(row.entity_name, row.column_name)}
+            inferred = infer_value_data_type(
+                derived.ast,
+                target_entity=row.entity_name,
+                target_column=row.column_name,
+                known_types=others,
+                scalar_types=derived.scalar_types,
+            )
+            if inferred:
+                row.data_type = inferred
+
+
+def _execution_sort_key(chains: list[LineageChain]):
+    """Rows in chain order, then object order, then SQL execution order."""
+    chain_rank = {chain.chain_id: i for i, chain in enumerate(chains)}
+    object_rank: dict[str, int] = {}
+    for chain in chains:
+        for i, oid in enumerate(chain.order or chain.object_ids):
+            object_rank.setdefault(oid, i)
+
+    def key(row: DDRow) -> tuple:
+        oid = row.source_object_ids[0] if row.source_object_ids else ""
+        order = row.execution_order if row.execution_order is not None else float("inf")
+        return (chain_rank.get(row.source_chain_id, len(chain_rank)),
+                object_rank.get(oid, len(object_rank)), order,
+                row.entity_name.upper(), row.column_name.upper())
+
+    return key

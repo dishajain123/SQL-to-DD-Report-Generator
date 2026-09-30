@@ -116,7 +116,12 @@ class StructuralInfo(BaseModel):
     version_thresholds: list[VersionThreshold] = Field(default_factory=list)
     smart_chunks: list["SmartChunk"] = Field(default_factory=list)
     confidence: float = 1.0
+    # Everything that needs attention: real parse failures PLUS coverage-ledger
+    # blockers (procedure branches, temp staging, MERGE, CATCH, anomalies).
     unsupported_constructs: list[str] = Field(default_factory=list)
+    # Only statements sqlglot genuinely could not parse. Kept separate so a
+    # well-formed UPDATE inside an IF branch is never reported as unparseable.
+    parse_failures: list[str] = Field(default_factory=list)
 
     @property
     def is_valid(self) -> bool:
@@ -196,6 +201,30 @@ class ReviewState(str, Enum):
     UNSUPPORTED = "UNSUPPORTED"
 
 
+class ExecutionStep(BaseModel):
+    """One source write to a DD column, in SQL execution order.
+
+    The DD formula folds every step into one expression; the steps keep the
+    sequence visible so an overwritten assignment (e.g. a value set in step 2
+    and replaced in step 3) is still traceable.
+    """
+
+    step: int
+    statement_ref: str = ""
+    source_line: Optional[int] = None
+    operation: str = "UPDATE"
+    # "Main" or "Exception handler (CATCH)".
+    scope: str = "Main"
+    # Procedure-wide gate label (e.g. "Gate 1") this write sits under.
+    workflow_gate: Optional[str] = None
+    row_condition: str = ""
+    # "JOIN Table ON a = b" for UPDATE/INSERT … FROM … JOIN sources: an INNER
+    # JOIN also limits which rows the statement touches.
+    join_conditions: list[str] = Field(default_factory=list)
+    assigned_value: str = ""
+    notes: list[str] = Field(default_factory=list)
+
+
 class DDRow(BaseModel):
     """One row of the Derivation Dictionary output — matches the platform's
     Derivations export schema exactly (Entity Name, Column Name, ...)."""
@@ -235,6 +264,16 @@ class DDRow(BaseModel):
     confidence: float = 1.0
     validation_errors: list[str] = Field(default_factory=list)
     advisory_notes: list[str] = Field(default_factory=list)
+    # Position of this column's first write in the (comment-stripped) source
+    # SQL. Reports sort rules by it so they read in execution order.
+    execution_order: Optional[int] = None
+    execution_steps: list[ExecutionStep] = Field(default_factory=list)
+    # Procedure-wide IF gates this column's writes sit under, as
+    # "Gate N := IF <original SQL condition>". Report context only — the
+    # exported formula never references them.
+    workflow_gates: list[str] = Field(default_factory=list)
+    # Formula for the BEGIN CATCH path, kept apart from the main (TRY) formula.
+    exception_handler_expression: str = ""
 
 
 class ReviewAction(str, Enum):
