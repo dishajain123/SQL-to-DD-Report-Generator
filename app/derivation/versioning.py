@@ -16,10 +16,14 @@ from datetime import date, timedelta
 
 from app.models.core import VersionThreshold
 
-# TIMEKEY 1 == this epoch, in the absence of a real SysDayMatrix mapping.
-# This constant is arbitrary and exists only to produce a deterministic,
-# strictly-increasing synthetic date per TIMEKEY value.
-_SYNTHETIC_EPOCH = date(2000, 1, 1)
+# TIMEKEY 1 == 1950-01-01, in the absence of a real SysDayMatrix mapping.
+# Derived from the sample procedures: `IF @TIMEKEY > 26267` is annotated
+# "IMPLEMENTED FROM 2021-12-01" (PRO.DPD_Calculation), i.e. key 26268 is
+# 2021-12-01, which is exactly 1950-01-01 + 26267 days. The value stays a
+# placeholder (rows are still flagged as synthetic); it only has to be
+# deterministic, strictly increasing, and land in a plausible calendar year
+# instead of the previous 2000-based 2071 dates.
+_SYNTHETIC_EPOCH = date(1949, 12, 31)
 
 
 def group_thresholds_by_variable(

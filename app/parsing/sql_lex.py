@@ -66,23 +66,43 @@ def mask_sql(text: str, *, quotes: bool = True) -> str:
 _SPACED_COMPARISON = re.compile(r'([<>!])([ \t]+)(=)|(<)([ \t]+)(>)')
 
 
-def normalize_comparison_spacing(text: str) -> tuple[str, list[str]]:
-    """Recover split comparison tokens in code only, recording every repair.
+# ``A. SRCASSETCLASSALT_KEY`` -- SQL Server accepts blanks around the dot of a
+# qualified name; every downstream alias/column scanner expects ``A.COL``.
+_SPACED_QUALIFIER = re.compile(r'((?<![\w.])[A-Za-z_#][\w#]*|\])\.([ \t]+)([A-Za-z_][\w#]*)')
 
-    Keep offsets stable by moving the intervening spaces after the operator.
+
+def normalize_comparison_spacing(text: str) -> tuple[str, list[str]]:
+    """Recover split comparison tokens and spaced qualifier dots in code only,
+    recording every repair.
+
+    Keep offsets stable by moving the intervening spaces after the operator
+    (or after the column name for ``A. COL``).
     Never merge across comments/newlines or change quoted values/identifiers.
     This is an explicit parser recovery, not a claim about server acceptance.
     """
-    if not _SPACED_COMPARISON.search(text):
-        return text, []
-    masked = mask_sql(text)
-    out, notes, previous = [], [], 0
-    for match in _SPACED_COMPARISON.finditer(text):
-        if masked[match.start():match.end()] != match.group(0):
-            continue
-        first, gap, last = match.group(1, 2, 3) if match.group(1) else match.group(4, 5, 6)
-        out.extend((text[previous:match.start()], first + last + gap))
-        notes.append(f"Comparison spacing normalized at offset {match.start()}: {match.group(0)!r} -> {first + last!r}")
-        previous = match.end()
-    out.append(text[previous:])
-    return ''.join(out), notes
+    notes: list[str] = []
+    if _SPACED_COMPARISON.search(text):
+        masked = mask_sql(text)
+        out, previous = [], 0
+        for match in _SPACED_COMPARISON.finditer(text):
+            if masked[match.start():match.end()] != match.group(0):
+                continue
+            first, gap, last = match.group(1, 2, 3) if match.group(1) else match.group(4, 5, 6)
+            out.extend((text[previous:match.start()], first + last + gap))
+            notes.append(f"Comparison spacing normalized at offset {match.start()}: {match.group(0)!r} -> {first + last!r}")
+            previous = match.end()
+        out.append(text[previous:])
+        text = ''.join(out)
+    if _SPACED_QUALIFIER.search(text):
+        masked = mask_sql(text)
+        out, previous = [], 0
+        for match in _SPACED_QUALIFIER.finditer(text):
+            if masked[match.start():match.end()] != match.group(0):
+                continue
+            qualifier, gap, column = match.group(1, 2, 3)
+            out.extend((text[previous:match.start()], f"{qualifier}.{column}{gap}"))
+            notes.append(f"Qualifier spacing normalized at offset {match.start()}: {match.group(0)!r} -> {qualifier + '.' + column!r}")
+            previous = match.end()
+        out.append(text[previous:])
+        text = ''.join(out)
+    return text, notes

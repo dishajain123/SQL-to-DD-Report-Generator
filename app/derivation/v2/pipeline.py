@@ -364,6 +364,11 @@ def _build_column_jobs(
 
         source_index = MutationSourceIndex.build(obj.raw_sql)
         columns_by_table = info.columns_written_by_table or {}
+        # The same logical column is often written under case-variant spellings
+        # (``Asset_Norm`` / ``ASSET_NORM``, ``##AccountCal`` / ``##ACCOUNTCAL``).
+        # Mutation folding is case-insensitive, so one job covers all spellings;
+        # a second job would emit a duplicate DD row for the same field.
+        seen_targets: set[tuple[str, str]] = set()
         for table, columns in columns_by_table.items():
             entity = resolve_entity_name(table, entity_name_map) or canonical_logical_name(
                 table
@@ -372,6 +377,10 @@ def _build_column_jobs(
             if _is_non_derivation_table(entity):
                 continue
             for column in columns:
+                target_key = (canonical_logical_name(entity), canonical_logical_name(column))
+                if target_key in seen_targets:
+                    continue
+                seen_targets.add(target_key)
                 jobs.append(
                     (
                         obj,
@@ -453,6 +462,9 @@ def _is_non_derivation_table(entity: str) -> bool:
         "SYSDAYMATRIX",
         "JOB_LOG",
         "ERROR_LOG",
+        # Per-step execution audit (INSERT … ORIGINAL_LOGIN(), 'RUNNING', GETDATE();
+        # UPDATE … EndTime = GETDATE()); its values are runtime metadata, not DD rules.
+        "PROCESSMONITOR",
     }
 
 

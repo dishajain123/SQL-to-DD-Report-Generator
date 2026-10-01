@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 
 from app.derivation.v2.pipeline import generate_dd_rows_for_chains
+from app.guardrails.completeness import enforce_completeness
 from app.guardrails.dd_row_coverage import flag_rows_with_uncovered_writes, mark_ledger_coverage
 from app.guardrails.structural_guardrails import check_structural_info
 from app.models.core import CanonicalModel, Intent, JobPlan, LineageChain
@@ -54,7 +55,8 @@ def generate_sample(path: Path, output_root: Path = OUT) -> dict:
                            technical_summary="Offline deterministic generation from source SQL.",
                            business_summary="")
     rows = generate_dd_rows_for_chains(chains, [model], objects, infos, None, entity_name_map=mapping)
-    blockers = []; ledgers = []
+    blockers = []
+    ledgers = []
     for oid, info in infos.items():
         flag_rows_with_uncovered_writes(rows, info, objects[oid].raw_sql, mapping)
         ledger = build_coverage_ledger(info, source_sql=objects[oid].raw_sql)
@@ -62,10 +64,13 @@ def generate_sample(path: Path, output_root: Path = OUT) -> dict:
         ledgers.append(ledger)
         blockers.extend(ledger.blockers)
         blockers.extend(check_structural_info(info).errors)
+    enforce_completeness(rows, objects, infos, mapping)
+    advisories: list[str] = []
     for row in rows:
         blockers.extend(f"{row.entity_name}.{row.column_name}: {e}" for e in row.validation_errors)
-        blockers.extend(f"{row.entity_name}.{row.column_name}: {e}" for e in row.advisory_notes)
+        advisories.extend(f"{row.entity_name}.{row.column_name}: {e}" for e in row.advisory_notes)
     blockers = list(dict.fromkeys(blockers))
+    advisories = list(dict.fromkeys(advisories))
     dest = output_root / path.stem
     dest.mkdir(parents=True, exist_ok=True)
     export_dd_rows_csv(rows, dest / "dd_export.csv")
@@ -79,13 +84,20 @@ def generate_sample(path: Path, output_root: Path = OUT) -> dict:
                       "Read [QA](qa_coverage_report.md) and [ordered source workflow](source_workflow.md).\n\n"
                       + report.read_text(), encoding="utf-8")
     write_source_workflow(objects, infos, dest)
-    write_qa_coverage_report(rows, dest / "qa_coverage_report.md", job_id=path.stem,
-                            coverage_markdown="\n\n".join(l.to_markdown() for l in ledgers), blockers=blockers)
+    write_qa_coverage_report(
+        rows,
+        dest / "qa_coverage_report.md",
+        job_id=path.stem,
+        coverage_markdown="\n\n".join(l.to_markdown() for l in ledgers),
+        blockers=blockers + advisories,
+    )
     summary = {"file": path.name, "rows": len(rows),
                "pending_rows": sum(r.status.value != "ACTIVE" for r in rows),
                "writes": sum(len(l.entries) for l in ledgers),
                "inventory_complete": not any(l.inventory_errors for l in ledgers),
-               "blockers": blockers, "source_anomalies": [a for l in ledgers for a in l.source_anomalies],
+               "blockers": blockers,
+               "advisories": advisories,
+               "source_anomalies": [a for l in ledgers for a in l.source_anomalies],
                "ready_to_present_as_fully_correct": False,
                "source_fingerprint": source_fingerprint(path)}
     (dest / "generation_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")

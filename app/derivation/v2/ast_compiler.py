@@ -114,6 +114,11 @@ def compile_ast_to_4x_string(node: dict[str, Any] | None) -> str:
             rendered = ", ".join(compile_ast_to_4x_string(part) for part in parts)
             return f"{operator}({rendered})"
 
+        if operator in {"+", "-", "*"}:
+            folded = _fold_numeric_constant(node)
+            if folded is not None:
+                return _compile_literal(folded)
+
         left = compile_ast_to_4x_string(node["left"])
         right = compile_ast_to_4x_string(node["right"])
         # Preserve the AST's grouping; dropping parentheses changes
@@ -148,6 +153,10 @@ def compile_ast_to_4x_string(node: dict[str, Any] | None) -> str:
             raise ValueError(
                 f"ADDDAY requires exactly 2 arguments (date, offset), got {len(args)}: {node!r}"
             )
+        if func == "COALESCE":
+            folded = _fold_numeric_constant(node)
+            if folded is not None:
+                return _compile_literal(folded)
         rendered = ", ".join(compile_ast_to_4x_string(a) for a in args)
         return f"{func}({rendered})"
 
@@ -207,6 +216,50 @@ def compile_ast_to_4x_string(node: dict[str, Any] | None) -> str:
         return _compile_literal(node)
 
     raise ValueError(f"Unknown AST node type: {node_type}")
+
+
+def _numeric_literal_value(node: Any) -> int | float | None:
+    if not isinstance(node, dict) or node.get("type") != "LITERAL":
+        return None
+    value = node.get("value")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value
+
+
+def _fold_numeric_constant(node: Any) -> dict[str, Any] | None:
+    """Fold literal-only arithmetic into one NUMBER literal.
+
+    Prior-value substitution turns ``ISNULL(COUNT, 0) + 1`` into
+    ``COALESCE(0, 0) + 1`` once an earlier UPDATE has set COUNT = 0; the
+    result is the constant 1. Only ``+ - *`` over numeric literals and a
+    COALESCE whose first argument is a non-NULL numeric literal are folded;
+    anything else (columns, division, strings) is left untouched.
+    """
+    if not isinstance(node, dict):
+        return None
+    kind = node.get("type")
+    if kind == "LITERAL":
+        return node if _numeric_literal_value(node) is not None else None
+    if kind == "FUNCTION_CALL":
+        if str(node.get("function_name") or "").strip().upper() != "COALESCE":
+            return None
+        args = node.get("arguments") or []
+        if not args:
+            return None
+        return _fold_numeric_constant(args[0])
+    if kind == "BINARY_OP":
+        operator = str(node.get("operator") or "").strip()
+        if operator not in {"+", "-", "*"}:
+            return None
+        left = _fold_numeric_constant(node.get("left"))
+        right = _fold_numeric_constant(node.get("right"))
+        if left is None or right is None:
+            return None
+        a, b = _numeric_literal_value(left), _numeric_literal_value(right)
+        value = a + b if operator == "+" else a - b if operator == "-" else a * b
+        return {"type": "LITERAL", "value_type": "NUMBER", "value": value}
+    return None
 
 
 _NUMERIC_VALUE_TYPES = frozenset({"NUMBER", "FLOAT", "INT", "INTEGER", "DECIMAL", "DOUBLE"})

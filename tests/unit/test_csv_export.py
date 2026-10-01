@@ -59,6 +59,27 @@ def test_export_withholds_unsupported_row_even_with_candidate_expression(tmp_pat
     assert _read_csv(out) == []
 
 
+def test_export_keeps_rows_gated_only_by_completeness(tmp_path):
+    from app.guardrails.completeness import COMPLETENESS_GATE_REASON
+
+    row = _sample_row(
+        review_state=ReviewState.NEEDS_REVIEW,
+        status=DDStatus.PENDING_REVIEW,
+        validation_errors=[COMPLETENESS_GATE_REASON],
+    )
+    rows = _read_csv(export_dd_rows([row], tmp_path / "dd.csv"))
+    assert len(rows) == 1
+    assert rows[0]["Status"] == "PENDING_REVIEW"
+
+
+def test_export_withholds_rows_with_real_validation_errors(tmp_path):
+    row = _sample_row(
+        review_state=ReviewState.NEEDS_REVIEW,
+        validation_errors=["grammar validation failed"],
+    )
+    assert _read_csv(export_dd_rows([row], tmp_path / "dd.csv")) == []
+
+
 def test_merge_preserves_unrelated_existing_rows(tmp_path):
     row_a = _sample_row(column_name="DPD_Overdue")
     row_b = _sample_row(column_name="DPD_Renewal")

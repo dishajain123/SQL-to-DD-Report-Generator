@@ -384,18 +384,32 @@ def _write_dd_xlsx(merged: list[dict], output_path: Path) -> Path:
     return output_path
 
 
+def is_exportable_row(row: DDRow, should_omit) -> bool:
+    """Decide whether a row belongs in the CSV/Excel deliverable.
+
+    The object-level completeness gate (app/guardrails/completeness.py)
+    demotes every row of an object with any unresolved note to
+    NEEDS_REVIEW + PENDING_REVIEW and appends one blanket validation error.
+    For a large procedure that is every row, which used to leave the export
+    empty even though the report listed all of them. Gate-only rows are
+    exported (their Status column still reads PENDING_REVIEW); rows with
+    real grammar/structure errors or UNSUPPORTED rows stay withheld.
+    """
+    from app.guardrails.completeness import COMPLETENESS_GATE_REASON
+
+    if row.review_state not in {ReviewState.GENERATED, ReviewState.APPROVED, ReviewState.NEEDS_REVIEW}:
+        return False
+    if any(e != COMPLETENESS_GATE_REASON for e in (row.validation_errors or [])):
+        return False
+    return not should_omit(row.display_derivation_expression or "")
+
+
 def export_dd_rows(
     dd_rows: list[DDRow], output_path: str | Path, existing_dd_path: str | Path | None = None
 ) -> Path:
     from app.derivation.dd_postprocess import should_omit_dd_row_from_presentation
 
-    presentable = [
-        row
-        for row in dd_rows
-        if row.review_state in {ReviewState.GENERATED, ReviewState.APPROVED}
-        and not row.validation_errors
-        and not should_omit_dd_row_from_presentation(row.display_derivation_expression or "")
-    ]
+    presentable = [row for row in dd_rows if is_exportable_row(row, should_omit_dd_row_from_presentation)]
     if existing_dd_path is not None:
         existing = read_existing_dd_excel(existing_dd_path)
         # A newly analysed source write can invalidate a previously exported

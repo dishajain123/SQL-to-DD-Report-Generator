@@ -83,7 +83,13 @@ class CoverageLedger:
                     f"→ {entry.target_table or '(unknown)'}: {entry.kind.value}"
                     + (f" ({entry.parse_error})" if entry.parse_error else "")
                 )
-            elif not entry.covered_by_dd and entry.kind not in {WriteKind.ROW_FORMULA, WriteKind.DECISION_TABLE}:
+            elif not entry.covered_by_dd and entry.kind not in {
+                WriteKind.ROW_FORMULA,
+                WriteKind.DECISION_TABLE,
+                # Run-status / audit bookkeeping has no DD derivation to cover;
+                # hundreds of these per procedure used to drown real blockers.
+                WriteKind.PROCESS_STATUS,
+            }:
                 out.append(
                     f"stmt #{entry.statement_index} {entry.statement_type} "
                     f"→ {entry.target_table}: requires manual / workflow coverage"
@@ -97,6 +103,7 @@ class CoverageLedger:
             e.covered_by_dd
             for e in self.entries
             if e.statement_type in {"INSERT", "UPDATE", "MERGE", "DELETE"}
+            and e.kind != WriteKind.PROCESS_STATUS
         )
 
     def to_markdown(self) -> str:
@@ -134,7 +141,10 @@ class CoverageLedger:
 _PROC_BRANCH_RE = re.compile(r"(?is)\b(?:ELSE|ELSIF|ELSEIF)\b|\bIF\s+(?!OBJECT_ID\b)")
 _CATCH_RE = re.compile(r"(?is)\b(?:BEGIN\s+CATCH|EXCEPTION\b|WHEN\s+OTHERS)\b")
 _TEMP_RE = re.compile(r"^#")
-_STATUS_RE = re.compile(r"(?i)RUNNINGPROCESSSTATUS|PROCESSSTATUS|RUNSTATUS\b")
+# PROCESSMONITOR is the step-by-step execution audit table the sample procedures
+# write after every statement (INSERT … 'RUNNING' / UPDATE … 'COMPLETE'); like
+# the run-status tables it carries no business derivation.
+_STATUS_RE = re.compile(r"(?i)RUNNINGPROCESSSTATUS|PROCESSSTATUS|RUNSTATUS\b|\bPROCESSMONITOR\b")
 _CROSS_ROW_RE = re.compile(
     r"(?is)\bOVER\s*\(|\bGROUP\s+BY\b|\bHAVING\b|\bPARTITION\s+BY\b|"
     r"\bSUM\s*\(|\bCOUNT\s*\(|\bAVG\s*\("
@@ -221,6 +231,11 @@ def _classify_write(
 
     if not stmt.parsed_ok and target:
         notes.append("parse incomplete; write target recovered for coverage")
+
+    # Execution-audit rows are bookkeeping wherever they sit (inside IF
+    # branches, CATCH blocks, or with an ORIGINAL_LOGIN()/GETDATE() select list).
+    if re.search(r"(?i)\bPROCESSMONITOR\b", target):
+        return WriteKind.PROCESS_STATUS, ConditionScope.PROCEDURE, notes + ["process-status bookkeeping"]
 
     if any(_CATCH_RE.search(p.raw_text or "") for p in preceding) or _CATCH_RE.search(raw):
         for prev in reversed(list(preceding)):

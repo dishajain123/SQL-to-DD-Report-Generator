@@ -210,6 +210,7 @@ _UPDATE_KW = re.compile(r"(?is)\bUPDATE\b")
 _WS_SET_KW = re.compile(r"(?is)\s+SET\b")
 _SET_KW = re.compile(r"(?is)\bSET\b")
 _FROM_KW = re.compile(r"(?is)FROM\b")
+_UNION_SELECT_KW = re.compile(r"(?is)UNION\s+(?:ALL\s+)?SELECT\b")
 _WHERE_KW = re.compile(r"(?is)WHERE\b")
 _BEGIN_KW = re.compile(r"(?is)BEGIN\b")
 _CASE_KW = re.compile(r"(?is)CASE\b")
@@ -1552,33 +1553,44 @@ def _extract_all_insert_select(sql: str) -> list[dict[str, str]]:
         cols = (match.group("cols") or "").strip()
         start = match.start()
         pos = match.end()
-        select_list, pos = _read_until_keyword(text, pos, {"FROM"}, stop_at_statement=True)
-        from_body = ""
-        where_clause = ""
-        if _FROM_KW.match(text, pos):
-            pos += len("FROM")
-            from_body, pos = _read_until_keyword(
-                text,
-                pos,
-                {"WHERE", "GROUP", "ORDER", "HAVING"},
-                stop_at_statement=True,
+        # ``INSERT … SELECT a UNION ALL SELECT b`` writes both branches into
+        # the same target. Each branch becomes its own entry; the clause
+        # readers stop at UNION so the first branch's WHERE no longer ends in
+        # a dangling ``UNION ALL`` (which surfaced as an untranslated value).
+        while True:
+            select_list, pos = _read_until_keyword(
+                text, pos, {"FROM", "UNION"}, stop_at_statement=True
             )
-        if _WHERE_KW.match(text, pos):
-            pos += len("WHERE")
-            where_clause, pos = _read_until_keyword(
-                text, pos, {"GROUP", "ORDER", "HAVING"}, stop_at_statement=True
+            from_body = ""
+            where_clause = ""
+            if _FROM_KW.match(text, pos):
+                pos += len("FROM")
+                from_body, pos = _read_until_keyword(
+                    text,
+                    pos,
+                    {"WHERE", "GROUP", "ORDER", "HAVING", "UNION"},
+                    stop_at_statement=True,
+                )
+            if _WHERE_KW.match(text, pos):
+                pos += len("WHERE")
+                where_clause, pos = _read_until_keyword(
+                    text, pos, {"GROUP", "ORDER", "HAVING", "UNION"}, stop_at_statement=True
+                )
+            results.append(
+                {
+                    "target": target,
+                    "target_raw": (target_raw or "").strip(),
+                    "cols": cols,
+                    "select_list": select_list.strip(),
+                    "from_body": from_body.strip(),
+                    "where_clause": where_clause.strip(),
+                    "raw_sql": text[start:pos].strip(),
+                    "start": str(start),
+                    "end": str(pos),
+                }
             )
-        results.append(
-            {
-                "target": target,
-                "target_raw": (target_raw or "").strip(),
-                "cols": cols,
-                "select_list": select_list.strip(),
-                "from_body": from_body.strip(),
-                "where_clause": where_clause.strip(),
-                "raw_sql": text[start:pos].strip(),
-                "start": str(start),
-                "end": str(pos),
-            }
-        )
+            union_match = _UNION_SELECT_KW.match(text, pos)
+            if not union_match:
+                break
+            pos = union_match.end()
     return results

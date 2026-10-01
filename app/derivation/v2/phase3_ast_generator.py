@@ -266,12 +266,16 @@ def build_ast_from_mutations(
                 then_node_sub = _substitute_prior_value(
                     then_node, ast, target_entity, target_column
                 )
-                cond = _substitute_prior_value(raw_cond, ast, target_entity, target_column)
+                cond = _substitute_prior_in_guard(
+                    raw_cond, ast, target_entity, target_column
+                )
                 ast = {
                     "type": "IF_THEN_ELSE",
                     "condition": cond,
                     "then_branch": then_node_sub,
-                    "else_branch": ast,
+                    "else_branch": _else_branch_for_literal_default_guard(
+                        ast, raw_cond, target_entity, target_column
+                    ),
                 }
                 shape = _self_ref_guard_shape(raw_cond, then_node, target_entity, target_column)
                 if shape is not None:
@@ -532,6 +536,57 @@ def _substitute_prior_value(node, prior, entity, column):
     return node
 
 
+def _is_literal_ast(node: Any) -> bool:
+    return isinstance(node, dict) and node.get("type") == "LITERAL"
+
+
+def _references_self_column(node: Any, entity: str, column: str) -> bool:
+    if isinstance(node, dict):
+        if _is_self_column_ref(node, entity, column):
+            return True
+        return any(
+            _references_self_column(v, entity, column)
+            for k, v in node.items()
+            if not str(k).startswith("_")
+        )
+    if isinstance(node, list):
+        return any(_references_self_column(v, entity, column) for v in node)
+    return False
+
+
+def _substitute_prior_in_guard(node: Any, prior: Any, entity: str, column: str) -> Any:
+    """Substitute prior column state into a WHERE/guard predicate.
+
+    When the accumulated state is a compile-time literal (e.g. an unguarded
+    ``SET Col = 0`` reset), keep the target column reference in the guard
+    instead of folding to ``0 == 0``. Complex prior ASTs (join assignments)
+    still substitute so later flattening can detect ``prior == 0`` patterns.
+    """
+    if isinstance(node, dict):
+        if _is_self_column_ref(node, entity, column):
+            if _is_literal_ast(prior):
+                return node
+            return prior
+        return {
+            k: _substitute_prior_in_guard(v, prior, entity, column) for k, v in node.items()
+        }
+    if isinstance(node, list):
+        return [_substitute_prior_in_guard(v, prior, entity, column) for v in node]
+    return node
+
+
+def _else_branch_for_literal_default_guard(
+    prior_ast: Any,
+    raw_cond: dict[str, Any],
+    entity: str,
+    column: str,
+) -> Any:
+    """Use pass-through column ref when filling a default for ``Col = <literal>``."""
+    if _is_literal_ast(prior_ast) and _references_self_column(raw_cond, entity, column):
+        return _column_ref(entity, column)
+    return prior_ast
+
+
 def _fold_control_branch_group(mutations, target_entity, target_column, prior=None):
     """Choose a procedural arm first, then apply its row-filtered updates.
 
@@ -561,7 +616,7 @@ def _fold_control_branch_group(mutations, target_entity, target_column, prior=No
             return _fallback_tautology()
         cond = parse_sql_expression_to_ast(predicate, default_entity=target_entity,
                                           target_column=target_column, as_condition=True)
-        cond = _substitute_prior_value(cond, base, target_entity, target_column)
+        cond = _substitute_prior_in_guard(cond, base, target_entity, target_column)
         result = prune_redundant_ast({"type": "IF_THEN_ELSE", "condition": cond,
                                       "then_branch": value, "else_branch": result})
     return result
@@ -782,10 +837,15 @@ def parse_sql_expression_to_ast(
     if cast_node is not None:
         return cast_node
 
-    # Explicit DATEADD → ADDDAY (only date-offset form we promote to ADDDAY).
+    # Explicit DATEADD → ADDDAY (only day-offset form) or honest unsupported.
     dateadd = _try_parse_dateadd(text, default_entity, target_column)
     if dateadd is not None:
         return dateadd
+
+    if re.match(r"(?is)^STRING_AGG\s*\(", text):
+        return _unsupported_sql_expression(
+            "STRING_AGG is set-based aggregation with no row-level 4X equivalent"
+        )
 
     # Oracle/SQL date literals & constructors → TODATE(...)
     date_lit = _try_parse_date_literal(text, default_entity, target_column)
@@ -1071,7 +1131,13 @@ def parse_sql_expression_to_ast(
 
     # ISNULL(a,b) / COALESCE(a,b) / NVL(a,b) / IFNULL(a,b) (MySQL) — never
     # ISEMPTY; keep as COALESCE.
+    # The balance check matters: ``ISNULL(a,0)+ISNULL(b,0)`` also starts with
+    # ``ISNULL(`` and ends with ``)``, but its first "(" closes mid-string, so
+    # it is an addition of two calls (handled by the arithmetic split below),
+    # not one call with the argument text ``a,0)+ISNULL(b,0``.
     isnull_fn = re.match(r"(?is)^(?:ISNULL|COALESCE|NVL|IFNULL)\s*\((.+)\)$", text)
+    if isnull_fn and not _balanced(isnull_fn.group(1)):
+        isnull_fn = None
     if isnull_fn:
         args = [
             parse_sql_expression_to_ast(
@@ -1086,7 +1152,7 @@ def parse_sql_expression_to_ast(
     # platform-recognized function names are used instead of falling
     # through to a raw string literal.
     least_greatest_fn = re.match(r"(?is)^(?P<fn>LEAST|GREATEST)\s*\((?P<args>.*)\)$", text)
-    if least_greatest_fn:
+    if least_greatest_fn and _balanced(least_greatest_fn.group("args")):
         mapped_fn = "MIN" if least_greatest_fn.group("fn").upper() == "LEAST" else "MAX"
         args = [
             parse_sql_expression_to_ast(
@@ -1123,7 +1189,7 @@ def parse_sql_expression_to_ast(
         r"(?is)^(?P<fn>MIN|MAX|SUM|COUNT|ABS|ROUND|CONCAT|DATEDIFF|LEN|UPPER|LOWER)\s*\((?P<args>.*)\)$",
         text,
     )
-    if gen_fn:
+    if gen_fn and _balanced(gen_fn.group("args")):
         raw_args = gen_fn.group("args").strip()
         args = []
         if raw_args:
@@ -1223,6 +1289,12 @@ def parse_sql_expression_to_ast(
             marker.group("col"),
             relationship=marker.group("rel"),
         )
+
+    # T-SQL allows whitespace around the dot of a qualified name
+    # (``A. SRCASSETCLASSALT_KEY``); collapse it so the path regex below sees
+    # ``A.SRCASSETCLASSALT_KEY`` instead of falling through to a raw literal.
+    if re.fullmatch(r"[#\[A-Za-z_][#\[\]\w]*(?:\s*\.\s*[\[\]#\w]+)+", text) and re.search(r"\s", text):
+        text = re.sub(r"\s*\.\s*", ".", text)
 
     # Qualified SQL col: Entity.Col / alias.Col (identifiers must start with a letter/_/#)
     qual = re.match(
@@ -1357,17 +1429,60 @@ def _try_parse_cast(
     }
 
 
+_DATEADD_DAY_UNITS = frozenset({"DAY", "DAYS", "DD"})
+_DATEADD_UNSUPPORTED_UNITS = frozenset(
+    {
+        "MONTH",
+        "MONTHS",
+        "MM",
+        "M",
+        "YEAR",
+        "YEARS",
+        "YY",
+        "Y",
+        "QUARTER",
+        "QQ",
+        "Q",
+        "WEEK",
+        "WK",
+        "WW",
+    }
+)
+
+
+def _unsupported_sql_expression(message: str) -> dict[str, Any]:
+    return {
+        "type": "FUNCTION_CALL",
+        "function_name": "__UNSUPPORTED_SQL__",
+        "arguments": [],
+        "_validation_error": message,
+    }
+
+
 def _try_parse_dateadd(
     text: str,
     default_entity: str,
     target_column: str,
 ) -> dict[str, Any] | None:
     """Map ``DATEADD(DAY|DD, n, expr)`` → ``ADDDAY(expr, n)``."""
-    match = re.match(
-        r"(?is)^DATEADD\s*\(\s*(?P<unit>DAY|DAYS|DD)\s*,\s*(?P<offset>.+?)\s*,\s*(?P<base>.+)\s*\)$",
-        text,
-    )
-    if not match:
+    match = None
+    head = re.match(r"(?is)^DATEADD\s*\((?P<args>.*)\)$", text)
+    if head and _balanced(head.group("args")):
+        # Split on top-level commas only: the offset is often itself a call,
+        # e.g. ``DATEADD(DD, -(ISNULL(DPD,0)-1), ReportDate)``.
+        dateadd_args = _split_top_level(head.group("args"), ",")
+        if len(dateadd_args) == 3:
+            unit = dateadd_args[0].strip().upper()
+            if unit in _DATEADD_UNSUPPORTED_UNITS:
+                return _unsupported_sql_expression(
+                    f"DATEADD({unit}, …) has no exact 4X equivalent; only day offsets map to ADDDAY"
+                )
+            if unit in _DATEADD_DAY_UNITS:
+                match = {
+                    "offset": dateadd_args[1].strip(),
+                    "base": dateadd_args[2].strip(),
+                }
+    if match is None:
         # Also accept sqlglot-ish DATE_ADD(base, n, 'day')
         match2 = re.match(
             r"(?is)^DATE_ADD\s*\(\s*(?P<base>.+?)\s*,\s*(?P<offset>.+?)\s*,\s*'?(?:DAY|DAYS|DD)'?\s*\)$",
@@ -1392,12 +1507,12 @@ def _try_parse_dateadd(
         }
 
     base = parse_sql_expression_to_ast(
-        match.group("base"),
+        match["base"],
         default_entity=default_entity,
         target_column=target_column,
     )
     offset = parse_sql_expression_to_ast(
-        match.group("offset"),
+        match["offset"],
         default_entity=default_entity,
         target_column=target_column,
     )

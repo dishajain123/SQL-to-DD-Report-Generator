@@ -945,10 +945,98 @@ def prune_redundant_ast(node: dict[str, Any] | None, _memo=None) -> dict[str, An
 
     if outer and _is_same_column_ref(cleaned.get("else_branch"), outer):
         cleaned.pop("else_branch", None)
+
+    flattened = _try_flatten_join_assignment_zero_default(cleaned)
+    if flattened is not None:
+        return prune_redundant_ast(flattened, _memo)
     return cleaned
 
 
 _IDENTIFIER_KEYS = {"entity", "relationship", "column", "function_name", "name", "operator"}
+
+
+def _is_zero_literal(node: Any) -> bool:
+    if not isinstance(node, dict) or node.get("type") != "LITERAL":
+        return False
+    if str(node.get("value_type") or "").upper() == "NULL":
+        return False
+    value = node.get("value")
+    try:
+        return float(value) == 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _and_ast(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    return {"type": "BINARY_OP", "operator": "AND", "left": left, "right": right}
+
+
+def _condition_is_expr_equals_zero(condition: Any, expr: dict[str, Any]) -> bool:
+    """True when ``condition`` is ``(expr == 0)`` (or reversed operands)."""
+    if not isinstance(condition, dict) or condition.get("type") != "BINARY_OP":
+        return False
+    op = str(condition.get("operator") or "").strip()
+    if op not in {"==", "="}:
+        return False
+    left = condition.get("left")
+    right = condition.get("right")
+    expr_sig = _ast_signature(expr)
+    if _is_zero_literal(right) and _ast_signature(left) == expr_sig:
+        return True
+    if _is_zero_literal(left) and _ast_signature(right) == expr_sig:
+        return True
+    return False
+
+
+def _try_flatten_join_assignment_zero_default(node: dict[str, Any]) -> dict[str, Any] | None:
+    """Collapse ``IF(prior==0) THEN default ELSE IF(join) THEN src ELSE 0``.
+
+    Chronological folding for ``JOIN … SET col=src`` followed by
+    ``SET col=default WHERE col=0`` substitutes the nested IF into the
+    zero-check, producing a duplicated join guard. Semantically:
+
+        IF(join_active AND COALESCE(src,0) != 0) THEN src ELSE default
+
+    is equivalent when an earlier pass reset the column to 0 and ``src`` is
+    only written under the join.
+    """
+    if node.get("type") != "IF_THEN_ELSE":
+        return None
+    outer_else = node.get("else_branch")
+    if not isinstance(outer_else, dict) or outer_else.get("type") != "IF_THEN_ELSE":
+        return None
+    join_cond = outer_else.get("condition")
+    source_value = outer_else.get("then_branch")
+    if not isinstance(join_cond, dict) or not isinstance(source_value, dict):
+        return None
+    if not _is_zero_literal(outer_else.get("else_branch")):
+        return None
+    if not _condition_is_expr_equals_zero(node.get("condition"), outer_else):
+        return None
+    default_value = node.get("then_branch")
+    if not isinstance(default_value, dict) or default_value.get("type") != "LITERAL":
+        return None
+
+    coalesce_source = {
+        "type": "FUNCTION_CALL",
+        "function_name": "COALESCE",
+        "arguments": [
+            source_value,
+            {"type": "LITERAL", "value_type": "NUMBER", "value": 0},
+        ],
+    }
+    nonzero = {
+        "type": "BINARY_OP",
+        "operator": "!=",
+        "left": coalesce_source,
+        "right": {"type": "LITERAL", "value_type": "NUMBER", "value": 0},
+    }
+    return {
+        "type": "IF_THEN_ELSE",
+        "condition": _and_ast(join_cond, nonzero),
+        "then_branch": source_value,
+        "else_branch": default_value,
+    }
 
 
 def _ast_signature(node: Any) -> Any:
