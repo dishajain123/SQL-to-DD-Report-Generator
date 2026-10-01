@@ -8,6 +8,8 @@ Allowed node types only:
 """
 from __future__ import annotations
 
+from app.derivation.v2.ast_limits import FormulaExpansionError
+
 import re
 from typing import Any, Optional
 
@@ -150,7 +152,7 @@ def generate_ast(
 
     try:
         return build_ast_from_mutations(mutations, target_entity, target_column)
-    except _ValuePredicateMixingError as exc:
+    except (_ValuePredicateMixingError, FormulaExpansionError) as exc:
         # Surface through the existing compile-error channel (ast_compiler
         # raises on this sentinel) rather than letting the exception bubble
         # past the caller and silently drop the whole DD row — the pipeline

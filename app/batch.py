@@ -83,6 +83,11 @@ def run_file(name: str, data: bytes) -> FileResult:
     job_id = f"job-{uuid.uuid4().hex[:10]}"
     result.job_id = job_id
     db.record_job(job_id, "Batch", "4X", Intent.GENERATE_DD.value, "RUNNING")
+    # Keep the original bytes as well as the pipeline's decoded SQL. No
+    # encoding repair or whitespace normalization may overwrite the upload.
+    source_dir = Path(db.get_job_output_dir(job_id)) / "source"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    (source_dir / "original.sql").write_bytes(data)
     try:
         state = build_pipeline().invoke(
             {

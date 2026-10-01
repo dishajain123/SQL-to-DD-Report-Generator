@@ -28,7 +28,11 @@ def test_batch_runs_utf16_and_cp1252_files(tmp_path, monkeypatch):
         assert not result["error"]
         assert result["rows"] > 0
         assert result["parse_failures"] == []
-        assert (Path(result["output_dir"]) / "dd_export.csv").exists()
+        job_dir = Path(result["output_dir"])
+        assert (job_dir / "dd_export.csv").exists()
+        assert (job_dir / "source" / "original.sql").read_bytes() == (src / result["file"]).read_bytes()
+        assert len(json.loads((job_dir / "dd_rows.json").read_text())) == result["rows"]
+        assert "ready" in json.loads((job_dir / "completeness.json").read_text())
     assert (out / "batch_summary.md").exists()
 
 

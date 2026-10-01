@@ -21,7 +21,7 @@ from app.derivation.v2.ast_compiler import (
 )
 from app.derivation.v2.execution_steps import build_execution_steps, is_identity_write
 from app.derivation.v2.phase1_lineage import LineageMap, build_lineage_map
-from app.derivation.v2.phase2_mutation_folder import MutationPass, fold_column_mutations
+from app.derivation.v2.phase2_mutation_folder import MutationPass, MutationSourceIndex, fold_column_mutations
 from app.derivation.v2.phase3_ast_generator import generate_ast
 from app.derivation.v2.phase4_metadata import build_metadata, metadata_to_dd_row
 from app.derivation.v2.semantic_checks import mutation_semantic_errors
@@ -61,6 +61,8 @@ def generate_dd_rows_for_chains(
     """
     del function_reference, rag_store  # v2 does not use RAG/prompt references
 
+    if len(chains) != len(canonical_models):
+        raise ValueError("Every lineage chain must have a canonical model")
     jobs: list[tuple] = []
     for chain, model in zip(chains, canonical_models):
         jobs.extend(
@@ -213,9 +215,10 @@ def _derive_column(
     business_summary: str = "",
     timekey_map: dict[int, date] | None = None,
     statement_label: str = "",
+    source_index: MutationSourceIndex | None = None,
 ) -> _DerivedColumn:
     mutations = fold_column_mutations(
-        sql_text, fold_entity or entity, column, lineage, entity_map
+        sql_text, fold_entity or entity, column, lineage, entity_map, source_index=source_index
     )
     # The CATCH handler only runs when the main path fails, so its writes are
     # never folded into the main formula as if they were later UPDATEs.
@@ -359,6 +362,7 @@ def _build_column_jobs(
         if oid not in lineage_by_oid:
             lineage_by_oid[oid] = build_lineage_map(obj.raw_sql, entity_name_map)
 
+        source_index = MutationSourceIndex.build(obj.raw_sql)
         columns_by_table = info.columns_written_by_table or {}
         for table, columns in columns_by_table.items():
             entity = resolve_entity_name(table, entity_name_map) or canonical_logical_name(
@@ -380,6 +384,7 @@ def _build_column_jobs(
                         llm_client,
                         entity_name_map,
                         timekey_map,
+                        source_index,
                     )
                 )
     return jobs
@@ -396,6 +401,7 @@ def _run_column_job(
     llm_client: Any,
     entity_name_map: dict[str, str] | None,
     timekey_map: dict[int, date] | None,
+    source_index: MutationSourceIndex | None = None,
 ) -> list[tuple[DDRow, _DerivedColumn | None]]:
     try:
         derived = _derive_column(
@@ -408,6 +414,7 @@ def _run_column_job(
             business_summary=canonical_model.business_summary or "",
             timekey_map=timekey_map,
             statement_label=f"{obj.source_file} ",
+            source_index=source_index,
         )
         row = metadata_to_dd_row(
             derived.meta,

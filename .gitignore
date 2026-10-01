@@ -32,6 +32,8 @@ output/
 dd_automation.db
 *.sqlite3
 *.db
+*.db-shm
+*.db-wal
 
 # Streamlit
 .streamlit/secrets.toml

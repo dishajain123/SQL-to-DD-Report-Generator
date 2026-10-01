@@ -8,6 +8,7 @@ from functools import lru_cache
 from typing import Any
 
 from app.utils.entity_name_map import resolve_entity_name
+from app.parsing.sql_lex import mask_sql, normalize_comparison_spacing
 
 
 _STMT_START = re.compile(
@@ -23,6 +24,11 @@ def strip_sql_comments(sql: str) -> str:
     sql = sql or ""
     if len(sql) >= _CACHE_MIN_CHARS:
         return _strip_large(sql)
+    return _strip_small(sql)
+
+
+@lru_cache(maxsize=512)
+def _strip_small(sql: str) -> str:
     return _strip_sql_comments_impl(sql, with_map=False)[0]
 
 
@@ -38,52 +44,12 @@ def _strip_sql_comments_with_map(sql: str) -> tuple[str, list[int]]:
 
 
 def _strip_sql_comments_impl(sql: str, *, with_map: bool) -> tuple[str, list[int]]:
-    out: list[str] = []
-    origin: list[int] = []
-    if not with_map:
-        # Same scanner without the per-character offset bookkeeping.
-        origin_append = lambda _i: None  # noqa: E731
-    else:
-        origin_append = origin.append
-    i = 0
-    n = len(sql)
-    in_single = False
-    while i < n:
-        ch = sql[i]
-        nxt = sql[i + 1] if i + 1 < n else ""
-        if in_single:
-            out.append(ch)
-            origin_append(i)
-            if ch == "'":
-                if nxt == "'":
-                    out.append(nxt)
-                    origin_append(i + 1)
-                    i += 2
-                    continue
-                in_single = False
-            i += 1
-            continue
-        if ch == "'":
-            in_single = True
-            out.append(ch)
-            origin_append(i)
-            i += 1
-            continue
-        if ch == "-" and nxt == "-":
-            i += 2
-            while i < n and sql[i] not in "\r\n":
-                i += 1
-            continue
-        if ch == "/" and nxt == "*":
-            i += 2
-            while i + 1 < n and not (sql[i] == "*" and sql[i + 1] == "/"):
-                i += 1
-            i = min(n, i + 2)
-            continue
-        out.append(ch)
-        origin_append(i)
-        i += 1
-    return "".join(out), origin
+    # Keep source coordinates stable across all scanners, including nested
+    # comments. Normalize comparison tokens in code only; parse_statement
+    # records these recoveries for the completeness/review gate.
+    text, _ = normalize_comparison_spacing(sql)
+    text = mask_sql(text, quotes=False)
+    return text, list(range(len(sql))) if with_map else []
 
 
 @lru_cache(maxsize=8)

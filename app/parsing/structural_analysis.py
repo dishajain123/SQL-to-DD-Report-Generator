@@ -7,6 +7,7 @@ TIMEKEY/date-threshold rule-versioning branches (architecture step 13c).
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 
 from app.models.core import SQLObject, StatementInfo, StructuralInfo, VersionThreshold
 from app.parsing.sql_parser import parse_statement, split_statements
@@ -83,6 +84,10 @@ def analyze_object(obj: SQLObject) -> StructuralInfo:
         if not s.parsed_ok and s.parse_error
     ]
     unsupported = [s.parse_error for s in dml_statements if not s.parsed_ok and s.parse_error]
+    unsupported.extend(
+        f"stmt #{stmt.statement_index}: {note}"
+        for stmt in statements for note in stmt.normalization_notes
+    )
     smart_chunks = build_smart_chunks(obj.object_id, statements)
     chunk_confidence = min((chunk.confidence for chunk in smart_chunks), default=1.0)
 
@@ -136,6 +141,7 @@ def _find_called_objects(raw_sql: str) -> list[str]:
     return sorted(names)
 
 
+@lru_cache(maxsize=16)
 def _strip_comments_for_threshold_scan(sql: str) -> str:
     """Blank out `--` and `/* */` comment contents (quote-aware), preserving
     every other character's position so match offsets in the caller's
@@ -145,55 +151,8 @@ def _strip_comments_for_threshold_scan(sql: str) -> str:
     example like `--exec [Pro].[DPD_Calculation] @timekey=25140;` -- without
     this, those examples get misread as genuine rule-version thresholds.
     """
-    out: list[str] = []
-    i = 0
-    n = len(sql)
-    in_single = in_double = in_line = in_block = False
-    while i < n:
-        ch = sql[i]
-        if in_line:
-            out.append("\n" if ch == "\n" else " ")
-            in_line = ch != "\n"
-            i += 1
-            continue
-        if in_block:
-            if ch == "*" and i + 1 < n and sql[i + 1] == "/":
-                out.append("  ")
-                i += 2
-                in_block = False
-                continue
-            out.append("\n" if ch == "\n" else " ")
-            i += 1
-            continue
-        if in_single:
-            out.append(ch)
-            if ch == "'" and not (i + 1 < n and sql[i + 1] == "'"):
-                in_single = False
-            i += 1
-            continue
-        if in_double:
-            out.append(ch)
-            if ch == '"':
-                in_double = False
-            i += 1
-            continue
-        if ch == "-" and i + 1 < n and sql[i + 1] == "-":
-            in_line = True
-            out.append("  ")
-            i += 2
-            continue
-        if ch == "/" and i + 1 < n and sql[i + 1] == "*":
-            in_block = True
-            out.append("  ")
-            i += 2
-            continue
-        if ch == "'":
-            in_single = True
-        elif ch == '"':
-            in_double = True
-        out.append(ch)
-        i += 1
-    return "".join(out)
+    from app.parsing.sql_lex import mask_sql
+    return mask_sql(sql, quotes=False)
 
 
 def _find_version_thresholds(raw_sql: str) -> list[VersionThreshold]:

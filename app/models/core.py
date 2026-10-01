@@ -89,6 +89,7 @@ class StatementInfo(BaseModel):
     conditions: list[str] = Field(default_factory=list)
     parsed_ok: bool = True
     parse_error: Optional[str] = None
+    normalization_notes: list[str] = Field(default_factory=list)
 
 
 class VersionThreshold(BaseModel):

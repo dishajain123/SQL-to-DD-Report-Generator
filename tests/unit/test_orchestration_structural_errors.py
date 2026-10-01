@@ -18,6 +18,8 @@ def test_structural_errors_surface_as_qa_coverage_blockers(monkeypatch, tmp_path
         lambda *a, **k: tmp_path / "report.md",
     )
 
+    monkeypatch.setattr("app.orchestration.pipeline.db.set_job_stage", lambda *a, **k: None)
+
     captured: dict = {}
 
     def fake_write_qa(rows, path, **kwargs):

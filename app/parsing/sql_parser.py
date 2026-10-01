@@ -25,6 +25,7 @@ import sqlglot
 from sqlglot import exp
 
 from app.models.core import Dialect, StatementInfo
+from app.parsing.sql_lex import mask_sql, normalize_comparison_spacing
 
 _DML_KEYWORDS = ("SELECT", "UPDATE", "MERGE", "INSERT", "DELETE", "TRUNCATE")
 _CONTROL_KEYWORDS = (
@@ -54,6 +55,7 @@ _TSQL_STATEMENT_START_KEYWORDS = (
     "EXECUTE",
     "DROP",
     "CREATE",
+    "ALTER",
     "TRUNCATE",
     "RETURN",
     "THROW",
@@ -80,63 +82,21 @@ def split_statements(raw_sql: str, dialect: Dialect | None = None) -> list[str]:
 
 
 def _split_semicolon_statements(raw_sql: str) -> list[str]:
-    statements: list[str] = []
-    buf: list[str] = []
-    paren_depth = 0
-    in_single = False
-    in_double = False
-    in_line_comment = False
-    in_block_comment = False
-    i = 0
-    n = len(raw_sql)
-    while i < n:
-        ch = raw_sql[i]
-        buf.append(ch)
-
-        if in_line_comment:
-            if ch == "\n":
-                in_line_comment = False
-        elif in_block_comment:
-            if ch == "*" and i + 1 < n and raw_sql[i + 1] == "/":
-                buf.append(raw_sql[i + 1])
-                i += 1
-                in_block_comment = False
-        elif in_single:
-            if ch == "'" and (i + 1 >= n or raw_sql[i + 1] != "'"):
-                in_single = False
-            elif ch == "'" and i + 1 < n and raw_sql[i + 1] == "'":
-                buf.append(raw_sql[i + 1])
-                i += 1
-        elif in_double:
-            if ch == '"':
-                in_double = False
-        elif ch == "-" and i + 1 < n and raw_sql[i + 1] == "-":
-            in_line_comment = True
-            buf.append(raw_sql[i + 1])
-            i += 1
-        elif ch == "/" and i + 1 < n and raw_sql[i + 1] == "*":
-            in_block_comment = True
-            buf.append(raw_sql[i + 1])
-            i += 1
-        elif ch == "'":
-            in_single = True
-        elif ch == '"':
-            in_double = True
-        elif ch == "(":
-            paren_depth += 1
+    statements = []
+    start, depth = 0, 0
+    for i, ch in enumerate(mask_sql(raw_sql)):
+        if ch == "(":
+            depth += 1
         elif ch == ")":
-            paren_depth = max(0, paren_depth - 1)
-        elif ch == ";" and paren_depth == 0:
-            stmt = "".join(buf).strip()
-            if stmt.strip(";").strip():
-                statements.append(stmt)
-            buf = []
-        i += 1
-
-    tail = "".join(buf).strip()
+            depth = max(0, depth - 1)
+        elif ch == ";" and depth == 0:
+            part = raw_sql[start:i + 1].strip()
+            if part.strip(";").strip():
+                statements.append(part)
+            start = i + 1
+    tail = raw_sql[start:].strip()
     if tail:
         statements.append(tail)
-
     return statements
 
 
@@ -162,9 +122,7 @@ def _split_tsql_statement(stmt: str) -> list[str]:
     # beginning with END must not terminate an UPDATE while that CASE is open.
     # Mask comments and literals before counting keywords so quoted values
     # and prose cannot change statement boundaries.
-    from app.parsing.write_inventory_scan import _strip_strings_and_comments
-
-    masked_lines = _strip_strings_and_comments(stmt).splitlines(keepends=True)
+    masked_lines = mask_sql(stmt).splitlines(keepends=True)
     case_depth = 0
     # True once the DML statement a `;WITH cte AS (...)` consumes has already
     # started. `buffer_lead` keeps reading "WITH" for the rest of that
@@ -177,7 +135,7 @@ def _split_tsql_statement(stmt: str) -> list[str]:
     with_consumer_started = False
 
     for line, masked_line in zip(lines, masked_lines):
-        stripped = _strip_leading_comments(line)
+        stripped = masked_line.lstrip()
         lead = re.match(r"[A-Za-z]+", stripped).group(0).upper() if re.match(r"[A-Za-z]+", stripped) else ""
         is_go = bool(re.match(r"^\s*GO(?:\s+\d+)?\s*(?:--.*)?$", stripped, re.IGNORECASE))
         buffer_text = "".join(buf).strip()
@@ -192,6 +150,7 @@ def _split_tsql_statement(stmt: str) -> list[str]:
 
         should_split = (
             bool(buf)
+            and bool(buffer_lead)
             and paren_depth == 0
             and not in_single
             and not in_double
@@ -210,7 +169,14 @@ def _split_tsql_statement(stmt: str) -> list[str]:
         is_update_awaiting_set = buffer_lead == "UPDATE" and lead == "SET"
         # INSERT ... SELECT / INSERT ... VALUES often puts the SELECT/VALUES
         # clause on a following line; SELECT is a statement-start keyword.
-        is_insert_awaiting_source = buffer_lead == "INSERT" and lead in {"SELECT", "VALUES", "WITH", "EXEC", "EXECUTE"}
+        source_started = buffer_lead == "INSERT" and bool(re.search(r"\b(?:SELECT|VALUES|EXEC|EXECUTE|DEFAULT)\b", mask_sql(buffer_text), re.I))
+        is_insert_awaiting_source = (
+            buffer_lead == "INSERT" and not source_started
+            and lead in {"SELECT", "VALUES", "WITH", "EXEC", "EXECUTE"}
+        )
+        is_set_query_arm = lead == "SELECT" and bool(
+            re.search(r"\b(?:UNION(?:\s+ALL)?|EXCEPT|INTERSECT)\s*$", mask_sql(buffer_text), re.I)
+        )
         # MERGE WHEN MATCHED/NOT MATCHED bodies start with UPDATE/INSERT on
         # their own lines; those are clauses of the MERGE, not new statements.
         is_merge_clause = buffer_lead == "MERGE" and lead in {
@@ -251,6 +217,7 @@ def _split_tsql_statement(stmt: str) -> list[str]:
             and not is_update_awaiting_set
             and not is_insert_awaiting_source
             and not is_merge_clause
+            and not is_set_query_arm
         ):
             result.append(buffer_text)
             buf = []
@@ -263,7 +230,7 @@ def _split_tsql_statement(stmt: str) -> list[str]:
             elif case_depth:
                 case_depth -= 1
         paren_depth, in_single, in_double, in_block_comment = _scan_text_state(
-            line, paren_depth, in_single, in_double, in_block_comment
+            masked_line, paren_depth, in_single, in_double, in_block_comment
         )
 
     tail = "".join(buf).strip()
@@ -562,21 +529,29 @@ def _strip_leading_comments(text: str) -> str:
     """Strip leading whitespace, `--` line comments, and `/* */` block
     comments so keyword detection isn't fooled by a comment preceding the
     actual statement (very common in these procs)."""
-    pos = 0
-    n = len(text)
-    while pos < n:
-        ch = text[pos]
-        if ch.isspace():
+    pos, size = 0, len(text)
+    while pos < size:
+        if text[pos].isspace() or text[pos] == ";":
             pos += 1
-        elif text[pos:pos + 2] == "--":
-            nl = text.find("\n", pos)
-            pos = n if nl == -1 else nl + 1
-        elif text[pos:pos + 2] == "/*":
-            end = text.find("*/", pos + 2)
-            pos = n if end == -1 else end + 2
+        elif text.startswith("--", pos):
+            end = re.search(r"[\r\n]", text[pos + 2:])
+            pos = size if end is None else pos + 2 + end.end()
+        elif text.startswith("/*", pos):
+            depth = 1
+            pos += 2
+            while pos < size and depth:
+                if text.startswith("/*", pos):
+                    depth += 1
+                    pos += 2
+                elif text.startswith("*/", pos):
+                    depth -= 1
+                    pos += 2
+                else:
+                    pos += 1
         else:
             break
     return text[pos:]
+
 
 
 _INSERT_TARGET_RE = re.compile(
@@ -726,7 +701,10 @@ def parse_statement(stmt_text: str, index: int, dialect: Dialect) -> StatementIn
         return info
 
     try:
-        tree = sqlglot.parse_one(_strip_leading_comments(stmt_text), read=_SQLGLOT_DIALECT[dialect])
+        parse_text = stmt_text
+        if dialect == Dialect.SQLSERVER:
+            parse_text, info.normalization_notes = normalize_comparison_spacing(parse_text)
+        tree = sqlglot.parse_one(_strip_leading_comments(parse_text), read=_SQLGLOT_DIALECT[dialect])
     except Exception as exc:  # sqlglot raises various ParseError subtypes
         info.parsed_ok = False
         info.parse_error = str(exc)
@@ -1131,52 +1109,7 @@ def _mask_comments_only(text: str) -> str:
     string contents -- condition text must keep literal comparison values
     like 'ACTIVE' intact). Preserves length/newlines so downstream regex
     match offsets stay valid."""
-    out: list[str] = []
-    i = 0
-    n = len(text)
-    in_single = False
-    in_double = False
-    in_block = False
-    while i < n:
-        ch = text[i]
-        if in_block:
-            out.append("\n" if ch == "\n" else " ")
-            if ch == "*" and i + 1 < n and text[i + 1] == "/":
-                out.append(" ")
-                i += 2
-                in_block = False
-                continue
-            i += 1
-            continue
-        if in_single:
-            out.append(ch)
-            if ch == "'" and not (i + 1 < n and text[i + 1] == "'"):
-                in_single = False
-            i += 1
-            continue
-        if in_double:
-            out.append(ch)
-            if ch == '"':
-                in_double = False
-            i += 1
-            continue
-        if ch == "-" and i + 1 < n and text[i + 1] == "-":
-            while i < n and text[i] != "\n":
-                out.append(" ")
-                i += 1
-            continue
-        if ch == "/" and i + 1 < n and text[i + 1] == "*":
-            in_block = True
-            out.append("  ")
-            i += 2
-            continue
-        if ch == "'":
-            in_single = True
-        elif ch == '"':
-            in_double = True
-        out.append(ch)
-        i += 1
-    return "".join(out)
+    return mask_sql(text, quotes=False)
 
 
 def _strip_balanced_wrapping_parens(text: str) -> str:

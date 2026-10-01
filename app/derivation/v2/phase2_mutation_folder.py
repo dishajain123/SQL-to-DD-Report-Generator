@@ -283,12 +283,54 @@ class MutationPass:
         }
 
 
+@dataclass
+class MutationSourceIndex:
+    """Object-scoped scan results, prepared once before column workers start.
+
+    UPDATE assignments are indexed by column, preserving statement indexes,
+    source order and duplicate assignments. Workers only read this structure;
+    each fold still creates its own mutable MutationPass objects.
+    """
+
+    sql_text: str
+    updates: list
+    updates_by_column: dict
+    inserts: list
+    selects: list
+    merges: list
+    branches: list
+    gates_by_arm: dict
+    catch_spans: list
+    resets: list
+
+    @classmethod
+    def build(cls, sql_text: str) -> "MutationSourceIndex":
+        updates = extract_update_statements(sql_text)
+        by_column: dict = {}
+        for index, stmt in enumerate(updates):
+            grouped: dict = {}
+            for assignment in _iter_set_assignments(stmt.get("set_clause") or ""):
+                grouped.setdefault(assignment["column"].upper(), []).append(assignment)
+            for column, assignments in grouped.items():
+                by_column.setdefault(column, []).append((index, stmt, assignments))
+        stripped = strip_sql_comments(sql_text)
+        return cls(
+            sql_text, updates, by_column,
+            extract_insert_select(sql_text), extract_select_into(sql_text),
+            extract_merge_matched_updates(sql_text), extract_if_else_chains(stripped),
+            {(g.group_id, g.index): g for g in extract_workflow_gates(stripped)},
+            extract_catch_spans(stripped), extract_table_resets(stripped),
+        )
+
+
 def fold_column_mutations(
     sql_text: str,
     target_entity: str,
     target_column: str,
     lineage: LineageMap,
     entity_map: dict[str, str] | None = None,
+    *,
+    source_index: MutationSourceIndex | None = None,
 ) -> list[MutationPass]:
     """Chronologically collect UPDATE passes that mutate target_entity.column."""
     target_entity_norm = _normalize_entity(target_entity, entity_map)
@@ -297,8 +339,10 @@ def fold_column_mutations(
     ordinal = 0
 
     # Map UPDATE source offsets → IF/ELSE branch (comment-stripped coordinates).
-    stripped = strip_sql_comments(sql_text or "")
-    branch_spans = extract_if_else_chains(stripped)
+    source = source_index or MutationSourceIndex.build(sql_text)
+    if source.sql_text != sql_text:
+        raise ValueError("Mutation source index does not match the SQL input")
+    branch_spans = source.branches
 
     def _branch_for_offset(pos: int):
         for span in branch_spans:
@@ -306,8 +350,8 @@ def fold_column_mutations(
                 return span
         return None
 
-    gates_by_arm = {(g.group_id, g.index): g for g in extract_workflow_gates(stripped)}
-    catch_spans = extract_catch_spans(stripped)
+    gates_by_arm = source.gates_by_arm
+    catch_spans = source.catch_spans
 
     def _scope_for_offset(pos: int) -> str | None:
         return "CATCH" if any(s <= pos < e for s, e in catch_spans) else None
@@ -324,22 +368,13 @@ def fold_column_mutations(
             return None, None
         return resolve(branch.condition), gates_by_arm.get((branch.group_id, branch.index))
 
-    for stmt_index, stmt in enumerate(extract_update_statements(sql_text)):
+    for stmt_index, stmt, assignments in source.updates_by_column.get(target_col.upper(), []):
         head = (stmt.get("head") or "").strip()
         set_clause = (stmt.get("set_clause") or "").strip()
         from_clause = (stmt.get("from_clause") or "").strip()
         where_clause = (stmt.get("where_clause") or "").strip() or None
         raw_sql = (stmt.get("raw_sql") or "").strip()
         stmt_start = int(stmt.get("start") or 0)
-
-        # Cheap filter first: most statements in a large procedure never
-        # assign this column, so skip their FROM/JOIN parsing entirely.
-        assignments = [
-            a for a in _iter_set_assignments(set_clause)
-            if a["column"].upper() == target_col.upper()
-        ]
-        if not assignments:
-            continue
 
         alias_map, joins = _parse_update_sources(head, from_clause, lineage, entity_map)
         written_tables = _resolve_update_target_tables(head, alias_map)
@@ -432,8 +467,8 @@ def fold_column_mutations(
             )
 
     # INSERT … SELECT writes (permanent + temp) — same chronological fold.
-    update_stmt_count = len(list(extract_update_statements(sql_text)))
-    for ins_index, ins in enumerate(extract_insert_select(sql_text, temps_only=False)):
+    update_stmt_count = len(source.updates)
+    for ins_index, ins in enumerate(source.inserts):
         target_table = normalize_table_name(ins.get("target") or "")
         if not _targets_entity([target_table], target_entity_norm, entity_map, lineage):
             if not _targets_via_lineage([target_table], target_entity_norm, lineage):
@@ -528,8 +563,8 @@ def fold_column_mutations(
     # INSERT ... SELECT, but the destination column list comes from the
     # projection itself (aliased name, or the bare source column name when
     # unaliased) instead of an explicit ``INSERT INTO target (cols)`` list.
-    insert_select_count = len(list(extract_insert_select(sql_text, temps_only=False)))
-    for si_index, si in enumerate(extract_select_into(sql_text)):
+    insert_select_count = len(source.inserts)
+    for si_index, si in enumerate(source.selects):
         target_table = normalize_table_name(si.get("target") or "")
         if not _targets_entity([target_table], target_entity_norm, entity_map, lineage):
             if not _targets_via_lineage([target_table], target_entity_norm, lineage):
@@ -614,10 +649,8 @@ def fold_column_mutations(
         )
 
     # MERGE … WHEN MATCHED THEN UPDATE SET … — chronological with UPDATEs/INSERTs.
-    prior_stmt_count = update_stmt_count + insert_select_count + len(
-        list(extract_select_into(sql_text))
-    )
-    for merge_index, merge in enumerate(extract_merge_matched_updates(sql_text)):
+    prior_stmt_count = update_stmt_count + insert_select_count + len(source.selects)
+    for merge_index, merge in enumerate(source.merges):
         target_table = normalize_table_name(merge.get("target") or "")
         if not _targets_entity([target_table], target_entity_norm, entity_map, lineage):
             if not _targets_via_lineage([target_table], target_entity_norm, lineage):
@@ -720,7 +753,7 @@ def fold_column_mutations(
     )
     mutations.sort(key=lambda m: m.source_position)
     mutations = _apply_table_resets(
-        mutations, extract_table_resets(stripped), target_entity_norm, entity_map
+        mutations, source.resets, target_entity_norm, entity_map
     )
     for ordinal, mutation in enumerate(mutations, 1):
         mutation.ordinal = ordinal
@@ -849,7 +882,7 @@ def _prune_redundant_mutations(mutations: list[MutationPass]) -> list[MutationPa
     return kept
 
 
-def prune_redundant_ast(node: dict[str, Any] | None) -> dict[str, Any] | None:
+def prune_redundant_ast(node: dict[str, Any] | None, _memo=None) -> dict[str, Any] | None:
     """Remove dead IF arms that cannot change the column.
 
     - ``IF(A) THEN(IF(A) THEN(x) ELSE(y))`` collapses to ``IF(A) THEN(x)`` —
@@ -861,15 +894,22 @@ def prune_redundant_ast(node: dict[str, Any] | None) -> dict[str, Any] | None:
     - ``ELSE(col)`` under ``IF(ISNOTEMPTY(col))`` is a self-assignment on the
       null path and is dropped.
     """
+    if _memo is None:
+        from app.derivation.v2.ast_limits import check_formula_expansion
+        check_formula_expansion(node)
+        _memo = {}
+    if id(node) in _memo:
+        return _memo[id(node)]
     if not isinstance(node, dict):
         return node
     cleaned = dict(node)
+    _memo[id(node)] = cleaned
     for key, value in list(cleaned.items()):
         if isinstance(value, dict) and "type" in value:
-            cleaned[key] = prune_redundant_ast(value)
+            cleaned[key] = prune_redundant_ast(value, _memo)
         elif isinstance(value, list):
             cleaned[key] = [
-                prune_redundant_ast(item) if isinstance(item, dict) else item for item in value
+                prune_redundant_ast(item, _memo) if isinstance(item, dict) else item for item in value
             ]
     if cleaned.get("type") != "IF_THEN_ELSE":
         return cleaned
@@ -892,7 +932,7 @@ def prune_redundant_ast(node: dict[str, Any] | None) -> dict[str, Any] | None:
         inner = _predicate_column(then_branch.get("condition"), "ISEMPTY")
         if inner and inner == outer:
             replacement = then_branch.get("else_branch")
-            cleaned["then_branch"] = prune_redundant_ast(replacement) if isinstance(replacement, dict) else replacement
+            cleaned["then_branch"] = prune_redundant_ast(replacement, _memo) if isinstance(replacement, dict) else replacement
 
     else_branch = cleaned.get("else_branch")
     if (

@@ -819,13 +819,13 @@ def test_like_with_dynamic_pattern_falls_back_honestly():
         default_entity="CustomerCal",
         as_condition=True,
     )
-    assert node["type"] == "BINARY_OP"
-    assert node["operator"] == "LIKE"
-    # The LHS/RHS must still resolve to real column refs, not be swallowed
-    # into a raw string blob.
-    assert node["left"]["type"] == "COLUMN_REF"
-    formula = compile_ast_to_4x_string(node)
-    assert not validate_expression(formula).valid
+    assert node["type"] == "FUNCTION_CALL"
+    assert node["function_name"] == "__UNSUPPORTED_SQL__"
+    assert "dynamic" in node["_validation_error"]
+    import pytest
+    with pytest.raises(ValueError, match="dynamic"):
+        compile_ast_to_4x_string(node)
+
 
 
 def test_npa_reason_staged_match_flag_compiles_without_dynamic_like():

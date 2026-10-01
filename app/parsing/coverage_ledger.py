@@ -342,7 +342,7 @@ def build_coverage_ledger(info: StructuralInfo, source_sql: str = "") -> Coverag
                 parse_error=stmt.parse_error,
                 source_excerpt=(stmt.raw_text or "")[:240].replace("\n", " "),
                 source_sql=stmt.raw_text or "",
-                notes=list(notes),
+                notes=[*notes, *stmt.normalization_notes],
                 covered_by_dd=False,
             )
             ledger.entries.append(entry)
@@ -352,6 +352,10 @@ def build_coverage_ledger(info: StructuralInfo, source_sql: str = "") -> Coverag
 
     full_sql = source_sql or "\n".join(s.raw_text or "" for s in statements)
     ledger.source_anomalies.extend(detect_source_anomalies(full_sql))
+    ledger.source_anomalies.extend(
+        f"stmt #{stmt.statement_index}: {note}"
+        for stmt in statements for note in stmt.normalization_notes
+    )
     if source_sql:
         ledger.inventory_errors.extend(reconcile_write_inventory(source_sql, ledger.entries))
     return ledger

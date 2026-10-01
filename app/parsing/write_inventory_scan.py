@@ -27,69 +27,8 @@ class ExpectedWrite:
 
 def _strip_strings_and_comments(sql: str) -> str:
     """Replace string/comment contents with spaces, preserving length/newlines."""
-    out: list[str] = []
-    i = 0
-    n = len(sql)
-    in_single = False
-    in_double = False
-    in_line = False
-    in_block = False
-    while i < n:
-        ch = sql[i]
-        if in_line:
-            out.append("\n" if ch == "\n" else " ")
-            if ch == "\n":
-                in_line = False
-            i += 1
-            continue
-        if in_block:
-            out.append("\n" if ch == "\n" else " ")
-            if ch == "*" and i + 1 < n and sql[i + 1] == "/":
-                out.append(" ")
-                i += 2
-                in_block = False
-                continue
-            i += 1
-            continue
-        if in_single:
-            out.append(" ")
-            if ch == "'" and not (i + 1 < n and sql[i + 1] == "'"):
-                in_single = False
-            elif ch == "'" and i + 1 < n and sql[i + 1] == "'":
-                out.append(" ")
-                i += 2
-                continue
-            i += 1
-            continue
-        if in_double:
-            out.append(" ")
-            if ch == '"':
-                in_double = False
-            i += 1
-            continue
-        if ch == "-" and i + 1 < n and sql[i + 1] == "-":
-            out.extend([" ", " "])
-            i += 2
-            in_line = True
-            continue
-        if ch == "/" and i + 1 < n and sql[i + 1] == "*":
-            out.extend([" ", " "])
-            i += 2
-            in_block = True
-            continue
-        if ch == "'":
-            in_single = True
-            out.append(" ")
-            i += 1
-            continue
-        if ch == '"':
-            in_double = True
-            out.append(" ")
-            i += 1
-            continue
-        out.append(ch)
-        i += 1
-    return "".join(out)
+    from app.parsing.sql_lex import mask_sql
+    return mask_sql(sql)
 
 
 def _line_of(sql: str, index: int) -> int:
@@ -199,9 +138,6 @@ def scan_expected_writes(sql: str) -> list[ExpectedWrite]:
         # MERGE WHEN arms are part of the parent MERGE, not separate writes.
         if operation in {"UPDATE", "INSERT", "DELETE"} and _preceded_by_when_matched(start):
             return
-        # Skip alias-only UPDATE targets that look like single letters without #
-        if operation == "UPDATE" and len(target) <= 2 and not target.startswith("#"):
-            return
         # The same table may be written more than once on one physical line.
         # Deduplicate overlapping scanner patterns by source offset, not line.
         key = (operation, target.upper(), start)
@@ -228,6 +164,7 @@ def scan_expected_writes(sql: str) -> list[ExpectedWrite]:
             )
         )
 
+    resolved_update_offsets = set()
     for match in _UPDATE_FROM_RE.finditer(cleaned):
         if _preceded_by_when_matched(match.start()):
             continue
@@ -238,10 +175,11 @@ def scan_expected_writes(sql: str) -> list[ExpectedWrite]:
             if col and col.upper() not in {c.upper() for c in cols}:
                 cols.append(col)
         _add("UPDATE", match.group("table"), match.start(), body, cols)
+        resolved_update_offsets.add(match.start())
 
     for match in _UPDATE_DIRECT_RE.finditer(cleaned):
         table = match.group("table")
-        if len(_clean_table(table)) <= 2 and not table.startswith("#"):
+        if match.start() in resolved_update_offsets:
             continue
         if _preceded_by_when_matched(match.start()):
             continue

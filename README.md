@@ -407,3 +407,14 @@ previously-generated DD CSV. Pass `existing_dd_path` to `export_dd_rows`
 by `(Entity Name, Column Name, Effective Start Date)`: new rows replace a
 matching existing row, everything else is preserved untouched. See
 `app/report/dd_export.py::merge_dd_rows`.
+
+## Large SQL performance and completeness
+
+The live pipeline now gates unresolved source coverage before marking rows
+ACTIVE. Large self-dependent expressions retain their ordered execution steps
+and require workflow review instead of expanding indefinitely. See
+[implementation, benchmark and acceptance plan](docs/LARGE_SQL_IMPLEMENTATION.md)
+for the supplied RBL procedure analysis and the reproducible check command.
+`completeness.json` is the generation readiness record; a COMPLETED job means
+artifacts were written, not that business equivalence has been proven. This
+supersedes the older statements above that grammar validity alone permits ACTIVE.

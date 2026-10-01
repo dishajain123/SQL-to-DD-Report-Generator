@@ -75,6 +75,7 @@ class PipelineState(TypedDict, total=False):
     csv_path: str
     excel_path: str
     existing_dd_csv_path: str
+    completeness: dict[str, Any]
 
 
 def _set_stage(state: PipelineState, stage: str) -> None:
@@ -254,6 +255,12 @@ def node_dd_generation(
             state["objects"][object_id].raw_sql,
             state.get("entity_name_map"),
         )
+    from app.guardrails.completeness import enforce_completeness
+
+    state["completeness"] = enforce_completeness(
+        all_rows, state["objects"], state["structural_infos"],
+        state.get("entity_name_map"), state.get("structural_errors"),
+    )
     state["dd_rows"] = all_rows
 
     db.record_dd_rows_bulk(
@@ -272,6 +279,27 @@ def node_report_and_export(state: PipelineState) -> PipelineState:
     _set_stage(state, "Writing the report, CSV, and Excel")
     job_plan = state["job_plan"]
     output_dir = db.get_job_output_dir(job_plan.job_id)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if "completeness" in state:
+        (output_dir / "completeness.json").write_text(
+            json.dumps(state["completeness"], indent=2, default=str), encoding="utf-8"
+        )
+    (output_dir / "dd_rows.json").write_text(
+        json.dumps([row.model_dump(mode="json") for row in state.get("dd_rows", [])], indent=2),
+        encoding="utf-8",
+    )
+    # Preserve every submitted character, including comments and unsupported
+    # constructs, independently of the parser and generated report.
+    from hashlib import sha256
+    source_dir = output_dir / "source"
+    source_dir.mkdir(exist_ok=True)
+    source_manifest = []
+    for number, (name, content) in enumerate(state.get("uploaded_files", {}).items(), 1):
+        artifact = f"{number:04d}.sql"
+        (source_dir / artifact).write_bytes(content.encode("utf-8"))
+        source_manifest.append({"source_file": name, "artifact": artifact,
+                                "sha256": sha256(content.encode("utf-8")).hexdigest()})
+    (source_dir / "manifest.json").write_text(json.dumps(source_manifest, indent=2), encoding="utf-8")
     report_path = generate_report(
         job_plan, state["canonical_models"], state.get("dd_rows", []),
         output_path=output_dir / "report.md",

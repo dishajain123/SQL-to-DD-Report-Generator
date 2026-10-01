@@ -22,6 +22,18 @@ def _name(value: str) -> str:
     return (value or "").split(".")[-1].strip().strip('"').strip("[]").upper()
 
 
+# Preserve literal case/whitespace and identifier boundaries. Removing all
+# whitespace and uppercasing SQL made 'a b' indistinguishable from 'AB'.
+_SOURCE_TOKEN = re.compile(r"'(?:(?:'')|[^'])*'|\[(?:\]\]|[^\]])*\]|\"(?:\"\"|[^\"])*\"|[\w@#$]+|[^\s]", re.DOTALL)
+
+
+def source_statement_key(sql: str) -> tuple[str, ...]:
+    tokens = _SOURCE_TOKEN.findall(strip_sql_comments(sql or ""))
+    while tokens and tokens[-1] == ";":
+        tokens.pop()
+    return tuple(token if token.startswith("'") else token.upper() for token in tokens)
+
+
 def mark_ledger_coverage(
     ledger: CoverageLedger,
     rows: Iterable[DDRow],
@@ -36,24 +48,30 @@ def mark_ledger_coverage(
         and not row.validation_errors
         and row.review_state in {ReviewState.GENERATED, ReviewState.APPROVED}
     ]
-    def source_key(sql):
-        return re.sub(r"\s+", "", strip_sql_comments(sql or "")).strip(";").upper()
+    # Normalize each fragment once, then use an inverted index. Previously
+    # every entry/column/row comparison re-scanned all SQL fragments.
+    keys: dict[str, tuple] = {}
 
+    def source_key(sql):
+        sql = sql or ""
+        if sql not in keys:
+            keys[sql] = source_statement_key(sql)
+        return keys[sql]
+
+    covered: set[tuple] = set()
+    for row in valid_rows:
+        for fragment in row.source_statement_sql:
+            key = source_key(fragment)
+            if key:
+                covered.add((_name(row.entity_name), _name(row.column_name), key))
     for entry in ledger.entries:
         if entry.kind not in {WriteKind.ROW_FORMULA, WriteKind.DECISION_TABLE}:
             continue
         target = _name(entry.target_table)
         entity = mapping.get(target, target)
-        entry.covered_by_dd = bool(entry.columns) and all(
-            any(
-                _name(row.entity_name) == entity
-                and _name(row.column_name) == _name(column)
-                and bool(source_key(entry.source_sql))
-                and any(source_key(entry.source_sql) == source_key(fragment)
-                        for fragment in row.source_statement_sql)
-                for row in valid_rows
-            )
-            for column in entry.columns
+        key = source_key(entry.source_sql)
+        entry.covered_by_dd = bool(entry.columns) and bool(key) and all(
+            (entity, _name(column), key) in covered for column in entry.columns
         )
     ledger.dd_coverage_checked = True
     return ledger
@@ -94,17 +112,23 @@ def flag_rows_with_uncovered_writes(
         for column in entry.columns
     }
 
+    entries_by_column: dict[str, list] = {}
+    for entry in ledger.entries:
+        for column in entry.columns:
+            entries_by_column.setdefault(_name(column), []).append(entry)
+
     for row in rows:
         if row.source_object_ids and info.object_id not in row.source_object_ids:
             continue
+        relevant_entries = entries_by_column.get(_name(row.column_name), [])
         candidates = {
             _name(entry.target_table)
-            for entry in ledger.entries
+            for entry in relevant_entries
             if any(_name(col) == _name(row.column_name) for col in entry.columns)
         }
         matching_tables = {
             _name(entry.target_table)
-            for entry in ledger.entries
+            for entry in relevant_entries
             if any(_name(col) == _name(row.column_name) for col in entry.columns)
             and (
                 _name(entry.target_table) == _name(row.entity_name)
@@ -119,7 +143,7 @@ def flag_rows_with_uncovered_writes(
             reasons.append(
                 "Generated row cannot be linked unambiguously to a source write target"
             )
-        for entry in ledger.entries:
+        for entry in relevant_entries:
             if _name(entry.target_table) not in matching_tables:
                 continue
             if not any(_name(col) == _name(row.column_name) for col in entry.columns):

@@ -74,6 +74,19 @@ def _table_alias_name(table: exp.Table) -> str | None:
     return None
 
 
+@lru_cache(maxsize=512)
+def _parse_reference_tree(statement: str, dialect_name: str):
+    # Shared read-only parse for alias and identifier collection. Cache failed
+    # parses as well; a broad INSERT feeds hundreds of DD columns.
+    try:
+        if dialect_name == "tsql":
+            from app.parsing.sql_lex import normalize_comparison_spacing
+            statement, _ = normalize_comparison_spacing(statement)
+        return sqlglot.parse_one(statement, read=dialect_name)
+    except Exception:
+        return None
+
+
 def collect_table_aliases(text: str, dialect: Dialect) -> dict[str, tuple[str, ...]]:
     """Return a case-insensitive alias -> exact table reference map.
 
@@ -95,7 +108,7 @@ def collect_table_aliases(text: str, dialect: Dialect) -> dict[str, tuple[str, .
     bounded so a long-running server process doesn't accumulate unbounded
     cache entries across many different jobs/procedures over its lifetime.
     """
-    return _collect_table_aliases_cached(text, dialect)
+    return dict(_collect_table_aliases_cached(text, dialect))
 
 
 @lru_cache(maxsize=256)
@@ -111,7 +124,9 @@ def _collect_table_aliases_cached(text: str, dialect: Dialect) -> dict[str, tupl
         if not cleaned_stmt:
             continue
         try:
-            tree = sqlglot.parse_one(cleaned_stmt, read=dialect_name)
+            tree = _parse_reference_tree(cleaned_stmt, dialect_name)
+            if tree is None:
+                continue
         except Exception:
             continue
 
@@ -159,6 +174,11 @@ def _collect_table_aliases_cached(text: str, dialect: Dialect) -> dict[str, tupl
 
 
 def collect_known_reference_names(text: str, dialect: Dialect) -> set[str]:
+    return set(_collect_known_reference_names_cached(text, dialect))
+
+
+@lru_cache(maxsize=256)
+def _collect_known_reference_names_cached(text: str, dialect: Dialect) -> set[str]:
     """Return the case-insensitive set of identifier names actually parsed
     out of the source SQL: column names, declared/bound parameters, and
     table/alias names.
@@ -181,7 +201,9 @@ def collect_known_reference_names(text: str, dialect: Dialect) -> set[str]:
         if not cleaned_stmt:
             continue
         try:
-            tree = sqlglot.parse_one(cleaned_stmt, read=dialect_name)
+            tree = _parse_reference_tree(cleaned_stmt, dialect_name)
+            if tree is None:
+                continue
         except Exception:
             continue
 
