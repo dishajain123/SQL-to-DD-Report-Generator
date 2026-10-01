@@ -213,6 +213,7 @@ def build_ast_from_mutations(
     self_ref_chain: list[tuple[dict[str, Any], dict[str, Any]]] = []
     self_ref_chain_base: dict[str, Any] | None = None
     self_ref_chain_class: str | None = None
+    skipped_set_based_source = False
 
     for segment in _segment_mutations_by_control_flow(mutations):
         group_id = segment[0].control_branch_group if segment else None
@@ -224,6 +225,10 @@ def build_ast_from_mutations(
             continue
 
         for mutation in segment:
+            if _skip_mutation_in_ast_fold(mutation, target_entity, target_column):
+                if _is_set_based_unresolved_source_assignment(mutation, target_entity):
+                    skipped_set_based_source = True
+                continue
             ast_before_this_pass = ast
             then_node = parse_sql_expression_to_ast(
                 mutation.assigned_expression,
@@ -238,7 +243,11 @@ def build_ast_from_mutations(
             if _is_self_column_ref(then_node, target_entity, target_column):
                 continue
 
-            cond_sql = mutation.effective_condition
+            cond_sql = mutation.effective_condition or (
+                mutation.where_clause.strip()
+                if mutation.where_clause and mutation.where_clause.strip()
+                else None
+            )
             if cond_sql:
                 raw_cond = parse_sql_expression_to_ast(
                     cond_sql,
@@ -294,7 +303,14 @@ def build_ast_from_mutations(
                 self_ref_chain_class = None
 
     pruned = prune_redundant_ast(ast)
-    return pruned if isinstance(pruned, dict) else ast
+    ast_out = pruned if isinstance(pruned, dict) else ast
+    if (
+        skipped_set_based_source
+        and isinstance(ast_out, dict)
+        and _is_self_column_ref(ast_out, target_entity, target_column)
+    ):
+        ast_out = _wrap_nullable_identity_default(ast_out, target_entity, target_column)
+    return ast_out
 
 
 def _contains_self_column_ref(node: Any, entity: str, column: str) -> bool:
@@ -554,14 +570,91 @@ def _references_self_column(node: Any, entity: str, column: str) -> bool:
     return False
 
 
+def _coalesce_or_isnull_of_self(node: Any, entity: str, column: str) -> bool:
+    if not isinstance(node, dict) or node.get("type") != "FUNCTION_CALL":
+        return False
+    fn = str(node.get("function_name") or "").upper()
+    if fn not in {"COALESCE", "ISNULL", "NVL", "IFNULL"}:
+        return False
+    args = node.get("arguments") or []
+    return bool(args) and _is_self_column_ref(args[0], entity, column)
+
+
+def _is_self_negativity_zero_guard(node: Any, entity: str, column: str) -> bool:
+    """``ISNULL(Col,0)<0`` / ``COALESCE(Col,0)<0`` / ``Col<0`` style clamps."""
+    if not isinstance(node, dict) or node.get("type") != "BINARY_OP":
+        return False
+    op = str(node.get("operator") or "").strip()
+    if op not in {"<", "<="}:
+        return False
+    left = node.get("left")
+    right = node.get("right")
+    if _coalesce_or_isnull_of_self(left, entity, column):
+        return _is_zero_literal(right)
+    if _is_self_column_ref(left, entity, column):
+        return _is_zero_literal(right)
+    return False
+
+
+def _is_zero_literal(node: Any) -> bool:
+    if not isinstance(node, dict) or node.get("type") != "LITERAL":
+        return False
+    try:
+        return float(node.get("value")) == 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _replace_negativity_guard_subject(
+    node: dict[str, Any],
+    prior: Any,
+    entity: str,
+    column: str,
+) -> dict[str, Any]:
+    """Point a ``COALESCE(Col,0)<0`` clamp at the already-folded derivation."""
+    left = node.get("left")
+    op = node.get("operator")
+    right = node.get("right")
+    zero_lit = {"type": "LITERAL", "value_type": "NUMBER", "value": 0}
+    if isinstance(left, dict) and _coalesce_or_isnull_of_self(left, entity, column):
+        pad = (left.get("arguments") or [None, zero_lit])[1] or zero_lit
+        if _is_self_column_ref(prior, entity, column) or _is_literal_ast(prior):
+            new_left = {
+                "type": "FUNCTION_CALL",
+                "function_name": "COALESCE",
+                "arguments": [prior, pad],
+            }
+        else:
+            # Folded derivation paths for DPD-style ints already end in 0, not
+            # NULL — test the computed value directly and avoid COALESCE(IF…)
+            # duplication in the exported formula.
+            new_left = prior
+    elif _is_self_column_ref(left, entity, column):
+        new_left = prior
+    else:
+        return node
+    return {"type": "BINARY_OP", "operator": op, "left": new_left, "right": right}
+
+
 def _substitute_prior_in_guard(node: Any, prior: Any, entity: str, column: str) -> Any:
     """Substitute prior column state into a WHERE/guard predicate.
 
     When the accumulated state is a compile-time literal (e.g. an unguarded
     ``SET Col = 0`` reset), keep the target column reference in the guard
-    instead of folding to ``0 == 0``. Complex prior ASTs (join assignments)
-    still substitute so later flattening can detect ``prior == 0`` patterns.
+    instead of folding to ``0 == 0``.
+
+    For ``ISNULL(Col,0)<0`` / ``COALESCE(Col,0)<0`` clamps that run **after**
+    the main derivation in source order, test the folded derivation (``prior``),
+    not the stale input column — otherwise the clamp appears to run before
+    ``DATEDIFF`` logic and can never fire.
+
+    Other complex priors still substitute so join+default flattening can
+    detect ``prior == 0`` patterns.
     """
+    if isinstance(node, dict) and _is_self_negativity_zero_guard(node, entity, column):
+        if _is_literal_ast(prior) or _is_self_column_ref(prior, entity, column):
+            return node
+        return _replace_negativity_guard_subject(node, prior, entity, column)
     if isinstance(node, dict):
         if _is_self_column_ref(node, entity, column):
             if _is_literal_ast(prior):
@@ -585,6 +678,137 @@ def _else_branch_for_literal_default_guard(
     if _is_literal_ast(prior_ast) and _references_self_column(raw_cond, entity, column):
         return _column_ref(entity, column)
     return prior_ast
+
+
+def _wrap_nullable_identity_default(
+    node: dict[str, Any],
+    entity: str,
+    column: str,
+) -> dict[str, Any]:
+    """``IF(ISEMPTY(col)) THEN 0 ELSE col`` for skipped set-based writes."""
+    col = node if _is_self_column_ref(node, entity, column) else _column_ref(entity, column)
+    return {
+        "type": "IF_THEN_ELSE",
+        "condition": {
+            "type": "FUNCTION_CALL",
+            "function_name": "ISEMPTY",
+            "arguments": [col],
+        },
+        "then_branch": {"type": "LITERAL", "value_type": "NUMBER", "value": 0},
+        "else_branch": col,
+    }
+
+
+def _condition_sql_mentions_column(sql: str | None, column: str) -> bool:
+    if not sql:
+        return False
+    name = bare_ident(column)
+    return bool(re.search(rf"(?i)\b{re.escape(name)}\b", sql))
+
+
+def _is_cross_column_null_default_guard(cond_sql: str, target_column: str) -> bool:
+    """True for ``SET Col = <literal> WHERE SiblingCol IS NULL`` (not join filters).
+
+    Join/product predicates (``ISNULL(C.Aqua_Scheme,'N')='Y'``) and process
+    filters (``RUNNINGPROCESSNAME = 'DPD_Calculation'``) must still fold into
+    the assigned column's formula.
+    """
+    if not cond_sql:
+        return False
+    col = bare_ident(target_column)
+    col_re = re.escape(col)
+    if re.search(
+        rf"(?i)\b(?!{col_re}\b)([A-Za-z_][\w]*)\s+IS\s+(?:NOT\s+)?NULL\b",
+        cond_sql,
+    ):
+        return True
+    for match in re.finditer(r"(?i)\bISEMPTY\s*\(\s*([^)]+)\)", cond_sql):
+        inner = (match.group(1) or "").strip()
+        peer_m = re.search(r'"([^"]+)"\s*$', inner) or re.search(
+            r"\.([A-Za-z_][\w]*)\"?\s*$", inner
+        )
+        if peer_m and peer_m.group(1).upper() != col.upper():
+            return True
+    for match in re.finditer(r"(?i)\bISNULL\s*\(\s*([A-Za-z_][\w]*)", cond_sql):
+        end = match.end()
+        if end < len(cond_sql) and cond_sql[end] in {".", ":"}:
+            # ``ISNULL(C.Col,…)`` or ``ISNULL(Entity::Rel::Col,…)`` — join / product
+            # predicate, not ``SET target WHERE sibling IS NULL``.
+            continue
+        if match.group(1).upper() != col.upper():
+            return True
+    return False
+
+
+def _skip_mutation_in_ast_fold(
+    mutation: MutationPass,
+    target_entity: str,
+    target_column: str,
+) -> bool:
+    """Drop writes the row-level 4X fold cannot express faithfully.
+
+    - Aggregates over CTE/subquery sources (``UPDATE … FROM (SELECT MAX…) a``)
+      leave ``A.Col`` qualifiers that do not resolve to a platform entity.
+    - Cross-column null defaults (``SET MaxFin=0 WHERE MaxNonFin IS NULL``)
+      must not fold into the wrong column's derivation.
+    """
+    expr = (mutation.assigned_expression or "").strip()
+    if not expr:
+        return False
+
+    if _is_set_based_unresolved_source_assignment(mutation, target_entity):
+        return True
+
+    cond_sql = mutation.effective_condition or mutation.where_clause or ""
+    if mutation.guarded and cond_sql and not _condition_sql_mentions_column(
+        cond_sql, target_column
+    ):
+        try:
+            value = parse_sql_expression_to_ast(
+                expr, default_entity=target_entity, target_column=target_column
+            )
+        except Exception:
+            value = None
+        if isinstance(value, dict) and value.get("type") == "LITERAL":
+            if _is_cross_column_null_default_guard(cond_sql, target_column):
+                return True
+    return False
+
+
+def _is_set_based_unresolved_source_assignment(
+    mutation: MutationPass,
+    target_entity: str,
+) -> bool:
+    """True when the assigned value still references an unmapped statement alias."""
+    expr = (mutation.assigned_expression or "").strip()
+    target_norm = normalize_table_name(target_entity).upper()
+    marker = re.match(
+        r"(?i)^(?P<entity>[^:]+)::(?P<rel>[^:]+)::",
+        expr,
+    )
+    if marker and marker.group("entity").upper() == target_norm:
+        if len(marker.group("rel")) <= 3:
+            return True
+    match = re.match(
+        r"(?i)^(?P<qual>[A-Za-z_][\w]*)\.(?P<col>[A-Za-z_][\w]*)$",
+        expr,
+    )
+    if not match:
+        return False
+    qual = match.group("qual").upper()
+    target_norm = normalize_table_name(target_entity).upper()
+    if qual in {target_norm, bare_ident(target_entity).upper()}:
+        return False
+    alias_map = mutation.alias_map or {}
+    if qual in alias_map:
+        table = str(alias_map[qual] or "")
+        if table.startswith("(") or re.search(r"(?is)\bSELECT\b", table):
+            return True
+        return False
+    # Never rewritten by phase2 (e.g. subquery alias ``A`` with no map entry).
+    if len(qual) <= 3:
+        return True
+    return False
 
 
 def _fold_control_branch_group(mutations, target_entity, target_column, prior=None):
@@ -2193,7 +2417,7 @@ def _split_top_level_keyword(text: str, keyword_pattern: str) -> list[str]:
     ``r"NOT\\s+LIKE"``), matched case-insensitively. Returns ``[text]``
     unmatched, or ``[before, after]`` on the first depth-0 match.
     """
-    pattern = re.compile(rf"(?is)\b(?:{keyword_pattern})\b")
+    pattern = re.compile(rf"\b(?:{keyword_pattern})\b", re.I | re.S)
     depth = 0
     in_single = False
     i = 0

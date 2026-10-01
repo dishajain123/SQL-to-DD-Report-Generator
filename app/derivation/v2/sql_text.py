@@ -1006,6 +1006,26 @@ def _extract_where_predicate(select_sql: str) -> str | None:
     return text[where_at:].strip()
 
 
+def extract_merge_using_row_predicate(using_body: str) -> str | None:
+    """Row filter from ``USING (SELECT … FROM … [JOIN …] WHERE …)`` in a MERGE.
+
+    The ON clause only keys target to source; business predicates (e.g. Aqua
+    Scheme product filters) live in the USING subquery's WHERE and must fold
+    into the derived row condition.
+    """
+    text = (using_body or "").strip()
+    if not text:
+        return None
+    if text.startswith("(") and text.endswith(")") and _parens_balanced(text[1:-1]):
+        text = text[1:-1].strip()
+    if not re.search(r"(?is)\bSELECT\b", text):
+        return None
+    pred = _extract_where_predicate(text)
+    if not pred:
+        return None
+    return _strip_group_order(pred)
+
+
 def _extract_having_clause(sql_fragment: str) -> str | None:
     text = sql_fragment or ""
     m = re.search(r"(?is)\bHAVING\b(.+?)(?=\bORDER\b|\bUNION\b|$)", text)
@@ -1097,7 +1117,9 @@ _KEYWORD_PATTERNS: dict[str, re.Pattern[str]] = {}
 def _keyword_pattern(keyword: str) -> re.Pattern[str]:
     pattern = _KEYWORD_PATTERNS.get(keyword)
     if pattern is None:
-        pattern = _KEYWORD_PATTERNS[keyword] = re.compile(rf"(?is){keyword}\b")
+        pattern = _KEYWORD_PATTERNS[keyword] = re.compile(
+            rf"{keyword}\b", re.I | re.S
+        )
     return pattern
 
 

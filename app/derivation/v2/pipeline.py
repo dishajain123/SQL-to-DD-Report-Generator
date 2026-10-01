@@ -196,9 +196,14 @@ class _DerivedColumn:
         row.advisory_notes = list(dict.fromkeys([*row.advisory_notes, *self.advisories]))
 
 
-def _compile(ast: dict[str, Any]) -> tuple[str, str | None]:
+def _compile(ast: dict[str, Any], *, entity: str, column: str) -> tuple[str, str | None]:
     try:
-        return compile_ast_to_4x_string(ast), None
+        return (
+            compile_ast_to_4x_string(
+                ast, target_entity=entity, target_column=column
+            ),
+            None,
+        )
     except Exception as exc:
         return "", str(exc)
 
@@ -228,12 +233,12 @@ def _derive_column(
     primary = main or handler
 
     ast = generate_ast(primary, target_entity=entity, target_column=column, llm_client=llm_client)
-    formula, compile_error = _compile(ast)
+    formula, compile_error = _compile(ast, entity=entity, column=column)
     exception_formula = ""
     handler_ast: dict[str, Any] | None = None
     if main and handler:
         handler_ast = generate_ast(handler, target_entity=entity, target_column=column)
-        exception_formula, _ = _compile(handler_ast)
+        exception_formula, _ = _compile(handler_ast, entity=entity, column=column)
 
     meta = build_metadata(
         target_entity=entity,

@@ -307,6 +307,42 @@ def _grace_condition(**extra):
     }
 
 
+def test_prune_collapses_negative_clamp_to_max_without_duplicating_derivation():
+    from app.derivation.v2.phase2_mutation_folder import prune_redundant_ast
+
+    deriv = {
+        "type": "IF_THEN_ELSE",
+        "condition": {
+            "type": "BINARY_OP",
+            "operator": ">",
+            "left": {"type": "VARIABLE_REF", "name": "@TIMEKEY"},
+            "right": {"type": "LITERAL", "value_type": "NUMBER", "value": 1},
+        },
+        "then_branch": {"type": "LITERAL", "value_type": "NUMBER", "value": 5},
+        "else_branch": {"type": "LITERAL", "value_type": "NUMBER", "value": 3},
+    }
+    zero = {"type": "LITERAL", "value_type": "NUMBER", "value": 0}
+    clamp = {
+        "type": "IF_THEN_ELSE",
+        "condition": {
+            "type": "BINARY_OP",
+            "operator": "<",
+            "left": {
+                "type": "FUNCTION_CALL",
+                "function_name": "COALESCE",
+                "arguments": [deriv, zero],
+            },
+            "right": zero,
+        },
+        "then_branch": zero,
+        "else_branch": deriv,
+    }
+    pruned = prune_redundant_ast(clamp)
+    assert pruned.get("type") == "FUNCTION_CALL"
+    assert str(pruned.get("function_name") or "").upper() == "MAX"
+    assert pruned.get("arguments") == [deriv, zero]
+
+
 def test_prune_collapses_nested_identical_condition():
     from app.derivation.v2.phase2_mutation_folder import prune_redundant_ast
 

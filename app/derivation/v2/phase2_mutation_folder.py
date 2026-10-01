@@ -18,6 +18,7 @@ from app.derivation.v2.sql_text import (
     extract_if_else_chains,
     extract_insert_select,
     extract_merge_matched_updates,
+    extract_merge_using_row_predicate,
     extract_select_into,
     extract_subquery_dependency_refs,
     extract_table_resets,
@@ -708,6 +709,32 @@ def fold_column_mutations(
                 on_clause, alias_map, lineage, entity_map, target_entity_norm
             )
 
+        using_row_pred = extract_merge_using_row_predicate(using_body)
+        resolved_using_pred = None
+        if using_row_pred:
+            dep_refs.extend(extract_subquery_dependency_refs(using_row_pred))
+            resolved_using_pred = _resolve_expression_tables(
+                using_row_pred,
+                alias_map,
+                lineage,
+                entity_map,
+                target_entity_norm,
+                use_derived_formula=False,
+            )
+        join_filter = _resolve_join_filter_condition(
+            joins, alias_map, lineage, entity_map, target_entity_norm
+        )
+        merge_row_guards: list[str] = []
+        if resolved_using_pred:
+            merge_row_guards.append(resolved_using_pred)
+        if join_filter and join_filter.upper() not in " AND ".join(merge_row_guards).upper():
+            merge_row_guards.append(join_filter)
+        if not merge_row_guards and resolved_on:
+            merge_row_guards.append(resolved_on)
+        merge_where = (
+            " AND ".join(f"({g})" for g in merge_row_guards) if merge_row_guards else None
+        )
+
         for assign in _iter_set_assignments(set_clause):
             col = assign["column"]
             if col.upper() != target_col.upper():
@@ -732,14 +759,15 @@ def fold_column_mutations(
                     target_entity=target_entity_norm,
                     target_column=target_col,
                     assigned_expression=resolved_expr,
-                    where_clause=resolved_on,
+                    where_clause=merge_where,
                     joins=joins,
                     alias_map=alias_map,
                     raw_sql=(merge.get("raw_sql") or "").strip(),
                     statement_index=prior_stmt_count + merge_index,
                     source_position=int(merge.get("start") or 0),
                     operation="MERGE",
-                    guarded=bool(resolved_on),
+                    guarded=bool(merge_where),
+                    join_filter_condition=None,
                     dependency_refs=_dedupe_refs(dep_refs),
                     exception_scope=_scope_for_offset(int(merge.get("start") or 0)),
                 )
@@ -949,6 +977,9 @@ def prune_redundant_ast(node: dict[str, Any] | None, _memo=None) -> dict[str, An
     flattened = _try_flatten_join_assignment_zero_default(cleaned)
     if flattened is not None:
         return prune_redundant_ast(flattened, _memo)
+    deduped_clamp = _try_dedupe_coalesce_negative_clamp(cleaned)
+    if deduped_clamp is not None:
+        return prune_redundant_ast(deduped_clamp, _memo)
     return cleaned
 
 
@@ -986,6 +1017,47 @@ def _condition_is_expr_equals_zero(condition: Any, expr: dict[str, Any]) -> bool
     if _is_zero_literal(left) and _ast_signature(right) == expr_sig:
         return True
     return False
+
+
+def _try_dedupe_coalesce_negative_clamp(node: dict[str, Any]) -> dict[str, Any] | None:
+    """Collapse ``IF(COALESCE(deriv,0)<0) THEN 0 ELSE deriv`` (or the same with
+    ``deriv`` inlined in the guard) into ``MAX(deriv, 0)``.
+
+    Prior-value substitution copies the full derivation into the clamp guard
+    while the ELSE arm still carries the same tree — the export then lists every
+    ``@TIMEKEY`` / ``DATEDIFF`` arm twice. When guard and ELSE payloads match,
+    ``MAX`` is exact for the integer DPD metrics this pattern serves.
+    """
+    if node.get("type") != "IF_THEN_ELSE" or not _is_zero_literal(node.get("then_branch")):
+        return None
+    else_branch = node.get("else_branch")
+    if not isinstance(else_branch, dict):
+        return None
+    cond = node.get("condition")
+    if not isinstance(cond, dict) or cond.get("type") != "BINARY_OP":
+        return None
+    if str(cond.get("operator") or "").strip() not in {"<", "<="}:
+        return None
+    if not _is_zero_literal(cond.get("right")):
+        return None
+    left = cond.get("left")
+    if not isinstance(left, dict):
+        return None
+    inner: dict[str, Any] | None = None
+    if left.get("type") == "FUNCTION_CALL" and str(left.get("function_name") or "").upper() == "COALESCE":
+        args = left.get("arguments") or []
+        if len(args) == 2 and _is_zero_literal(args[1]):
+            inner = args[0] if isinstance(args[0], dict) else None
+    elif _ast_signature(left) == _ast_signature(else_branch):
+        inner = left
+    if inner is None or _ast_signature(inner) != _ast_signature(else_branch):
+        return None
+    zero_lit = {"type": "LITERAL", "value_type": "NUMBER", "value": 0}
+    return {
+        "type": "FUNCTION_CALL",
+        "function_name": "MAX",
+        "arguments": [else_branch, zero_lit],
+    }
 
 
 def _try_flatten_join_assignment_zero_default(node: dict[str, Any]) -> dict[str, Any] | None:

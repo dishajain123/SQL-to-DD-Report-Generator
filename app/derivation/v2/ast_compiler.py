@@ -10,7 +10,17 @@ Nested ``IF_THEN_ELSE`` else-branches are flattened into ``ELSEIF`` clauses
 from __future__ import annotations
 
 import re
+from contextvars import ContextVar
 from typing import Any
+
+from app.derivation.v2.sql_text import bare_ident, normalize_table_name
+
+_COMPILE_TARGET_ENTITY: ContextVar[str | None] = ContextVar(
+    "compile_target_entity", default=None
+)
+_COMPILE_TARGET_COLUMN: ContextVar[str | None] = ContextVar(
+    "compile_target_column", default=None
+)
 
 
 # NOTE: "LIKE"/"NOT LIKE" are NOT valid tokens in fourx_grammar.lark (it has
@@ -57,8 +67,53 @@ ALLOWED_FUNCTIONS = {
 }
 
 
-def compile_ast_to_4x_string(node: dict[str, Any] | None) -> str:
+def compile_ast_to_4x_string(
+    node: dict[str, Any] | None,
+    *,
+    target_entity: str | None = None,
+    target_column: str | None = None,
+) -> str:
     """Compile a structured AST node into a 4X DSL string."""
+    if target_entity is not None or target_column is not None:
+        ent_tok = _COMPILE_TARGET_ENTITY.set(
+            normalize_table_name(target_entity) if target_entity else None
+        )
+        col_tok = _COMPILE_TARGET_COLUMN.set(
+            bare_ident(target_column) if target_column else None
+        )
+        try:
+            return _compile_ast_to_4x_string(node)
+        finally:
+            _COMPILE_TARGET_ENTITY.reset(ent_tok)
+            _COMPILE_TARGET_COLUMN.reset(col_tok)
+    return _compile_ast_to_4x_string(node)
+
+
+def _is_ephemeral_sql_alias(name: str) -> bool:
+    """Statement-local alias (``A``, ``B``, ``SRC``) — not a physical entity."""
+    text = bare_ident(name or "")
+    if not text or text.startswith("#") or text.startswith("@"):
+        return False
+    if len(text) > 3:
+        return False
+    return bool(re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", text))
+
+
+def _resolve_column_entity_for_compile(entity: str, column: str) -> str:
+    """Map leaked subquery aliases onto the physical target entity when safe."""
+    target_entity = _COMPILE_TARGET_ENTITY.get()
+    target_column = _COMPILE_TARGET_COLUMN.get()
+    if (
+        target_entity
+        and target_column
+        and _is_ephemeral_sql_alias(entity)
+        and column.upper() == target_column.upper()
+    ):
+        return target_entity
+    return entity
+
+
+def _compile_ast_to_4x_string(node: dict[str, Any] | None) -> str:
     if node is None:
         return "NULL"
 
@@ -93,7 +148,7 @@ def compile_ast_to_4x_string(node: dict[str, Any] | None) -> str:
             left_node = node.get("left") or {}
             right_node = node.get("right") or {}
             operand = left_node if not _is_null_literal(left_node) else right_node
-            return f"{operator}({compile_ast_to_4x_string(operand)})"
+            return f"{operator}({_compile_ast_to_4x_string(operand)})"
 
         # NULL comparisons (``col >= NULL`` / ``col == NULL``) are not valid
         # 4X grammar — the platform has no NULL literal on the RHS/LHS of a
@@ -107,11 +162,11 @@ def compile_ast_to_4x_string(node: dict[str, Any] | None) -> str:
             if left_is_null or right_is_null:
                 operand = right_node if left_is_null else left_node
                 func = "ISEMPTY" if operator in {"==", "<=", ">="} else "ISNOTEMPTY"
-                return f"{func}({compile_ast_to_4x_string(operand)})"
+                return f"{func}({_compile_ast_to_4x_string(operand)})"
 
         if operator in {"AND", "OR"}:
             parts = _flatten_logical(node, operator)
-            rendered = ", ".join(compile_ast_to_4x_string(part) for part in parts)
+            rendered = ", ".join(_compile_ast_to_4x_string(part) for part in parts)
             return f"{operator}({rendered})"
 
         if operator in {"+", "-", "*"}:
@@ -119,8 +174,8 @@ def compile_ast_to_4x_string(node: dict[str, Any] | None) -> str:
             if folded is not None:
                 return _compile_literal(folded)
 
-        left = compile_ast_to_4x_string(node["left"])
-        right = compile_ast_to_4x_string(node["right"])
+        left = _compile_ast_to_4x_string(node["left"])
+        right = _compile_ast_to_4x_string(node["right"])
         # Preserve the AST's grouping; dropping parentheses changes
         # arithmetic expressions on the target platform.
         if node["left"].get("type") == "BINARY_OP":
@@ -157,7 +212,7 @@ def compile_ast_to_4x_string(node: dict[str, Any] | None) -> str:
             folded = _fold_numeric_constant(node)
             if folded is not None:
                 return _compile_literal(folded)
-        rendered = ", ".join(compile_ast_to_4x_string(a) for a in args)
+        rendered = ", ".join(_compile_ast_to_4x_string(a) for a in args)
         return f"{func}({rendered})"
 
     if node_type == "MEMBERSHIP_OP":
@@ -169,7 +224,7 @@ def compile_ast_to_4x_string(node: dict[str, Any] | None) -> str:
         # the platform grammar supports them.
         if operator not in _MEMBERSHIP_OP_TOKENS:
             operator = "NOTIN" if "NOT" in operator and "IN" in operator else "IN"
-        col = compile_ast_to_4x_string(node["column"])
+        col = _compile_ast_to_4x_string(node["column"])
         vals = ", ".join(_compile_membership_value(v) for v in (node.get("values") or []))
         return f"{col} {operator} [{vals}]"
 
@@ -182,8 +237,11 @@ def compile_ast_to_4x_string(node: dict[str, Any] | None) -> str:
         return f"[{items}]"
 
     if node_type == "COLUMN_REF":
-        entity = _clean_entity_qualifier(str(node.get("entity") or "").strip())
         column = str(node.get("column") or "").strip()
+        entity = _resolve_column_entity_for_compile(
+            _clean_entity_qualifier(str(node.get("entity") or "").strip()),
+            column,
+        )
         relationship = node.get("relationship")
         # Local T-SQL scalar variables (@GraceWindowStart, @ProcessDate) must
         # never be emitted as "Entity"."@Var" — grammar accepts them as STRING.
@@ -475,8 +533,8 @@ def _compile_if_then_else(node: dict[str, Any]) -> str:
     has_else = False
 
     while current is not None and current.get("type") == "IF_THEN_ELSE":
-        cond = compile_ast_to_4x_string(current["condition"])
-        then_b = compile_ast_to_4x_string(_repair_value_branch(current["then_branch"]))
+        cond = _compile_ast_to_4x_string(current["condition"])
+        then_b = _compile_ast_to_4x_string(_repair_value_branch(current["then_branch"]))
         clauses.append((cond, then_b))
         else_branch = current.get("else_branch")
         if isinstance(else_branch, dict) and else_branch.get("type") == "IF_THEN_ELSE":
@@ -501,7 +559,7 @@ def _compile_if_then_else(node: dict[str, Any]) -> str:
     for cond, then_b in deduped[1:]:
         parts.append(f"ELSEIF({cond})THEN({then_b})")
     if has_else:
-        parts.append(f"ELSE({compile_ast_to_4x_string(_repair_value_branch(default_node))})")
+        parts.append(f"ELSE({_compile_ast_to_4x_string(_repair_value_branch(default_node))})")
     return "".join(parts)
 
 
@@ -683,7 +741,7 @@ def _compile_membership_value(value: Any) -> str:
         # mixed list) -- recurse through the real compiler instead of
         # falling through to str(value), which would emit the node's raw
         # Python dict repr as a quoted string literal.
-        return compile_ast_to_4x_string(value)
+        return _compile_ast_to_4x_string(value)
     if isinstance(value, bool):
         return f'"{str(value).upper()}"'
     if isinstance(value, (int, float)) and not isinstance(value, bool):
