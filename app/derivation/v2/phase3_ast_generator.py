@@ -21,6 +21,7 @@ from app.derivation.v2.phase2_mutation_folder import (
 from app.derivation.v2.sql_text import (
     bare_ident,
     extract_subquery_dependency_refs,
+    lineage_keeps_target_hop,
     normalize_table_name,
     split_csv_respecting_parens,
 )
@@ -545,6 +546,12 @@ def _substitute_prior_value(node, prior, entity, column):
     """Resolve reads of the target against the state BEFORE this statement."""
     if isinstance(node, dict):
         if _is_self_column_ref(node, entity, column):
+            # After an unguarded literal reset (``SET COUNT=0``), keep the
+            # column reference in ``ISNULL(COUNT,0)+1``-style increments —
+            # substituting the literal ``0`` would fold the whole expression
+            # to a constant ``1``.
+            if _is_literal_ast(prior):
+                return node
             return prior
         return {k: _substitute_prior_value(v, prior, entity, column) for k, v in node.items()}
     if isinstance(node, list):
@@ -554,6 +561,24 @@ def _substitute_prior_value(node, prior, entity, column):
 
 def _is_literal_ast(node: Any) -> bool:
     return isinstance(node, dict) and node.get("type") == "LITERAL"
+
+
+def _null_safe_concat_arguments(args: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """``CONCAT(col, ',', 'text')`` → ``CONCAT(COALESCE(col,''), ',', 'text')``."""
+    empty = {"type": "LITERAL", "value_type": "STRING", "value": ""}
+    wrapped: list[dict[str, Any]] = []
+    for arg in args:
+        if isinstance(arg, dict) and _is_string_literal_node(arg):
+            wrapped.append(arg)
+        else:
+            wrapped.append(
+                {
+                    "type": "FUNCTION_CALL",
+                    "function_name": "COALESCE",
+                    "arguments": [arg, empty],
+                }
+            )
+    return wrapped
 
 
 def _references_self_column(node: Any, entity: str, column: str) -> bool:
@@ -1429,9 +1454,12 @@ def parse_sql_expression_to_ast(
                             target_column=target_column,
                         )
                     )
+        fn_name = gen_fn.group("fn").upper()
+        if fn_name == "CONCAT":
+            args = _null_safe_concat_arguments(args)
         return {
             "type": "FUNCTION_CALL",
-            "function_name": gen_fn.group("fn").upper(),
+            "function_name": fn_name,
             "arguments": args,
         }
 
@@ -1451,7 +1479,11 @@ def parse_sql_expression_to_ast(
             # grammar treats +/- as numeric-only -- CONCAT is the platform's
             # documented equivalent (see app/grammar/validator.py's
             # "numeric-only operators" check).
-            return {"type": "FUNCTION_CALL", "function_name": "CONCAT", "arguments": [left, right]}
+            return {
+                "type": "FUNCTION_CALL",
+                "function_name": "CONCAT",
+                "arguments": _null_safe_concat_arguments([left, right]),
+            }
         if op in {"+", "-"} and _should_use_addday_for_arithmetic(left, right, target_column):
             if op == "-":
                 right = {"type": "BINARY_OP", "operator": "*",
@@ -1508,11 +1540,15 @@ def parse_sql_expression_to_ast(
         text,
     )
     if marker:
-        return _column_ref(
-            marker.group("entity"),
-            marker.group("col"),
-            relationship=marker.group("rel"),
-        )
+        ent = marker.group("entity")
+        rel = marker.group("rel")
+        col = marker.group("col")
+        if rel and default_entity:
+            ent_norm = normalize_table_name(ent).upper()
+            def_norm = normalize_table_name(default_entity).upper()
+            if ent_norm == def_norm and not lineage_keeps_target_hop(ent, rel):
+                return _column_ref(rel, col)
+        return _column_ref(ent, col, relationship=rel)
 
     # T-SQL allows whitespace around the dot of a qualified name
     # (``A. SRCASSETCLASSALT_KEY``); collapse it so the path regex below sees

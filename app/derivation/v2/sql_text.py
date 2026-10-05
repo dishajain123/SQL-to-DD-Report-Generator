@@ -118,6 +118,27 @@ def normalize_table_name(name: str) -> str:
     return text
 
 
+def lineage_keeps_target_hop(entity: str, relationship: str | None = None) -> bool:
+    """Whether a column ref should keep target→hop→column in compiled 4X.
+
+    ACCOUNTCAL derivations that read sibling cal/global-temp hops keep the
+    three-part path (``"ACCOUNTCAL"."CUSTOMERCAL"."RiskFlag"``). CUSTOMERCAL
+    (and other non-ACCOUNTCAL targets) collapse to the physical source table
+    (``"CUSTOMERBASICDETAIL"."CustomerEntityID"``).
+    """
+    ent = normalize_table_name(entity or "").upper().lstrip("#")
+    if ent.endswith("CUSTOMERCAL"):
+        return False
+    rel = (
+        normalize_table_name(relationship or "").upper().lstrip("#")
+        if relationship
+        else ""
+    )
+    if ent.endswith("ACCOUNTCAL") and rel:
+        return True
+    return False
+
+
 def bare_ident(name: str) -> str:
     return (name or "").strip().strip("[]").strip('"').strip()
 
@@ -131,7 +152,13 @@ _ALIAS_TOKEN = (
 )
 # T-SQL table hints — ``WITH (NOLOCK)`` — may follow a table or its alias.
 _TABLE_HINT = r"(?:\s+WITH\s*\([^)]*\))?"
-_JOIN_KEYWORD = r"(?:(?:LEFT|RIGHT|FULL)(?:\s+OUTER)?|INNER|CROSS)\s+JOIN|JOIN"
+# T-SQL physical join hints sit between the join type and JOIN
+# (``INNER HASH JOIN``, ``LEFT hash JOIN``, ``INNER MERGE JOIN``). Without them
+# a LEFT hash JOIN was read as a bare JOIN, i.e. treated like an inner join.
+_JOIN_HINT = r"(?:\s+(?:HASH|MERGE|LOOP|REMOTE))?"
+_JOIN_KEYWORD = (
+    rf"(?:(?:LEFT|RIGHT|FULL)(?:\s+OUTER)?|INNER|CROSS){_JOIN_HINT}\s+JOIN|JOIN"
+)
 
 
 def parse_from_join_clause(from_body: str) -> list[tuple[str, str | None, str | None]]:
@@ -197,6 +224,7 @@ def parse_from_join_clause_with_type(
         alias = match.groupdict().get("alias")
         on_clause = (match.group("on") or "").strip() or None
         join_type = re.sub(r"\s+", " ", (match.group("kw") or "").strip()).upper()
+        join_type = re.sub(r"\s(?:HASH|MERGE|LOOP|REMOTE)\b", "", join_type)
         results.append((table, alias, on_clause, join_type))
     return results
 
@@ -275,11 +303,15 @@ def extract_update_statements(sql: str) -> list[dict[str, str | None]]:
         where_clause = None
         if i < len(text) and _FROM_KW.match(text, i):
             i = i + len("FROM")
-            from_clause, i = _read_until_keyword(text, i, {"WHERE"}, stop_at_statement=True)
+            # OPTION (MAXDOP 1 / HASH JOIN …) is a statement-level query hint,
+            # not part of the FROM or WHERE text.
+            from_clause, i = _read_until_keyword(
+                text, i, {"WHERE", "OPTION"}, stop_at_statement=True
+            )
             from_clause = from_clause.strip() or None
         if i < len(text) and _WHERE_KW.match(text, i):
             i = i + len("WHERE")
-            where_clause, i = _read_until_keyword(text, i, set(), stop_at_statement=True)
+            where_clause, i = _read_until_keyword(text, i, {"OPTION"}, stop_at_statement=True)
             where_clause = where_clause.strip() or None
 
         statements.append(
@@ -1280,6 +1312,11 @@ _SELECT_ITEM_COL_AS_RE = re.compile(
 )
 
 
+_SELECT_ITEM_EQ_ALIAS_RE = re.compile(
+    r"(?s)^\[?(?P<alias>[A-Za-z_][A-Za-z0-9_]*)\]?\s*=(?!=)\s*(?P<value>\S.*)$"
+)
+
+
 def parse_select_list(
     select_list: str,
 ) -> list[tuple[str | None, str | None, str | None, str]]:
@@ -1317,6 +1354,15 @@ def parse_select_list(
         if not chunk or chunk == "*":
             results.append((None, None, None, chunk))
             continue
+        # T-SQL ``alias = expression`` projection (``FLGDEG='N'``,
+        # ``ACCOUNTENTITYID = ACCOUNTENTITYID``). A boolean comparison is not a
+        # legal SELECT-list item, so a leading ``identifier =`` is always the
+        # output name; keep only the value as the chunk.
+        eq_alias: str | None = None
+        eq_match = _SELECT_ITEM_EQ_ALIAS_RE.match(chunk)
+        if eq_match:
+            eq_alias = bare_ident(eq_match.group("alias"))
+            chunk = eq_match.group("value").strip()
         if "(" in chunk:
             alias = None
             alias_m = re.search(
@@ -1325,20 +1371,26 @@ def parse_select_list(
             )
             if alias_m:
                 alias = bare_ident(alias_m.group("alias"))
-            results.append((None, None, alias, chunk))
+            results.append((None, None, eq_alias or alias, chunk))
             continue
         match = _SELECT_ITEM_COL_AS_RE.fullmatch(chunk)
         if not match:
-            results.append((None, None, None, chunk))
+            results.append((None, None, eq_alias, chunk))
             continue
         qual = match.group("qual")
         col = bare_ident(match.group("col"))
-        alias = bare_ident(match.group("alias")) if match.group("alias") else None
+        alias = bare_ident(match.group("alias")) if match.group("alias") else eq_alias
         if col.upper() in {"AS", "FROM", "INTO", "NULL", "CASE", "WHEN", "END", "TRUE", "FALSE"}:
             results.append((None, None, None, chunk))
             continue
         results.append((qual, col, alias, chunk))
     return results
+
+
+_CTE_CHAIN_RE = re.compile(
+    r"(?is)\s*,\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*"
+    r"(?:\((?P<cols>[^)]*)\))?\s*AS\s*\("
+)
 
 
 def extract_cte_definitions(sql: str) -> list[dict[str, str]]:
@@ -1359,48 +1411,53 @@ def extract_cte_definitions(sql: str) -> list[dict[str, str]]:
         r"(?:\((?P<cols>[^)]*)\))?\s*AS\s*\(",
         text,
     ):
-        name = m.group("name")
-        cols = m.group("cols") or ""
-        body_start = m.end()
-        depth = 1
-        i = body_start
-        n = len(text)
-        in_single = False
-        while i < n and depth > 0:
-            ch = text[i]
-            if in_single:
+        # ``WITH A AS (…), B AS (…) UPDATE …`` -- every CTE of the chain is
+        # registered, not only the first.
+        cte_match = m
+        while cte_match is not None:
+            name = cte_match.group("name")
+            cols = cte_match.group("cols") or ""
+            body_start = cte_match.end()
+            depth = 1
+            i = body_start
+            n = len(text)
+            in_single = False
+            while i < n and depth > 0:
+                ch = text[i]
+                if in_single:
+                    if ch == "'":
+                        if i + 1 < n and text[i + 1] == "'":
+                            i += 2
+                            continue
+                        in_single = False
+                    i += 1
+                    continue
                 if ch == "'":
-                    if i + 1 < n and text[i + 1] == "'":
-                        i += 2
-                        continue
-                    in_single = False
+                    in_single = True
+                    i += 1
+                    continue
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
                 i += 1
-                continue
-            if ch == "'":
-                in_single = True
-                i += 1
-                continue
-            if ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-                if depth == 0:
-                    break
-            i += 1
-        if depth != 0:
-            continue
-        body = text[body_start:i]
-        if not re.match(r"(?is)^\s*SELECT\b", body):
-            continue
-        results.append(
-            {
-                "name": name,
-                "cols": cols.strip(),
-                "body": body.strip(),
-                "start": str(m.start()),
-                "end": str(i + 1),
-            }
-        )
+            if depth != 0:
+                break
+            body = text[body_start:i]
+            if not re.match(r"(?is)^\s*SELECT\b", body):
+                break
+            results.append(
+                {
+                    "name": name,
+                    "cols": cols.strip(),
+                    "body": body.strip(),
+                    "start": str(cte_match.start()),
+                    "end": str(i + 1),
+                }
+            )
+            cte_match = _CTE_CHAIN_RE.match(text, i + 1)
     return results
 
 

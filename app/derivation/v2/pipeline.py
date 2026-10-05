@@ -23,6 +23,7 @@ from app.derivation.v2.execution_steps import build_execution_steps, is_identity
 from app.derivation.v2.phase1_lineage import LineageMap, build_lineage_map
 from app.derivation.v2.phase2_mutation_folder import MutationPass, MutationSourceIndex, fold_column_mutations
 from app.derivation.v2.phase3_ast_generator import generate_ast
+from app.derivation.derivation_option import format_expression_syntax
 from app.derivation.v2.phase4_metadata import build_metadata, metadata_to_dd_row
 from app.derivation.v2.semantic_checks import mutation_semantic_errors
 from app.derivation.v2.sql_text import extract_declared_column_types, normalize_table_name
@@ -158,6 +159,7 @@ def generate_for_sql(
         ],
         source_statement_sql=[m.raw_sql for m in derived.mutations],
         data_type=derived.data_type,
+        ast=derived.ast,
     )
     derived.apply_to(row)
     debug = {
@@ -192,7 +194,9 @@ class _DerivedColumn:
         row.execution_order = self.execution_order
         row.execution_steps = list(self.steps)
         row.workflow_gates = list(self.workflow_gates)
-        row.exception_handler_expression = self.exception_formula
+        row.exception_handler_expression = format_expression_syntax(
+            self.exception_formula or ""
+        )
         row.advisory_notes = list(dict.fromkeys([*row.advisory_notes, *self.advisories]))
 
 
@@ -440,6 +444,7 @@ def _run_column_job(
             ],
             source_statement_sql=[m.raw_sql for m in derived.mutations],
             data_type=derived.data_type,
+            ast=derived.ast,
         )
         derived.apply_to(row)
         return [(row, derived)]

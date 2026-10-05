@@ -13,7 +13,11 @@ import re
 from contextvars import ContextVar
 from typing import Any
 
-from app.derivation.v2.sql_text import bare_ident, normalize_table_name
+from app.derivation.v2.sql_text import (
+    bare_ident,
+    lineage_keeps_target_hop,
+    normalize_table_name,
+)
 
 _COMPILE_TARGET_ENTITY: ContextVar[str | None] = ContextVar(
     "compile_target_entity", default=None
@@ -261,6 +265,13 @@ def _compile_ast_to_4x_string(node: dict[str, Any] | None) -> str:
                 # Redundant self-relationship (e.g. a join path that folded
                 # back onto its own entity) collapses to a plain column ref.
                 return f'"{entity}"."{column}"'
+            target_entity = _COMPILE_TARGET_ENTITY.get()
+            if (
+                target_entity
+                and entity.upper() == target_entity.upper()
+                and not lineage_keeps_target_hop(entity, relationship)
+            ):
+                return f'"{relationship}"."{column}"'
             return f'"{entity}"."{relationship}"."{column}"'
         return f'"{entity}"."{column}"'
 
@@ -424,7 +435,13 @@ def _clean_entity_qualifier(text: str) -> str:
     Never touches a single bare identifier with no ``.``.
     """
     raw = (text or "").strip()
-    if not raw or "." not in raw:
+    if not raw:
+        return raw
+    if "." not in raw:
+        if raw.startswith("##"):
+            return raw[2:]
+        if raw.startswith("#"):
+            return raw[1:]
         return raw
 
     prefix = ""
@@ -450,7 +467,13 @@ def _clean_entity_qualifier(text: str) -> str:
             continue
         deduped.append(part)
 
-    return f"{prefix}{'.'.join(deduped) if deduped else raw}"
+    out = f"{prefix}{'.'.join(deduped) if deduped else raw}"
+    # Global temp tables (``##ACCOUNTCAL``) export as physical entity names.
+    if out.startswith("##"):
+        return out[2:]
+    if out.startswith("#"):
+        return out[1:]
+    return out
 
 
 def _is_null_literal(node: dict[str, Any]) -> bool:

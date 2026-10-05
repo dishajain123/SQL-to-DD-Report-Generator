@@ -15,7 +15,12 @@ from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
 
-from app.models.core import DDRow, ReviewState
+from app.derivation.derivation_option import (
+    classify_derivation_option,
+    is_static_seed,
+    format_expression_syntax,
+)
+from app.models.core import DDRow, DerivationOption, ReviewState
 from app.utils import db
 from app.utils.identity import canonical_expression_key, canonical_logical_name
 
@@ -101,12 +106,14 @@ def reconcile_data_type(data_type: str, expression: str, column_name: str = "") 
 
 
 def dd_row_to_dict(dd: DDRow) -> dict:
+    display = format_expression_syntax(dd.display_derivation_expression or "")
+    option = classify_derivation_option(display)
     return {
         "entity_name": dd.entity_name,
         "column_name": dd.column_name,
         "column_type": dd.column_type.value,
-        "derivation_option": dd.derivation_option.value,
-        "display_derivation_expression": dd.display_derivation_expression,
+        "derivation_option": option.value,
+        "display_derivation_expression": display,
         "effective_start_date": dd.effective_start_date.strftime("%d-%m-%Y"),
         "status": dd.status.value,
         "data_type": reconcile_data_type(
@@ -400,6 +407,8 @@ def is_exportable_row(row: DDRow, should_omit) -> bool:
     if row.review_state not in {ReviewState.GENERATED, ReviewState.APPROVED, ReviewState.NEEDS_REVIEW}:
         return False
     if any(e != COMPLETENESS_GATE_REASON for e in (row.validation_errors or [])):
+        return False
+    if is_static_seed(row.display_derivation_expression or ""):
         return False
     return not should_omit(row.display_derivation_expression or "")
 

@@ -171,7 +171,7 @@ def test_join_to_global_temp_keeps_its_prefix_and_local_temp_traces_to_root():
     WHERE B.RiskFlag = 'Y'
     """
     _, d_global = generate_for_sql(sql_global, "##ACCOUNTCAL", "ASSET_NORM", llm_client=None)
-    assert '"ACCOUNTCAL"."##CUSTOMERCAL"."RiskFlag"' in d_global["formula"]
+    assert '"ACCOUNTCAL"."CUSTOMERCAL"."RiskFlag"' in d_global["formula"]
     assert validate_expression(d_global["formula"]).valid
 
     sql_local = """
@@ -187,6 +187,21 @@ def test_join_to_global_temp_keeps_its_prefix_and_local_temp_traces_to_root():
     assert '"ACCOUNTCAL"."CustomerMaster"."RiskFlag"' in d_local["formula"]
     assert "#CustRisk" not in d_local["formula"]
     assert validate_expression(d_local["formula"]).valid
+
+
+def test_customercal_cross_table_markers_compile_as_two_tier_source_lineage():
+    """INSERT/SELECT copies onto CUSTOMERCAL must not self-prefix the target."""
+    for marker in (
+        "CUSTOMERBASICDETAIL::CustomerEntityID",
+        "CUSTOMERCAL::CUSTOMERBASICDETAIL::CustomerEntityID",
+    ):
+        ast = parse_sql_expression_to_ast(marker, default_entity="CUSTOMERCAL")
+        formula = compile_ast_to_4x_string(
+            ast, target_entity="CUSTOMERCAL", target_column="CustomerEntityID"
+        )
+        assert formula == '"CUSTOMERBASICDETAIL"."CustomerEntityID"'
+        assert "CUSTOMERCAL" not in formula
+        assert validate_expression(formula).valid
 
 
 def test_phase3_between_not_split_on_and():

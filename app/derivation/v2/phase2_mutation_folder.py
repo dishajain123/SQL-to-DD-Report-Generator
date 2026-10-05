@@ -24,6 +24,7 @@ from app.derivation.v2.sql_text import (
     extract_table_resets,
     extract_update_statements,
     extract_workflow_gates,
+    lineage_keeps_target_hop,
     normalize_table_name,
     parse_from_join_clause,
     parse_from_join_clause_with_type,
@@ -980,10 +981,58 @@ def prune_redundant_ast(node: dict[str, Any] | None, _memo=None) -> dict[str, An
     deduped_clamp = _try_dedupe_coalesce_negative_clamp(cleaned)
     if deduped_clamp is not None:
         return prune_redundant_ast(deduped_clamp, _memo)
+    cond = cleaned.get("condition")
+    if isinstance(cond, dict):
+        deduped_cond = _dedupe_or_condition_ast(cond)
+        if deduped_cond is not None:
+            cleaned["condition"] = deduped_cond
     return cleaned
 
 
 _IDENTIFIER_KEYS = {"entity", "relationship", "column", "function_name", "name", "operator"}
+
+
+def _flatten_or_conditions(node: dict[str, Any]) -> list[dict[str, Any]]:
+    """Left-to-right leaves of an ``OR`` tree."""
+    if node.get("type") != "BINARY_OP" or str(node.get("operator") or "").upper() != "OR":
+        return [node]
+    left = node.get("left")
+    right = node.get("right")
+    parts: list[dict[str, Any]] = []
+    if isinstance(left, dict):
+        parts.extend(_flatten_or_conditions(left))
+    if isinstance(right, dict):
+        parts.extend(_flatten_or_conditions(right))
+    return parts or [node]
+
+
+def _rebuild_or_chain(parts: list[dict[str, Any]]) -> dict[str, Any]:
+    if not parts:
+        return {"type": "LITERAL", "value_type": "NULL", "value": None}
+    out = parts[0]
+    for part in parts[1:]:
+        out = {"type": "BINARY_OP", "operator": "OR", "left": out, "right": part}
+    return out
+
+
+def _dedupe_or_condition_ast(node: dict[str, Any]) -> dict[str, Any] | None:
+    """Drop duplicate disjuncts from a flat ``OR`` guard (same Class-A arm)."""
+    if node.get("type") != "BINARY_OP" or str(node.get("operator") or "").upper() != "OR":
+        return None
+    parts = _flatten_or_conditions(node)
+    if len(parts) < 2:
+        return None
+    seen: set[Any] = set()
+    unique: list[dict[str, Any]] = []
+    for part in parts:
+        sig = _ast_signature(part)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        unique.append(part)
+    if len(unique) == len(parts):
+        return None
+    return _rebuild_or_chain(unique)
 
 
 def _is_zero_literal(node: Any) -> bool:
@@ -1544,15 +1593,46 @@ def _resolve_expression_tables(
             else:
                 rel = ref.entity
             if resolve_entity_name(str(table), entity_map).upper() != default_entity.upper():
-                return f"{default_entity}::{rel}::{ref.column}"
+                return _cross_entity_column_marker(default_entity, rel, ref.column)
         if relationship:
-            return f"{ref.entity}::{relationship}::{ref.column}"
+            ent = ref.entity
+            rel = relationship
+            if (
+                default_entity
+                and ent
+                and ent.upper() == normalize_table_name(default_entity).upper()
+                and not lineage_keeps_target_hop(ent, rel)
+            ):
+                return f"{normalize_table_name(rel)}::{ref.column}"
+            return f"{ent}::{rel}::{ref.column}"
+        root_entity = normalize_table_name(ref.entity or "")
+        if default_entity and root_entity.upper() == normalize_table_name(default_entity).upper():
+            physical = resolve_entity_name(ref.source_table or "", entity_map) or normalize_table_name(
+                ref.source_table or ""
+            )
+            physical = normalize_table_name(physical)
+            if (
+                physical
+                and physical.upper() != root_entity.upper()
+                and not physical.startswith("#")
+                and not lineage_keeps_target_hop(root_entity, physical)
+            ):
+                return f"{physical}::{ref.column}"
         return f"{ref.entity}::{ref.column}"
 
     pattern = re.compile(
         r"(?P<qual>[#A-Za-z_][A-Za-z0-9_]*)\.(?P<col>\[?[A-Za-z_][A-Za-z0-9_]*\]?)"
     )
     return pattern.sub(repl, expression)
+
+
+def _cross_entity_column_marker(default_entity: str, rel: str, column: str) -> str:
+    """Encode a cross-table column read for phase3 (``Entity::Col`` markers)."""
+    target = normalize_table_name(default_entity or "")
+    rel_name = normalize_table_name(rel or "")
+    if not lineage_keeps_target_hop(target, rel_name):
+        return f"{rel_name}::{column}"
+    return f"{target}::{rel_name}::{column}"
 
 
 def _normalize_entity(entity: str, entity_map: dict[str, str] | None) -> str:

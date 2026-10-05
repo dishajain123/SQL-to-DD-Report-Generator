@@ -180,6 +180,7 @@ class CanonicalModel(BaseModel):
 class DerivationOption(str, Enum):
     FORMULA_EXPRESSION = "Formula Expression"
     DECISION_TABLE = "Decision Table"
+    DIRECT_PARAMETER = "Direct Parameter"
 
 
 class ColumnType(str, Enum):

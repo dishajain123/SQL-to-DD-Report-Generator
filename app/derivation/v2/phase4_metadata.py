@@ -12,6 +12,10 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Optional
 
+from app.derivation.derivation_option import (
+    classify_derivation_option,
+    format_expression_syntax,
+)
 from app.derivation.versioning import resolve_timekey_to_date
 from app.grammar.validator import validate_expression
 from app.models.core import (
@@ -201,9 +205,14 @@ def metadata_to_dd_row(
     source_statement_refs: list[str] | None = None,
     source_statement_sql: list[str] | None = None,
     data_type: str = "String",
+    ast: dict[str, Any] | None = None,
 ) -> DDRow:
     """Convert Phase-4 metadata into a platform ``DDRow``."""
     valid = not meta.validation_errors
+    display_expression = format_expression_syntax(meta.derivation_formula_expression or "")
+    derivation_option = classify_derivation_option(
+        display_expression, ast=ast
+    )
     # Valid formulas ship as ACTIVE/GENERATED. Only grammar failures go pending.
     # An unmapped TIMEKEY (no real SysDayMatrix date available) makes the
     # Effective Start Date value itself uncertain, but it says nothing about
@@ -222,8 +231,8 @@ def metadata_to_dd_row(
         entity_name=meta.target_entity_name,
         column_name=meta.target_column_name,
         column_type=_infer_column_type(meta.target_entity_name),
-        derivation_option=DerivationOption.FORMULA_EXPRESSION,
-        display_derivation_expression=meta.derivation_formula_expression,
+        derivation_option=derivation_option,
+        display_derivation_expression=display_expression,
         effective_start_date=meta.effective_start_date,
         status=status,
         review_state=review_state,
