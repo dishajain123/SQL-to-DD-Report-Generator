@@ -117,6 +117,9 @@ def _resolve_column_entity_for_compile(entity: str, column: str) -> str:
     return entity
 
 
+_PLAIN_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+
+
 def _compile_ast_to_4x_string(node: dict[str, Any] | None) -> str:
     if node is None:
         return "NULL"
@@ -182,9 +185,12 @@ def _compile_ast_to_4x_string(node: dict[str, Any] | None) -> str:
         right = _compile_ast_to_4x_string(node["right"])
         # Preserve the AST's grouping; dropping parentheses changes
         # arithmetic expressions on the target platform.
-        if node["left"].get("type") == "BINARY_OP":
+        # A nested IF/THEN/ELSE used as an operand must be wrapped too, or the
+        # trailing ``> @ProcessDate`` reads as if it applied to the ELSE value.
+        # (A sub-expression that folded to a plain number needs no wrapper.)
+        if node["left"].get("type") in {"BINARY_OP", "IF_THEN_ELSE"} and not _PLAIN_NUMBER_RE.fullmatch(left):
             left = f"({left})"
-        if node["right"].get("type") == "BINARY_OP":
+        if node["right"].get("type") in {"BINARY_OP", "IF_THEN_ELSE"} and not _PLAIN_NUMBER_RE.fullmatch(right):
             right = f"({right})"
         return f"{left} {operator} {right}"
 

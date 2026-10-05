@@ -497,7 +497,10 @@ def test_end_to_end_final_asset_class_validates():
     assert result.valid, f"{result.error}\nformula={debug['formula']}\nast={debug['ast']}"
     assert row.entity_name
     assert row.column_name == "FinalAssetClassAlt_Key"
-    assert row.display_derivation_expression == debug["formula"]
+    from app.derivation.derivation_option import format_expression_syntax
+
+    # Display form shows @PARAM unquoted; the compiled formula keeps it quoted.
+    assert row.display_derivation_expression == format_expression_syntax(debug["formula"])
     assert "ELSEIF" in debug["formula"] or debug["formula"].startswith("IF(")
 
 

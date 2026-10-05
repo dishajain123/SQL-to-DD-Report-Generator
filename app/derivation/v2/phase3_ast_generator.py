@@ -309,9 +309,21 @@ def build_ast_from_mutations(
         skipped_set_based_source
         and isinstance(ast_out, dict)
         and _is_self_column_ref(ast_out, target_entity, target_column)
+        and not _is_string_flag_column(target_column)
     ):
         ast_out = _wrap_nullable_identity_default(ast_out, target_entity, target_column)
     return ast_out
+
+
+_STRING_FLAG_NAME_RE = re.compile(r"(?i)^(?:flg|flag)|(?:flg|flag)$")
+
+
+def _is_string_flag_column(column: str) -> bool:
+    """Character flag columns (``FlgDeg``, ``FlgProcessing``) hold 'Y'/'N'.
+
+    A numeric ``ISEMPTY -> 0`` default is wrong for them; map the flag directly.
+    """
+    return bool(_STRING_FLAG_NAME_RE.search(bare_ident(column or "")))
 
 
 def _contains_self_column_ref(node: Any, entity: str, column: str) -> bool:

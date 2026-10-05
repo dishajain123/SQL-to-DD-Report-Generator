@@ -1214,6 +1214,116 @@ def _dedupe_refs(refs: list[str]) -> list[str]:
     return out
 
 
+class DerivedTable(str):
+    """Alias-map value for a ``( SELECT ... ) alias`` derived table.
+
+    Behaves as the subquery's primary source table name (so existing
+    ``alias_map`` consumers keep working) and additionally carries the
+    projected expressions, so ``alias.col`` can be rewritten to the
+    underlying expression (aggregates such as ``MIN(...)`` included) instead
+    of leaking an unresolved short alias like ``"C"``.
+    """
+
+    projections: dict[str, str]
+    inner_alias_map: dict[str, str]
+
+    def __new__(cls, primary: str, projections: dict[str, str], inner_alias_map: dict[str, str]):
+        obj = super().__new__(cls, primary)
+        obj.projections = projections
+        obj.inner_alias_map = inner_alias_map
+        return obj
+
+    def __getnewargs__(self):  # keeps copy/deepcopy/pickle working
+        return (str(self), self.projections, self.inner_alias_map)
+
+
+_DERIVED_OPEN_RE = re.compile(r"(?is)\b(?:FROM|JOIN)\s*\(")
+
+
+def _mask_derived_tables(from_clause: str) -> tuple[str, dict[str, str]]:
+    """Replace ``( SELECT ... )`` table sources with ``__DERIVED_n__`` tokens."""
+    text = from_clause or ""
+    masked: dict[str, str] = {}
+    out: list[str] = []
+    pos = 0
+    while True:
+        m = _DERIVED_OPEN_RE.search(text, pos)
+        if not m:
+            break
+        open_idx = m.end() - 1
+        depth = 0
+        in_single = False
+        close_idx = -1
+        for i in range(open_idx, len(text)):
+            ch = text[i]
+            if in_single:
+                if ch == "'":
+                    in_single = False
+                continue
+            if ch == "'":
+                in_single = True
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    close_idx = i
+                    break
+        inner = text[open_idx + 1 : close_idx].strip() if close_idx > 0 else ""
+        if close_idx < 0 or not re.match(r"(?is)^SELECT\b", inner):
+            out.append(text[pos : m.end()])
+            pos = m.end()
+            continue
+        token = f"__DERIVED_{len(masked)}__"
+        masked[token] = inner
+        out.append(text[pos : open_idx])
+        # Pad the token: ``) c`` may reach us as ``)c`` once comments/whitespace
+        # are stripped, and the alias must stay a separate token.
+        out.append(f" {token} ")
+        pos = close_idx + 1
+    out.append(text[pos:])
+    return "".join(out), masked
+
+
+def _build_derived_table(
+    inner_select: str,
+    lineage: LineageMap,
+    entity_map: dict[str, str] | None,
+    fallback: str,
+) -> DerivedTable:
+    from app.derivation.v2.sql_text import split_select_from
+
+    select_list, from_body = split_select_from(inner_select)
+    inner_alias_map, _ = _parse_update_sources("", from_body, lineage, entity_map)
+    primary = next(iter(dict.fromkeys(inner_alias_map.values())), fallback)
+
+    group_by = ""
+    gm = re.search(
+        r"(?is)\bGROUP\s+BY\s+(?P<g>.+?)(?:\bHAVING\b|\bORDER\s+BY\b|$)", inner_select
+    )
+    if gm:
+        group_by = gm.group("g").strip()
+
+    projections: dict[str, str] = {}
+    for _qual, src_col, dest_alias, raw in parse_select_list(select_list):
+        expr = _strip_trailing_select_alias(raw.strip())
+        name = dest_alias or src_col
+        if not name:
+            tail = re.match(r"(?is)^(?P<e>.+?)\s+AS\s+\[?(?P<n>[A-Za-z_]\w*)\]?\s*$", raw.strip())
+            if not tail:
+                continue
+            name, expr = tail.group("n"), tail.group("e").strip()
+        agg = re.match(r"(?is)^STRING_AGG\s*\((?P<args>.*)\)$", expr.strip())
+        if agg:
+            # Concatenating aggregation has no row-level 4X form; the row's
+            # value is the aggregated source column itself.
+            args = split_csv_respecting_parens(agg.group("args"))
+            expr = args[0].strip() if args else expr
+        expr = _attach_groupby_to_bare_aggregate(expr, group_by)
+        projections[bare_ident(name).upper()] = expr
+    return DerivedTable(primary, projections, inner_alias_map)
+
+
 def _parse_update_sources(
     head: str,
     from_clause: str,
@@ -1222,6 +1332,7 @@ def _parse_update_sources(
 ) -> tuple[dict[str, str], list[JoinInfo]]:
     alias_map: dict[str, str] = {}
     joins: list[JoinInfo] = []
+    from_clause, derived_sources = _mask_derived_tables(from_clause or "")
 
     head_match = re.match(
         r"(?is)^(?P<table>\[?#?#?[A-Za-z0-9_\.]+\]?)"
@@ -1264,6 +1375,21 @@ def _parse_update_sources(
         elif re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", bare_head):
             # Still unknown — leave for target resolution via FROM-only tables.
             pass
+
+    if derived_sources:
+        built = {
+            token: _build_derived_table(sql, lineage, entity_map, token)
+            for token, sql in derived_sources.items()
+        }
+        for key, value in list(alias_map.items()):
+            if value in built:
+                alias_map[key] = built[value]
+        for token in built:
+            alias_map.pop(token.upper(), None)
+        for join in joins:
+            if join.table in built:
+                join.table = str(built[join.table])
+                join.resolved_entity = _resolve_table_entity(join.table, lineage, entity_map)
 
     return alias_map, joins
 
@@ -1564,6 +1690,21 @@ def _resolve_expression_tables(
                 table = normalize_table_name(qual)
             else:
                 return match.group(0)
+        if isinstance(table, DerivedTable):
+            projection = table.projections.get(col.upper())
+            if projection is not None:
+                inner = _resolve_expression_tables(
+                    projection,
+                    table.inner_alias_map,
+                    lineage,
+                    entity_map,
+                    default_entity,
+                    use_derived_formula=use_derived_formula,
+                    default_source_table=_pick_primary_source_table(table.inner_alias_map),
+                )
+                if re.fullmatch(r"[\w:.#\"]+|\w+\(.*\)", inner.strip(), flags=re.S):
+                    return inner
+                return f"({inner})"
         ref = lineage.resolve_column(table, col, entity_map)
         if use_derived_formula and getattr(ref, "derived_formula", None):
             # Temp-table mutation checkpoint (Phase 1) — splice the folded
@@ -1623,7 +1764,13 @@ def _resolve_expression_tables(
     pattern = re.compile(
         r"(?P<qual>[#A-Za-z_][A-Za-z0-9_]*)\.(?P<col>\[?[A-Za-z_][A-Za-z0-9_]*\]?)"
     )
-    return pattern.sub(repl, expression)
+    # Never rewrite text inside single-quoted string literals: ``'D.FDSEC'``
+    # is data, not an ``alias.column`` reference, and rewriting it would embed
+    # an entity prefix in the literal (``"DimProduct.FDSEC"``).
+    segments = re.split(r"('(?:[^']|'')*')", expression)
+    return "".join(
+        seg if seg.startswith("'") else pattern.sub(repl, seg) for seg in segments
+    )
 
 
 def _cross_entity_column_marker(default_entity: str, rel: str, column: str) -> str:

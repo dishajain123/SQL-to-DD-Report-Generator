@@ -36,6 +36,25 @@ def format_expression_syntax(expression: str) -> str:
     return _QUOTED_PARAM_RE.sub(r"\1", expression)
 
 
+_DOUBLE_QUOTED_RE = re.compile(r'("(?:[^"\\]|\\.)*")')
+_BARE_PARAM_RE = re.compile(r"(?<![\w@])@[A-Za-z_][A-Za-z0-9_]*")
+
+
+def quote_expression_parameters(expression: str) -> str:
+    """Inverse of ``format_expression_syntax``: quote bare ``@`` parameters.
+
+    The 4X grammar has no bare ``@`` token, so validation must run on the
+    quoted form even though the exported/display text shows ``@TIMEKEY``.
+    """
+    if not expression or "@" not in expression:
+        return expression
+    parts = _DOUBLE_QUOTED_RE.split(expression)
+    return "".join(
+        part if part.startswith('"') else _BARE_PARAM_RE.sub(lambda m: f'"{m.group(0)}"', part)
+        for part in parts
+    )
+
+
 def classify_derivation_option(
     expression: str,
     *,

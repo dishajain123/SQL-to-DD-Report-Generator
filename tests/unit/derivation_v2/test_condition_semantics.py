@@ -75,7 +75,7 @@ def test_arithmetic_order(expr,expected):
     ast = parse_sql_expression_to_ast(expr, default_entity='AccountCal')
     assert evaluate(ast,{}) == expected
     if expr == '(10-4)/2':
-        assert compile_ast_to_4x_string(ast) == '(10 - 4) / 2'
+        assert compile_ast_to_4x_string(ast) == '6 / 2'  # literal-only (10 - 4) folds to a constant
 
 
 @pytest.mark.parametrize('dpd,active,expected', [(70,1,True),(70,0,False),(91,1,False),(60,1,False)])

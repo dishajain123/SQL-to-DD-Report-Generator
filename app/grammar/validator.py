@@ -19,6 +19,14 @@ class ValidationResult:
     valid: bool
     error: str | None = None
 
+    @property
+    def passed(self) -> bool:
+        return self.valid
+
+    @property
+    def errors(self) -> list[str]:
+        return [self.error] if self.error else []
+
 
 # Function names the grammar accepts syntactically as FUNC_NAME, cross-checked
 # here against the actual documented library so an expression using a made-up
@@ -721,12 +729,29 @@ def _normalize_expression(expression: str) -> str:
     return normalized
 
 
+_DOUBLE_QUOTED_SPLIT_RE = re.compile(r'("(?:[^"\\]|\\.)*")')
+_BARE_PARAMETER_RE = re.compile(r"(?<![\w@])@[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _quote_bare_parameters(expression: str) -> str:
+    if not expression or "@" not in expression:
+        return expression
+    parts = _DOUBLE_QUOTED_SPLIT_RE.split(expression)
+    return "".join(
+        part if part.startswith('"') else _BARE_PARAMETER_RE.sub(lambda m: f'"{m.group(0)}"', part)
+        for part in parts
+    )
+
+
 def validate_expression(expression: str) -> ValidationResult:
     # Chronological substitution can expand a compact SQL procedure into an
     # enormous formula. Do not let Earley's parse forest exhaust a worker.
     # Withhold the candidate and require smaller ordered workflow steps.
     if len(expression or "") > 8000:
         return ValidationResult(valid=False, error="Expression exceeds 8000-character validation budget; split into ordered workflow steps")
+    # Display text shows runtime parameters bare (``@TIMEKEY``); the grammar
+    # only has the quoted token form, so quote them before parsing.
+    expression = _quote_bare_parameters(expression)
     expression = _normalize_expression(expression)
     if not expression.strip():
         return ValidationResult(valid=False, error="Empty expression")

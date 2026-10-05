@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 
+from app.derivation.derivation_option import quote_expression_parameters
 from app.grammar.validator import KNOWN_FUNCTIONS, validate_expression
 from app.guardrails.input_guardrails import GuardrailResult
 from app.models.core import CanonicalModel, DDRow
@@ -208,11 +209,13 @@ def check_dd_row(dd_row: DDRow, canonical_model: CanonicalModel) -> GuardrailRes
         )
 
     if dd_row.display_derivation_expression:
-        result = validate_expression(dd_row.display_derivation_expression)
+        # Display text shows ``@TIMEKEY``; the grammar only knows the quoted form.
+        grammar_form = quote_expression_parameters(dd_row.display_derivation_expression)
+        result = validate_expression(grammar_form)
         if not result.valid:
             errors.append(f"Grammar validation failed: {result.error}")
-        errors.extend(check_no_bare_identifiers(dd_row.display_derivation_expression))
-        errors.extend(check_contradictory_guard_conjuncts(dd_row.display_derivation_expression))
+        errors.extend(check_no_bare_identifiers(grammar_form))
+        errors.extend(check_contradictory_guard_conjuncts(grammar_form))
 
     if dd_row.derivation_option.value == "Decision Table" and not dd_row.decision_table_json:
         errors.append("Decision Table derivation option chosen but decision_table_json is empty")
