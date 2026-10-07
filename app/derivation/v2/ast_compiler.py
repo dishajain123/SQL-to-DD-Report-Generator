@@ -13,10 +13,17 @@ import re
 from contextvars import ContextVar
 from typing import Any
 
+from app.derivation.v2.ast_optimize import (
+    distribute_if_over_comparisons,
+    lower_set_aggregates,
+    optimize_expression_ast,
+)
 from app.derivation.v2.sql_text import (
     bare_ident,
-    lineage_keeps_target_hop,
+    is_ephemeral_sql_alias,
+    is_staging_derivation_entity,
     normalize_table_name,
+    should_collapse_target_join_hop,
 )
 
 _COMPILE_TARGET_ENTITY: ContextVar[str | None] = ContextVar(
@@ -59,16 +66,17 @@ ALLOWED_FUNCTIONS = {
     "SOM",
     "EOM",
     "ADDDAY",
-    "MAX",
-    "MIN",
+    "PERIOD",
     "DATEDIFF",
     "TODATE",
     "CONCAT",
     "ABS",
     "ROUND",
-    "SUM",
-    "COUNT",
 }
+
+
+_SET_AGGREGATE_FUNCS = frozenset({"MIN", "MAX", "SUM", "COUNT"})
+_COMPARISON_OPS_AST = frozenset({">", "<", ">=", "<=", "==", "!="})
 
 
 def compile_ast_to_4x_string(
@@ -86,21 +94,15 @@ def compile_ast_to_4x_string(
             bare_ident(target_column) if target_column else None
         )
         try:
+            if isinstance(node, dict):
+                node = optimize_expression_ast(
+                    node, target_entity=target_entity or "", target_column=target_column or ""
+                )
             return _compile_ast_to_4x_string(node)
         finally:
             _COMPILE_TARGET_ENTITY.reset(ent_tok)
             _COMPILE_TARGET_COLUMN.reset(col_tok)
     return _compile_ast_to_4x_string(node)
-
-
-def _is_ephemeral_sql_alias(name: str) -> bool:
-    """Statement-local alias (``A``, ``B``, ``SRC``) — not a physical entity."""
-    text = bare_ident(name or "")
-    if not text or text.startswith("#") or text.startswith("@"):
-        return False
-    if len(text) > 3:
-        return False
-    return bool(re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", text))
 
 
 def _resolve_column_entity_for_compile(entity: str, column: str) -> str:
@@ -110,11 +112,20 @@ def _resolve_column_entity_for_compile(entity: str, column: str) -> str:
     if (
         target_entity
         and target_column
-        and _is_ephemeral_sql_alias(entity)
+        and is_ephemeral_sql_alias(entity)
         and column.upper() == target_column.upper()
     ):
         return target_entity
     return entity
+
+
+def _quote_entity_for_4x(entity: str) -> str:
+    """Quote a physical entity for 4X, preserving ``#`` on session scratch tables."""
+    clean = _clean_entity_qualifier(entity)
+    if is_staging_derivation_entity(clean) and not clean.startswith("##"):
+        base = clean.lstrip("#")
+        return f'"#{base}"'
+    return f'"{clean}"'
 
 
 _PLAIN_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
@@ -171,6 +182,12 @@ def _compile_ast_to_4x_string(node: dict[str, Any] | None) -> str:
                 func = "ISEMPTY" if operator in {"==", "<=", ">="} else "ISNOTEMPTY"
                 return f"{func}({_compile_ast_to_4x_string(operand)})"
 
+        if operator in _COMPARISON_OPS_AST:
+            distributed = distribute_if_over_comparisons(node)
+            if isinstance(distributed, dict) and distributed.get("type") == "IF_THEN_ELSE":
+                return _compile_if_then_else(distributed)
+            node = distributed
+
         if operator in {"AND", "OR"}:
             parts = _flatten_logical(node, operator)
             rendered = ", ".join(_compile_ast_to_4x_string(part) for part in parts)
@@ -185,18 +202,37 @@ def _compile_ast_to_4x_string(node: dict[str, Any] | None) -> str:
         right = _compile_ast_to_4x_string(node["right"])
         # Preserve the AST's grouping; dropping parentheses changes
         # arithmetic expressions on the target platform.
-        # A nested IF/THEN/ELSE used as an operand must be wrapped too, or the
-        # trailing ``> @ProcessDate`` reads as if it applied to the ELSE value.
-        # (A sub-expression that folded to a plain number needs no wrapper.)
-        if node["left"].get("type") in {"BINARY_OP", "IF_THEN_ELSE"} and not _PLAIN_NUMBER_RE.fullmatch(left):
+        # IF operands in comparisons must be distributed before compile (see
+        # distribute_if_over_comparisons); never wrap value-IFs in comparisons.
+        wrap_left = node["left"].get("type") in {"BINARY_OP"} and not _PLAIN_NUMBER_RE.fullmatch(left)
+        wrap_right = node["right"].get("type") in {"BINARY_OP"} and not _PLAIN_NUMBER_RE.fullmatch(right)
+        if wrap_left:
             left = f"({left})"
-        if node["right"].get("type") in {"BINARY_OP", "IF_THEN_ELSE"} and not _PLAIN_NUMBER_RE.fullmatch(right):
+        if wrap_right:
             right = f"({right})"
+        if operator in _COMPARISON_OPS_AST and (
+            node["left"].get("type") == "IF_THEN_ELSE"
+            or node["right"].get("type") == "IF_THEN_ELSE"
+        ):
+            raise ValueError(
+                "Comparison operator applied to inline IF value; "
+                "run distribute_if_over_comparisons before compile"
+            )
         return f"{left} {operator} {right}"
 
     if node_type == "FUNCTION_CALL":
         func = str(node.get("function_name") or "").strip().upper()
         args = node.get("arguments") or []
+        if func in _SET_AGGREGATE_FUNCS:
+            lowered = lower_set_aggregates(node)
+            if isinstance(lowered, dict) and (
+                lowered.get("type") != "FUNCTION_CALL"
+                or str(lowered.get("function_name") or "").upper() not in _SET_AGGREGATE_FUNCS
+            ):
+                return _compile_ast_to_4x_string(lowered)
+            raise ValueError(
+                f"Set aggregate {func} has no row-level 4X equivalent after lowering"
+            )
         if func == "__UNSUPPORTED_SQL__":
             raise ValueError(node.get("_validation_error") or "Unsupported SQL expression")
         if func == "__VALUE_PREDICATE_MIXING__":
@@ -272,14 +308,13 @@ def _compile_ast_to_4x_string(node: dict[str, Any] | None) -> str:
                 # back onto its own entity) collapses to a plain column ref.
                 return f'"{entity}"."{column}"'
             target_entity = _COMPILE_TARGET_ENTITY.get()
-            if (
-                target_entity
-                and entity.upper() == target_entity.upper()
-                and not lineage_keeps_target_hop(entity, relationship)
-            ):
-                return f'"{relationship}"."{column}"'
-            return f'"{entity}"."{relationship}"."{column}"'
-        return f'"{entity}"."{column}"'
+            if should_collapse_target_join_hop(entity, relationship, target_entity):
+                return f'{_quote_entity_for_4x(relationship)}."{column}"'
+            return (
+                f'{_quote_entity_for_4x(entity)}.'
+                f'{_quote_entity_for_4x(relationship)}."{column}"'
+            )
+        return f'{_quote_entity_for_4x(entity)}."{column}"'
 
     if node_type == "VARIABLE_REF":
         name = str(node.get("name") or node.get("variable") or "").strip()
@@ -583,6 +618,15 @@ def _compile_if_then_else(node: dict[str, Any]) -> str:
             continue
         deduped.append(clause)
 
+    merged: list[tuple[str, str]] = []
+    for cond, then_b in deduped:
+        if merged and merged[-1][1] == then_b:
+            prev_cond = merged[-1][0]
+            merged[-1] = (f"OR({prev_cond},{cond})", then_b)
+        else:
+            merged.append((cond, then_b))
+    deduped = merged
+
     first_cond, first_then = deduped[0]
     parts = [f"IF({first_cond})THEN({first_then})"]
     for cond, then_b in deduped[1:]:
@@ -641,9 +685,9 @@ _NAME_TYPE_HINTS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 _INTEGER_FUNCTIONS = {"DATEDIFF", "DATEPART", "LEN", "COUNT"}
-_DATE_FUNCTIONS = {"ADDDAY", "TODATE", "SOM", "EOM", "SOY", "EOY", "SOFY", "EOFY", "SOQ", "EOQ"}
+_DATE_FUNCTIONS = {"ADDDAY", "PERIOD", "TODATE", "SOM", "EOM", "SOY", "EOY", "SOFY", "EOFY", "SOQ", "EOQ"}
 _STRING_FUNCTIONS = {"CONCAT", "SUBSTR", "UPPER", "LOWER", "TRIM", "REPLACE", "REGEX"}
-_PASSTHROUGH_FUNCTIONS = {"COALESCE", "MAX", "MIN", "ABS", "SUM"}
+_PASSTHROUGH_FUNCTIONS = {"COALESCE", "ABS"}
 
 
 def sql_type_to_data_type(sql_type: str | None) -> str | None:

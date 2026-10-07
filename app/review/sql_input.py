@@ -7,7 +7,7 @@ from app.guardrails.input_guardrails import check_input_file
 from app.utils.text_encoding import decode_text_bytes
 
 
-SAMPLES_SQL_DIR = Path(__file__).resolve().parents[2] / "samples" / "sql"
+SAMPLES_SQL_DIR = Path(__file__).resolve().parents[2] / "samples" / "sql" / "PRO_SPs_Sequenced"
 PASTED_SQL_NAME = "pasted_procedure.sql"
 
 

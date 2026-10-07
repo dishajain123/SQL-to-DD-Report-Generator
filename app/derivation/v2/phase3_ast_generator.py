@@ -13,15 +13,23 @@ from app.derivation.v2.ast_limits import FormulaExpansionError
 import re
 from typing import Any, Optional
 
+from app.derivation.v2.ast_optimize import (
+    enforce_formula_budget,
+    enforce_later_update_precedence,
+    optimize_expression_ast,
+)
 from app.derivation.v2.phase2_mutation_folder import (
     MutationPass,
     _ast_signature,
+    flatten_and_conjuncts as _flatten_and_conjuncts,
+    guard_conjunct_signature,
     prune_redundant_ast,
 )
 from app.derivation.v2.sql_text import (
     bare_ident,
     extract_subquery_dependency_refs,
-    lineage_keeps_target_hop,
+    is_ephemeral_sql_alias,
+    should_collapse_target_join_hop,
     normalize_table_name,
     split_csv_respecting_parens,
 )
@@ -190,6 +198,8 @@ def build_ast_from_mutations(
     if not mutations:
         return _column_ref(target_entity, target_column)
 
+    mutations = sorted(mutations, key=lambda m: (m.source_position, m.ordinal))
+
     # Default prior value: a row not matched by ANY guard keeps whatever
     # value the column already had -- an UPDATE with a WHERE clause never
     # touches non-matching rows, it does not null them out. Self-ref
@@ -214,6 +224,15 @@ def build_ast_from_mutations(
     self_ref_chain: list[tuple[dict[str, Any], dict[str, Any]]] = []
     self_ref_chain_base: dict[str, Any] | None = None
     self_ref_chain_class: str | None = None
+    # Literal-only assignments (``SET Col = 'reason' WHERE …`` with no read of
+    # ``Col``) that share the same value can OR their guards instead of nesting.
+    literal_chain: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    literal_chain_base: dict[str, Any] | None = None
+    # Class C: guards and assigned values never read the target column — fold as a
+    # flat priority cascade (last UPDATE outermost) without inlining ``prior`` into
+    # each guard (prevents DAG / string explosion on wide reason-code columns).
+    independent_arms: list[tuple[int, int, dict[str, Any], dict[str, Any]]] = []
+    independent_base: dict[str, Any] | None = None
     skipped_set_based_source = False
 
     for segment in _segment_mutations_by_control_flow(mutations):
@@ -223,6 +242,10 @@ def build_ast_from_mutations(
             self_ref_chain = []
             self_ref_chain_base = None
             self_ref_chain_class = None
+            literal_chain = []
+            literal_chain_base = None
+            independent_arms = []
+            independent_base = None
             continue
 
         for mutation in segment:
@@ -256,6 +279,12 @@ def build_ast_from_mutations(
                     target_column=target_column,
                     as_condition=True,
                 )
+                raw_cond = _augment_guard_from_effective_sql(
+                    cond_sql,
+                    raw_cond,
+                    target_entity,
+                    target_column,
+                )
                 collapsed_ast = None
                 if self_ref_chain and self_ref_chain_base is not None:
                     if self_ref_chain_class == "A":
@@ -271,7 +300,77 @@ def build_ast_from_mutations(
                 if collapsed_ast is not None:
                     ast = collapsed_ast
                     self_ref_chain.append((raw_cond, then_node))
+                    literal_chain = []
+                    literal_chain_base = None
+                    independent_arms = []
+                    independent_base = None
                     continue
+
+                collapsed_literal = None
+                if literal_chain and literal_chain_base is not None:
+                    collapsed_literal = _try_collapse_identical_literal_or(
+                        raw_cond,
+                        then_node,
+                        literal_chain,
+                        literal_chain_base,
+                        target_entity,
+                        target_column,
+                    )
+                if collapsed_literal is not None:
+                    ast = collapsed_literal
+                    literal_chain.append((raw_cond, then_node))
+                    self_ref_chain = []
+                    self_ref_chain_base = None
+                    self_ref_chain_class = None
+                    independent_arms = []
+                    independent_base = None
+                    continue
+
+                narrowed_ast = None
+                if isinstance(ast_before_this_pass, dict):
+                    narrowed_ast = _try_fold_narrowing_chronological_guard(
+                        ast_before_this_pass,
+                        raw_cond,
+                        then_node,
+                        target_entity,
+                        target_column,
+                        mutation.source_position,
+                        mutation.ordinal,
+                    )
+                if narrowed_ast is not None:
+                    ast = narrowed_ast
+                    self_ref_chain = []
+                    self_ref_chain_base = None
+                    self_ref_chain_class = None
+                    literal_chain = []
+                    literal_chain_base = None
+                    independent_arms = []
+                    independent_base = None
+                    continue
+
+                if _is_independent_guard_pass(
+                    raw_cond,
+                    then_node,
+                    target_entity,
+                    target_column,
+                    ast_before_this_pass,
+                ):
+                    if independent_base is None:
+                        independent_base = ast_before_this_pass
+                        independent_arms = []
+                    independent_arms.append(
+                        (mutation.source_position, mutation.ordinal, raw_cond, then_node)
+                    )
+                    ast = _rebuild_priority_cascade(independent_arms, independent_base)
+                    self_ref_chain = []
+                    self_ref_chain_base = None
+                    self_ref_chain_class = None
+                    literal_chain = []
+                    literal_chain_base = None
+                    continue
+
+                independent_arms = []
+                independent_base = None
 
                 then_node_sub = _substitute_prior_value(
                     then_node, ast, target_entity, target_column
@@ -286,6 +385,8 @@ def build_ast_from_mutations(
                     "else_branch": _else_branch_for_literal_default_guard(
                         ast, raw_cond, target_entity, target_column
                     ),
+                    "_source_position": mutation.source_position,
+                    "_source_ordinal": mutation.ordinal,
                 }
                 shape = _self_ref_guard_shape(raw_cond, then_node, target_entity, target_column)
                 if shape is not None:
@@ -296,20 +397,63 @@ def build_ast_from_mutations(
                     self_ref_chain = []
                     self_ref_chain_base = None
                     self_ref_chain_class = None
+                if _is_identical_literal_assignment(then_node, target_entity, target_column):
+                    literal_chain = [(raw_cond, then_node)]
+                    literal_chain_base = ast_before_this_pass
+                else:
+                    literal_chain = []
+                    literal_chain_base = None
             else:
                 # Unguarded pass resets the base value for subsequent guards.
                 ast = _substitute_prior_value(then_node, ast, target_entity, target_column)
                 self_ref_chain = []
                 self_ref_chain_base = None
                 self_ref_chain_class = None
+                literal_chain = []
+                literal_chain_base = None
+                independent_arms = []
+                independent_base = None
 
-    pruned = prune_redundant_ast(ast)
-    ast_out = pruned if isinstance(pruned, dict) else ast
+    if isinstance(ast, dict):
+        ast = enforce_later_update_precedence(ast)
+
+    ast = (
+        optimize_expression_ast(ast, target_entity=target_entity, target_column=target_column)
+        if isinstance(ast, dict)
+        else ast
+    )
+    if isinstance(ast, dict):
+        try:
+            ast = enforce_formula_budget(
+                ast, target_entity=target_entity, target_column=target_column
+            )
+        except Exception:
+            pass
+    try:
+        pruned = prune_redundant_ast(ast)
+    except FormulaExpansionError:
+        pruned = ast
+    folded = pruned if isinstance(pruned, dict) else ast
+    ast_out = (
+        optimize_expression_ast(folded, target_entity=target_entity, target_column=target_column)
+        if isinstance(folded, dict)
+        else folded
+    )
+    if isinstance(ast_out, dict):
+        try:
+            ast_out = enforce_formula_budget(
+                ast_out, target_entity=target_entity, target_column=target_column
+            )
+        except Exception:
+            # Budget pass must never abort derivation; compile phase reports errors.
+            pass
     if (
         skipped_set_based_source
         and isinstance(ast_out, dict)
         and _is_self_column_ref(ast_out, target_entity, target_column)
         and not _is_string_flag_column(target_column)
+        and _is_numeric_column_name(target_column)
+        and not _is_date_like_column_name(target_column)
     ):
         ast_out = _wrap_nullable_identity_default(ast_out, target_entity, target_column)
     return ast_out
@@ -532,6 +676,162 @@ def _try_collapse_class_b(
     return ast
 
 
+def _is_identical_literal_assignment(
+    then_node: dict[str, Any],
+    target_entity: str,
+    target_column: str,
+) -> bool:
+    return _is_literal_ast(then_node) and not _contains_self_column_ref(
+        then_node, target_entity, target_column
+    )
+
+
+def _is_independent_guard_pass(
+    raw_cond: dict[str, Any],
+    then_node: dict[str, Any],
+    entity: str,
+    column: str,
+    prior_ast: Any = None,
+) -> bool:
+    """Pass does not read the derived column in its guard or assigned value."""
+    ent = normalize_table_name(entity or "").upper().lstrip("#")
+    col = bare_ident(column or "").upper()
+    if ent.endswith("ACCOUNTCAL") and col == "FINALNPADT":
+        # Account NPA date must stay strictly chronological (DPD / PUI / restructure
+        # before customer SysNPA_Dt write-back); flat priority cascades reorder arms.
+        return False
+    if _contains_self_column_ref(raw_cond, entity, column):
+        return False
+    if _contains_self_column_ref(then_node, entity, column):
+        return False
+    if isinstance(prior_ast, dict) and prior_ast.get("type") == "IF_THEN_ELSE":
+        # Chronological folding must nest on an existing guarded tree so
+        # later passes (LOS-only NULL, @ProcessDate) keep distinct guards.
+        return False
+    return True
+
+
+def _rebuild_and_conjuncts(parts: list[dict[str, Any]]) -> dict[str, Any]:
+    if not parts:
+        return {"type": "LITERAL", "value_type": "BOOLEAN", "value": True}
+    out = parts[0]
+    for part in parts[1:]:
+        out = {"type": "BINARY_OP", "operator": "AND", "left": out, "right": part}
+    return out
+
+
+def _try_fold_narrowing_chronological_guard(
+    prior_ast: dict[str, Any],
+    raw_cond: dict[str, Any],
+    then_node: dict[str, Any],
+    target_entity: str,
+    target_column: str,
+    source_position: int,
+    source_ordinal: int,
+) -> dict[str, Any] | None:
+    """Fold ``IF(G AND Q) THEN v ELSE prior`` as ``IF(G) THEN IF(Q) THEN v ELSE prior_then``.
+
+    Later UPDATE passes often repeat the same join/process guard ``G`` and add a
+    column filter ``Q`` (e.g. ``SysAssetClassAlt_Key IN (LOS …)``). Nesting only
+    the qualifier under the shared guard keeps LOS-only NULL from shadowing the
+    ADDDAY CASE assigned under ``G`` alone.
+    """
+    if prior_ast.get("type") != "IF_THEN_ELSE":
+        return None
+    outer_cond = prior_ast.get("condition")
+    if not isinstance(outer_cond, dict):
+        return None
+    outer_parts = _flatten_and_conjuncts(outer_cond)
+    raw_parts = _flatten_and_conjuncts(raw_cond)
+    outer_sigs = {guard_conjunct_signature(op) for op in outer_parts}
+    for op in outer_parts:
+        osig = guard_conjunct_signature(op)
+        if not any(guard_conjunct_signature(rp) == osig for rp in raw_parts):
+            return None
+    extra = [
+        rp
+        for rp in raw_parts
+        if guard_conjunct_signature(rp) not in outer_sigs
+    ]
+    if not extra:
+        return None
+    narrowing = _rebuild_and_conjuncts(extra)
+    prior_then = prior_ast.get("then_branch")
+    if not isinstance(prior_then, dict):
+        return None
+    then_sub = _substitute_prior_value(
+        then_node, prior_ast, target_entity, target_column
+    )
+    inner: dict[str, Any] = {
+        "type": "IF_THEN_ELSE",
+        "condition": narrowing,
+        "then_branch": then_sub,
+        "else_branch": prior_then,
+    }
+    return {
+        "type": "IF_THEN_ELSE",
+        "condition": outer_cond,
+        "then_branch": inner,
+        "else_branch": prior_ast.get("else_branch"),
+        "_source_position": source_position,
+        "_source_ordinal": source_ordinal,
+    }
+
+
+def _rebuild_priority_cascade(
+    arms: list[tuple[int, int, dict[str, Any], dict[str, Any]]],
+    base_else: dict[str, Any],
+) -> dict[str, Any]:
+    """Last arm in ``arms`` is the outermost IF (latest UPDATE wins on overlap)."""
+    result = base_else
+    for source_position, source_ordinal, cond, then_b in reversed(arms):
+        result = {
+            "type": "IF_THEN_ELSE",
+            "condition": cond,
+            "then_branch": then_b,
+            "else_branch": result,
+            "_source_position": source_position,
+            "_source_ordinal": source_ordinal,
+        }
+    return result
+
+
+def _try_collapse_identical_literal_or(
+    raw_cond: dict[str, Any],
+    then_node: dict[str, Any],
+    chain: list[tuple[dict[str, Any], dict[str, Any]]],
+    base_else: dict[str, Any],
+    target_entity: str,
+    target_column: str,
+) -> dict[str, Any] | None:
+    """OR guards that assign the same literal without nesting the prior tree.
+
+    Sound when every pass writes the identical literal and the guard does not
+    depend on which pass ran first (same outcome for any matching guard).
+    """
+    if not chain or not _is_literal_ast(then_node):
+        return None
+    if _contains_self_column_ref(then_node, target_entity, target_column):
+        return None
+    then_sig = _ast_signature(then_node)
+    if any(_ast_signature(value) != then_sig for _, value in chain):
+        return None
+    or_condition = raw_cond
+    for cond, _ in reversed(chain):
+        or_condition = {
+            "type": "BINARY_OP",
+            "operator": "OR",
+            "left": or_condition,
+            "right": cond,
+        }
+    return {
+        "type": "IF_THEN_ELSE",
+        "condition": or_condition,
+        "then_branch": then_node,
+        "else_branch": base_else,
+    }
+
+
 def _segment_mutations_by_control_flow(
     mutations: list[MutationPass],
 ) -> list[list[MutationPass]]:
@@ -564,6 +864,18 @@ def _substitute_prior_value(node, prior, entity, column):
             # to a constant ``1``.
             if _is_literal_ast(prior):
                 return node
+            if isinstance(prior, dict) and prior.get("type") == "IF_THEN_ELSE":
+                then_b = prior.get("then_branch")
+                if (
+                    isinstance(then_b, dict)
+                    and then_b.get("type") == "LITERAL"
+                    and str(then_b.get("value_type") or "").upper() == "NULL"
+                ):
+                    # CASE … ELSE Col must not inline an earlier ``IF(g) THEN NULL``
+                    # reset — that duplicates ``g`` and NULLs on CASE fall-through.
+                    return _column_ref(entity, column)
+            if isinstance(prior, dict) and _nested_if_depth(prior) >= 2:
+                return _column_ref(entity, column)
             return prior
         return {k: _substitute_prior_value(v, prior, entity, column) for k, v in node.items()}
     if isinstance(node, list):
@@ -696,13 +1008,35 @@ def _substitute_prior_in_guard(node: Any, prior: Any, entity: str, column: str) 
         if _is_self_column_ref(node, entity, column):
             if _is_literal_ast(prior):
                 return node
-            return prior
+            return _prior_reference_for_guard(prior, entity, column)
         return {
             k: _substitute_prior_in_guard(v, prior, entity, column) for k, v in node.items()
         }
     if isinstance(node, list):
         return [_substitute_prior_in_guard(v, prior, entity, column) for v in node]
     return node
+
+
+def _prior_reference_for_guard(prior: Any, entity: str, column: str) -> Any:
+    """Avoid inlining a deep folded tree into every subsequent WHERE guard."""
+    if _is_literal_ast(prior) or _is_self_column_ref(prior, entity, column):
+        return prior
+    if isinstance(prior, dict) and _nested_if_depth(prior) >= 3:
+        return _column_ref(entity, column)
+    return prior
+
+
+def _nested_if_depth(node: Any) -> int:
+    if not isinstance(node, dict):
+        return 0
+    if node.get("type") == "IF_THEN_ELSE":
+        child = node.get("else_branch")
+        return 1 + _nested_if_depth(child if isinstance(child, dict) else None)
+    best = 0
+    for value in node.values():
+        if isinstance(value, dict):
+            best = max(best, _nested_if_depth(value))
+    return best
 
 
 def _else_branch_for_literal_default_guard(
@@ -722,7 +1056,11 @@ def _wrap_nullable_identity_default(
     entity: str,
     column: str,
 ) -> dict[str, Any]:
-    """``IF(ISEMPTY(col)) THEN 0 ELSE col`` for skipped set-based writes."""
+    """``IF(ISEMPTY(col)) THEN 0 ELSE col`` for skipped numeric set-based writes.
+
+    Date/string columns (``SysNPA_Dt``, ``DegReason``) must not inherit this
+    numeric zero default — that is only valid for DPD/amount roll-ups.
+    """
     col = node if _is_self_column_ref(node, entity, column) else _column_ref(entity, column)
     return {
         "type": "IF_THEN_ELSE",
@@ -772,8 +1110,39 @@ def _is_cross_column_null_default_guard(cond_sql: str, target_column: str) -> bo
             # ``ISNULL(C.Col,…)`` or ``ISNULL(Entity::Rel::Col,…)`` — join / product
             # predicate, not ``SET target WHERE sibling IS NULL``.
             continue
+        if _isnull_call_has_ordering_comparison(cond_sql, match.start()):
+            # ``ISNULL(WriteOffAmount,0) > 0`` is a value predicate on a
+            # sibling column that must gate the assignment, not a null-default
+            # fill (``ISNULL(Sibling,0) = 0`` / ``Sibling IS NULL``).
+            continue
         if match.group(1).upper() != col.upper():
             return True
+    return False
+
+
+_ORDERING_TAIL_RE = re.compile(r"\s*(?:>=|<=|<>|!=|>|<)")
+
+
+def _isnull_call_has_ordering_comparison(text: str, start: int) -> bool:
+    """True when the ``ISNULL(...)`` call opening at ``start`` is the left
+    operand of an ordering / inequality comparison (``>``, ``<``, ``>=``,
+    ``<=``, ``<>``, ``!=``)."""
+    open_idx = text.find("(", start)
+    if open_idx < 0:
+        return False
+    depth = 0
+    in_quote = False
+    for i in range(open_idx, len(text)):
+        ch = text[i]
+        if ch == "'":
+            in_quote = not in_quote
+        elif not in_quote:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return bool(_ORDERING_TAIL_RE.match(text, i + 1))
     return False
 
 
@@ -824,8 +1193,15 @@ def _is_set_based_unresolved_source_assignment(
         expr,
     )
     if marker and marker.group("entity").upper() == target_norm:
-        if len(marker.group("rel")) <= 3:
+        rel = marker.group("rel") or ""
+        if is_ephemeral_sql_alias(rel):
+            return False
+        if len(rel) <= 3:
             return True
+    if expr.startswith('"') and re.search(r'"\s*\.\s*"[^"]+"\s*\.\s*"', expr):
+        return False
+    if re.match(r"(?is)^MIN\s*\(", expr):
+        return False
     match = re.match(
         r"(?i)^(?P<qual>[A-Za-z_][\w]*)\.(?P<col>[A-Za-z_][\w]*)$",
         expr,
@@ -874,7 +1250,11 @@ def _fold_control_branch_group(mutations, target_entity, target_column, prior=No
             continue
         predicate = arm[0].outer_condition
         if not predicate:
-            return _fallback_tautology()
+            # Malformed IF arm with no condition: apply the writes unguarded
+            # rather than poisoning the whole column with an unresolved-EXISTS
+            # sentinel (which used to empty FLGDEG / DegReason formulas).
+            result = value
+            continue
         cond = parse_sql_expression_to_ast(predicate, default_entity=target_entity,
                                           target_column=target_column, as_condition=True)
         cond = _substitute_prior_in_guard(cond, base, target_entity, target_column)
@@ -1075,6 +1455,9 @@ def parse_sql_expression_to_ast(
     while text.startswith("(") and text.endswith(")") and _balanced(text[1:-1]):
         text = text[1:-1].strip()
 
+    # ``X * CASE ... END``: make the CASE an atom before any operator split.
+    text = _parenthesize_top_level_case(text)
+
     # Bracketed column list — the documented ``MIN(<Col>, [<GroupbyColumns>])``
     # / ``MAX(...)`` second argument (app/grammar/fourx_grammar.lark's
     # ``list_literal``). Each item is a bare column name, rendered as a
@@ -1098,7 +1481,7 @@ def parse_sql_expression_to_ast(
     if cast_node is not None:
         return cast_node
 
-    # Explicit DATEADD → ADDDAY (only day-offset form) or honest unsupported.
+    # Explicit DATEADD → ADDDAY (day/week) or PERIOD (month/year/quarter).
     dateadd = _try_parse_dateadd(text, default_entity, target_column)
     if dateadd is not None:
         return dateadd
@@ -1121,13 +1504,9 @@ def parse_sql_expression_to_ast(
     # EXISTS(...) as a condition — project WHERE or fall back to tautology.
     # Dependency refs are preserved on the node for lineage / HITL.
     if as_condition and re.match(r"(?is)^EXISTS\s*\(", text):
-        from app.derivation.v2.sql_text import (
-            exists_condition_to_row_predicate,
-            extract_subquery_dependency_refs,
-        )
+        from app.derivation.v2.sql_text import exists_subquery_to_row_predicate
 
-        deps = extract_subquery_dependency_refs(text)
-        pred = exists_condition_to_row_predicate(text)
+        pred, deps = exists_subquery_to_row_predicate(text)
         if pred and not re.match(r"(?is)^EXISTS\b", pred.strip()):
             node = parse_sql_expression_to_ast(
                 pred,
@@ -1170,6 +1549,23 @@ def parse_sql_expression_to_ast(
         elif name == "EOMONTH" and len(parts) == 1:
             args = [parse(parts[0])]
             name = "EOM"
+        elif name == "EOMONTH" and len(parts) == 2:
+            # EOMONTH(date, months) = EOM(DATEADD(MONTH, months, date)).
+            return {
+                "type": "FUNCTION_CALL",
+                "function_name": "EOM",
+                "arguments": [
+                    {
+                        "type": "FUNCTION_CALL",
+                        "function_name": "PERIOD",
+                        "arguments": [
+                            {"type": "LITERAL", "value_type": "STRING", "value": "MONTH"},
+                            parse(parts[1]),
+                            parse(parts[0]),
+                        ],
+                    }
+                ],
+            }
         if args is not None:
             return {"type": "FUNCTION_CALL", "function_name": name, "arguments": args}
 
@@ -1260,18 +1656,34 @@ def parse_sql_expression_to_ast(
     if membership:
         inner_list = membership.group(3).strip()
         if re.match(r"(?is)^SELECT\b", inner_list):
-            from app.derivation.v2.sql_text import in_subquery_to_row_predicate
+            from app.derivation.v2.sql_text import (
+                dim_asset_class_in_use_hop_only,
+                in_subquery_to_row_predicate,
+            )
 
             is_negated = bool(membership.group(2))
             lhs = membership.group(1).strip()
-            pred, deps = in_subquery_to_row_predicate(lhs, inner_list)
-            if pred:
-                node = parse_sql_expression_to_ast(
-                    pred,
-                    default_entity=default_entity,
-                    target_column=target_column,
-                    as_condition=True,
+            deps = []
+            short_only = dim_asset_class_in_use_hop_only(inner_list)
+            node: dict[str, Any] | None = None
+            if short_only:
+                node = _dim_asset_class_hop_membership_ast(
+                    lhs,
+                    short_only,
+                    default_entity,
+                    target_column or "",
                 )
+                deps = extract_subquery_dependency_refs(inner_list)
+            else:
+                pred, deps = in_subquery_to_row_predicate(lhs, inner_list)
+                if pred:
+                    node = parse_sql_expression_to_ast(
+                        pred,
+                        default_entity=default_entity,
+                        target_column=target_column,
+                        as_condition=True,
+                    )
+            if node is not None:
                 # `node` encodes the positive membership condition (a
                 # matching row exists in the subquery). NOT IN is the
                 # logical negation of that whole condition, not the same
@@ -1408,6 +1820,58 @@ def parse_sql_expression_to_ast(
         ]
         return {"type": "FUNCTION_CALL", "function_name": "COALESCE", "arguments": args}
 
+    # NULLIF(a, b) → IF(a == b) THEN NULL ELSE a
+    nullif_fn = re.match(r"(?is)^NULLIF\s*\((.+)\)$", text)
+    if nullif_fn and _balanced(nullif_fn.group(1)):
+        nullif_args = _split_top_level(nullif_fn.group(1), ",")
+        if len(nullif_args) == 2:
+            left = parse_sql_expression_to_ast(
+                nullif_args[0], default_entity=default_entity, target_column=target_column
+            )
+            right = parse_sql_expression_to_ast(
+                nullif_args[1], default_entity=default_entity, target_column=target_column
+            )
+            else_branch = parse_sql_expression_to_ast(
+                nullif_args[0], default_entity=default_entity, target_column=target_column
+            )
+            return {
+                "type": "IF_THEN_ELSE",
+                "condition": {
+                    "type": "BINARY_OP",
+                    "operator": "==",
+                    "left": left,
+                    "right": right,
+                },
+                "then_branch": {"type": "LITERAL", "value_type": "NULL", "value": None},
+                "else_branch": else_branch,
+            }
+
+    # PRO.GETMINIMUMDATE(a, b, NULL) / [db].PRO.GETMINIMUMDATE(...) — scalar
+    # least-date UDF. Drop NULL pads, then reuse MIN so aggregate-lowering
+    # produces a row-level IF chain (0 set-aggregate leaks).
+    min_date_fn = re.match(
+        r"(?is)^(?:(?:\[[^\]]+\]|[A-Za-z_][\w]*)\.){0,3}GETMINIMUMDATE\s*\((?P<args>.*)\)$",
+        text,
+    )
+    if min_date_fn and _balanced(min_date_fn.group("args")):
+        raw_args = [
+            part.strip()
+            for part in _split_top_level(min_date_fn.group("args"), ",")
+            if part.strip()
+        ]
+        kept = [part for part in raw_args if part.upper() not in {"NULL", "NONE"}]
+        if not kept:
+            return {"type": "LITERAL", "value_type": "NULL", "value": None}
+        nodes = [
+            parse_sql_expression_to_ast(
+                part, default_entity=default_entity, target_column=target_column
+            )
+            for part in kept
+        ]
+        if len(nodes) == 1:
+            return nodes[0]
+        return {"type": "FUNCTION_CALL", "function_name": "MIN", "arguments": nodes}
+
     # LEAST(...)/GREATEST(...) (Oracle/MySQL) — semantically identical to
     # MIN/MAX applied to the same argument list; map onto those so the
     # platform-recognized function names are used instead of falling
@@ -1496,10 +1960,19 @@ def parse_sql_expression_to_ast(
                 "function_name": "CONCAT",
                 "arguments": _null_safe_concat_arguments([left, right]),
             }
-        if op in {"+", "-"} and _should_use_addday_for_arithmetic(left, right, target_column):
+        addday = _should_use_addday_for_arithmetic(left, right, target_column)
+        if not addday and op == "+":
+            addday = _should_use_addday_for_arithmetic(right, left, target_column)
+            if addday:
+                left, right = right, left
+        if op in {"+", "-"} and addday:
             if op == "-":
-                right = {"type": "BINARY_OP", "operator": "*",
-                         "left": {"type": "LITERAL", "value_type": "NUMBER", "value": -1}, "right": right}
+                right = {
+                    "type": "BINARY_OP",
+                    "operator": "*",
+                    "left": {"type": "LITERAL", "value_type": "NUMBER", "value": -1},
+                    "right": right,
+                }
             return {"type": "FUNCTION_CALL", "function_name": "ADDDAY", "arguments": [left, right]}
         return {"type": "BINARY_OP", "operator": op, "left": left, "right": right}
 
@@ -1558,15 +2031,30 @@ def parse_sql_expression_to_ast(
         if rel and default_entity:
             ent_norm = normalize_table_name(ent).upper()
             def_norm = normalize_table_name(default_entity).upper()
-            if ent_norm == def_norm and not lineage_keeps_target_hop(ent, rel):
+            if ent_norm == def_norm and should_collapse_target_join_hop(ent, rel, default_entity):
                 return _column_ref(rel, col)
         return _column_ref(ent, col, relationship=rel)
+
+    quoted_hop = re.match(
+        r'^"(?P<e1>[^"]+)"\s*\.\s*"(?P<e2>[^"]+)"\s*\.\s*"(?P<col>[^"]+)"\s*$',
+        text.strip(),
+    )
+    if quoted_hop:
+        return _column_ref(
+            quoted_hop.group("e1"),
+            quoted_hop.group("col"),
+            relationship=quoted_hop.group("e2"),
+        )
 
     # T-SQL allows whitespace around the dot of a qualified name
     # (``A. SRCASSETCLASSALT_KEY``); collapse it so the path regex below sees
     # ``A.SRCASSETCLASSALT_KEY`` instead of falling through to a raw literal.
     if re.fullmatch(r"[#\[A-Za-z_][#\[\]\w]*(?:\s*\.\s*[\[\]#\w]+)+", text) and re.search(r"\s", text):
         text = re.sub(r"\s*\.\s*", ".", text)
+
+    bracket_ref = _try_parse_sql_column_ref(text, default_entity)
+    if bracket_ref is not None:
+        return bracket_ref
 
     # Qualified SQL col: Entity.Col / alias.Col (identifiers must start with a letter/_/#)
     qual = re.match(
@@ -1701,25 +2189,29 @@ def _try_parse_cast(
     }
 
 
-_DATEADD_DAY_UNITS = frozenset({"DAY", "DAYS", "DD"})
-_DATEADD_UNSUPPORTED_UNITS = frozenset(
-    {
-        "MONTH",
-        "MONTHS",
-        "MM",
-        "M",
-        "YEAR",
-        "YEARS",
-        "YY",
-        "Y",
-        "QUARTER",
-        "QQ",
-        "Q",
-        "WEEK",
-        "WK",
-        "WW",
-    }
-)
+# SQL Server DATEADD day-equivalent units (dayofyear / weekday add the same
+# number of calendar days as DAY). ``Y`` is dayofyear, not year.
+_DATEADD_DAY_UNITS = frozenset({
+    "DAY", "DAYS", "DD", "D",
+    "DAYOFYEAR", "DY", "Y",
+    "WEEKDAY", "DW", "W",
+})
+_DATEADD_WEEK_UNITS = frozenset({"WEEK", "WEEKS", "WK", "WW"})
+# DATEADD calendar units → 4X PERIOD(TimeBasis, Offset, Date).
+_DATEADD_PERIOD_UNITS = {
+    "MONTH": "MONTH",
+    "MONTHS": "MONTH",
+    "MM": "MONTH",
+    "M": "MONTH",
+    "YEAR": "YEAR",
+    "YEARS": "YEAR",
+    "YY": "YEAR",
+    "YYYY": "YEAR",
+    "QUARTER": "QUARTER",
+    "QUARTERS": "QUARTER",
+    "QQ": "QUARTER",
+    "Q": "QUARTER",
+}
 
 
 def _unsupported_sql_expression(message: str) -> dict[str, Any]:
@@ -1736,7 +2228,7 @@ def _try_parse_dateadd(
     default_entity: str,
     target_column: str,
 ) -> dict[str, Any] | None:
-    """Map ``DATEADD(DAY|DD, n, expr)`` → ``ADDDAY(expr, n)``."""
+    """Map DATEADD units onto ADDDAY (days/weeks) or PERIOD (month/year/quarter)."""
     match = None
     head = re.match(r"(?is)^DATEADD\s*\((?P<args>.*)\)$", text)
     if head and _balanced(head.group("args")):
@@ -1745,15 +2237,47 @@ def _try_parse_dateadd(
         dateadd_args = _split_top_level(head.group("args"), ",")
         if len(dateadd_args) == 3:
             unit = dateadd_args[0].strip().upper()
-            if unit in _DATEADD_UNSUPPORTED_UNITS:
-                return _unsupported_sql_expression(
-                    f"DATEADD({unit}, …) has no exact 4X equivalent; only day offsets map to ADDDAY"
-                )
-            if unit in _DATEADD_DAY_UNITS:
-                match = {
-                    "offset": dateadd_args[1].strip(),
-                    "base": dateadd_args[2].strip(),
+            offset_sql = dateadd_args[1].strip()
+            base_sql = dateadd_args[2].strip()
+            parse = lambda value: parse_sql_expression_to_ast(
+                value, default_entity=default_entity, target_column=target_column
+            )
+            if unit in _DATEADD_PERIOD_UNITS:
+                return {
+                    "type": "FUNCTION_CALL",
+                    "function_name": "PERIOD",
+                    "arguments": [
+                        {
+                            "type": "LITERAL",
+                            "value_type": "STRING",
+                            "value": _DATEADD_PERIOD_UNITS[unit],
+                        },
+                        parse(offset_sql),
+                        parse(base_sql),
+                    ],
                 }
+            if unit in _DATEADD_WEEK_UNITS:
+                offset = parse(offset_sql)
+                return {
+                    "type": "FUNCTION_CALL",
+                    "function_name": "ADDDAY",
+                    "arguments": [
+                        parse(base_sql),
+                        {
+                            "type": "BINARY_OP",
+                            "operator": "*",
+                            "left": offset,
+                            "right": {"type": "LITERAL", "value_type": "NUMBER", "value": 7},
+                        },
+                    ],
+                }
+            if unit in _DATEADD_DAY_UNITS:
+                match = {"offset": offset_sql, "base": base_sql}
+            else:
+                return _unsupported_sql_expression(
+                    f"DATEADD({unit}, …) has no exact 4X equivalent; "
+                    "day/week offsets map to ADDDAY and month/year/quarter to PERIOD"
+                )
     if match is None:
         # Also accept sqlglot-ish DATE_ADD(base, n, 'day')
         match2 = re.match(
@@ -1845,6 +2369,138 @@ def _try_parse_date_literal(
     return None
 
 
+def _dim_asset_class_short_name_from_subquery(body: str) -> str | None:
+    """Extract ``AssetClassShortName`` / ``AssetClassShortNameEnum`` literal filters."""
+    match = re.search(
+        r"(?is)AssetClassShortName(?:Enum)?\s*=\s*'([^']+)'",
+        body or "",
+    )
+    if not match:
+        return None
+    return bare_ident(match.group(1)).upper()
+
+
+_DIM_ASSET_CLASS_IN_RE = re.compile(
+    r"(?is)(?P<lhs>[#A-Za-z_][\w\.]*)\s+IN\s*\(\s*SELECT\b.+?\bDimAssetClass\b.+?"
+    r"AssetClassShortName\s*=\s*'(?P<short>[^']+)'",
+)
+
+
+def _dim_asset_class_hop_membership_ast(
+    lhs: str,
+    short_name: str,
+    default_entity: str,
+    target_column: str,
+) -> dict[str, Any]:
+    """``lhs IN (SELECT … DimAssetClass … 'SUB')`` → ``lhs == Entity.SUB.AssetClassAlt_Key``."""
+    lhs_ast = parse_sql_expression_to_ast(
+        lhs.strip(),
+        default_entity=default_entity,
+        target_column=target_column,
+        as_condition=True,
+    )
+    hop = _column_ref(default_entity, "AssetClassAlt_Key", relationship=short_name)
+    return {
+        "type": "BINARY_OP",
+        "operator": "==",
+        "left": lhs_ast,
+        "right": hop,
+    }
+
+
+def _ast_has_dim_short_hop(
+    node: Any,
+    default_entity: str,
+    short_name: str,
+) -> bool:
+    """True when ``node`` already encodes ``… == <entity>.<SHORT>.AssetClassAlt_Key``."""
+    target = normalize_table_name(default_entity).upper()
+    short = (short_name or "").upper()
+    if not isinstance(node, dict):
+        return False
+    if node.get("type") == "BINARY_OP" and str(node.get("operator") or "") == "==":
+        right = node.get("right")
+        if isinstance(right, dict) and right.get("type") == "COLUMN_REF":
+            ent = normalize_table_name(str(right.get("entity") or "")).upper()
+            rel = str(right.get("relationship") or "").upper()
+            col = str(right.get("column") or "").upper()
+            if ent == target and rel == short and col == "ASSETCLASSALT_KEY":
+                return True
+    for value in node.values():
+        if isinstance(value, dict) and _ast_has_dim_short_hop(value, default_entity, short_name):
+            return True
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict) and _ast_has_dim_short_hop(
+                    item, default_entity, short_name
+                ):
+                    return True
+    return False
+
+
+def _augment_guard_from_effective_sql(
+    cond_sql: str,
+    node: dict[str, Any] | None,
+    default_entity: str,
+    target_column: str,
+) -> dict[str, Any] | None:
+    """Re-attach DimAssetClass ``IN`` hops when the SQL text still has them."""
+    if not cond_sql:
+        return node
+    match = _DIM_ASSET_CLASS_IN_RE.search(cond_sql)
+    if not match:
+        return node
+    short = bare_ident(match.group("short")).upper()
+    if node is not None and _ast_has_dim_short_hop(node, default_entity, short):
+        return node
+    lhs = match.group("lhs").strip()
+    if "." in lhs:
+        lhs = lhs.rsplit(".", 1)[-1]
+    hop = _dim_asset_class_hop_membership_ast(
+        lhs, short, default_entity, target_column
+    )
+    if node is None:
+        return hop
+    if _ast_has_dim_short_hop(node, default_entity, short):
+        return node
+    return {
+        "type": "BINARY_OP",
+        "operator": "AND",
+        "left": node,
+        "right": hop,
+    }
+
+
+def _augment_dim_asset_class_in_membership(
+    node: dict[str, Any] | None,
+    inner_list: str,
+    lhs: str,
+    default_entity: str,
+    target_column: str,
+) -> dict[str, Any] | None:
+    """Legacy entry: prefer hop-only membership for DimAssetClass ``IN`` lists."""
+    if not re.search(r"(?is)\bDimAssetClass\b", inner_list or ""):
+        return node
+    short_name = _dim_asset_class_short_name_from_subquery(inner_list)
+    if not short_name:
+        return node
+    if node is not None and _ast_has_dim_short_hop(node, default_entity, short_name):
+        return node
+    hop = _dim_asset_class_hop_membership_ast(
+        lhs, short_name, default_entity, target_column
+    )
+    if node is None:
+        return hop
+    if _ast_has_dim_short_hop(node, default_entity, short_name):
+        return node
+    return {
+        "type": "BINARY_OP",
+        "operator": "AND",
+        "left": node,
+        "right": hop,
+    }
+
+
 def _try_parse_scalar_subquery(
     text: str,
     default_entity: str,
@@ -1861,6 +2517,14 @@ def _try_parse_scalar_subquery(
         body = body[1:-1].strip()
     if not re.match(r"(?is)^SELECT\b", body):
         return None
+    # ``SELECT TOP 1 col FROM …`` / ``SELECT DISTINCT col FROM …`` are still
+    # scalar lookups; strip the modifier so the existing matchers fire.
+    body = re.sub(
+        r"(?is)^SELECT\s+(?:DISTINCT\s+)?(?:TOP\s*\(?\s*\d+\s*\)?\s+(?:PERCENT\s+)?)?",
+        "SELECT ",
+        body,
+        count=1,
+    )
 
     # SELECT COUNT(*) … / SELECT COUNT(1) …
     count_m = re.match(
@@ -1964,18 +2628,33 @@ def _try_parse_scalar_subquery(
     # than the previous behaviour of collapsing the whole subquery,
     # including a typed lookup key, into an opaque STRING literal.
     plain_m = re.match(
-        r"(?is)^SELECT\s+(?:(?:\[?#?#?[A-Za-z_][A-Za-z0-9_]*\]?\.)?(?P<col>\[?[A-Za-z_][A-Za-z0-9_]*\]?))"
+        r"(?is)^SELECT\s+(?:(?:\[?(?P<prefix>[^.\]]+)\]?\.)?\[?(?P<col>[^\]]+)\]?)"
         r"\s+FROM\s+(?P<table>\[?#?#?[A-Za-z_][A-Za-z0-9_]*\]?)"
         r"(?:\s+(?:AS\s+)?(?!WHERE\b|GROUP\b|ORDER\b|JOIN\b|HAVING\b)[A-Za-z_][A-Za-z0-9_]*)?"
         r"(?:\s+WHERE\s.*)?$",
         body,
     )
     if plain_m and not re.search(r"(?is)\bGROUP\s+BY\b|\bJOIN\b", body):
+        table = normalize_table_name(plain_m.group("table"))
+        column = bare_ident(plain_m.group("col"))
+        short_name = _dim_asset_class_short_name_from_subquery(body)
+        if short_name and "ASSETCLASS" in table.upper():
+            # PRO asset-class procedures pick distinct keys via
+            # ``WHERE AssetClassShortName='SUB'`` (etc.). Encode the short
+            # name as a relationship hop on the derivation target so CASE
+            # branches do not collapse to one undifferentiated key column.
+            return {
+                "type": "COLUMN_REF",
+                "entity": normalize_table_name(default_entity),
+                "relationship": short_name,
+                "column": column,
+                "_dependency_refs": extract_subquery_dependency_refs(body),
+            }
         return {
             "type": "COLUMN_REF",
-            "entity": normalize_table_name(plain_m.group("table")),
+            "entity": table,
             "relationship": None,
-            "column": bare_ident(plain_m.group("col")),
+            "column": column,
             "_dependency_refs": extract_subquery_dependency_refs(body),
         }
 
@@ -1996,14 +2675,17 @@ def _should_use_addday_for_arithmetic(
     target_column: str,
 ) -> bool:
     """True only for date ± numeric-day arithmetic — never for counters."""
-    if _is_numeric_column_name(target_column):
-        return False
-    # Right side must look like a day offset (number / numeric literal expr).
     if not _node_looks_numeric(right):
+        return False
+    # Date column + day offset stays ADDDAY even when the *target* column is an
+    # integer key (e.g. SysAssetClassAlt_Key aging CASE on SysNPA_Dt).
+    if _node_looks_date_valued(left):
+        return True
+    if _is_numeric_column_name(target_column):
         return False
     if _is_date_like_column_name(target_column):
         return True
-    return _node_looks_date_valued(left)
+    return False
 
 
 def _is_date_like_column_name(name: str) -> bool:
@@ -2059,7 +2741,7 @@ def _node_looks_date_valued(node: dict[str, Any] | None) -> bool:
         return _is_date_like_column_name(str(node.get("column") or ""))
     if node.get("type") == "FUNCTION_CALL":
         func = str(node.get("function_name") or "").upper()
-        if func in {"SOM", "EOM", "ADDDAY", "TODATE", "DATE"}:
+        if func in {"SOM", "EOM", "ADDDAY", "TODATE", "DATE", "PERIOD"}:
             return True
         if func == "COALESCE":
             args = node.get("arguments") or []
@@ -2113,12 +2795,12 @@ def _sanitize_addday_misuse(node: dict[str, Any], target_column: str) -> dict[st
 
 
 def _addday_should_be_numeric_plus(base: dict[str, Any], target_column: str) -> bool:
-    if _is_numeric_column_name(target_column):
-        return True
-    if _is_date_like_column_name(target_column):
-        return False
     if _node_looks_date_valued(base):
         return False
+    if _is_date_like_column_name(target_column):
+        return False
+    if _is_numeric_column_name(target_column):
+        return True
     # COALESCE(COUNT, 0) / COUNT column refs → numeric
     col = _column_name_from_node(base)
     if _node_looks_numeric(base) or (col and _is_numeric_column_name(col)):
@@ -2143,6 +2825,91 @@ def _column_name_from_node(node: dict[str, Any] | None) -> str | None:
         )
     return None
 
+
+
+def _case_end_index(text: str, start: int) -> int | None:
+    """Index just past the ``END`` closing the ``CASE`` that begins at ``start``."""
+    n = len(text)
+    i = start + 4
+    depth = 1
+    in_single = False
+    while i < n:
+        ch = text[i]
+        if in_single:
+            if ch == "'":
+                if i + 1 < n and text[i + 1] == "'":
+                    i += 2
+                    continue
+                in_single = False
+            i += 1
+            continue
+        if ch == "'":
+            in_single = True
+        elif (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
+            if re.match(r"(?is)CASE\b", text[i:i + 5]):
+                depth += 1
+                i += 4
+                continue
+            if re.match(r"(?is)END\b", text[i:i + 4]):
+                depth -= 1
+                if depth == 0:
+                    return i + 3
+                i += 3
+                continue
+        i += 1
+    return None
+
+
+def _parenthesize_top_level_case(text: str) -> str:
+    """Wrap every top-level ``CASE ... END`` that is not the whole expression
+    in parentheses (``X * CASE WHEN a=b THEN 1 ELSE c/100 END`` ->
+    ``X * (CASE ... END)``).
+
+    The comparison / AND-OR / arithmetic splitters only track parentheses, so
+    an operator inside an un-parenthesised CASE (the ``/`` or ``=`` above)
+    would otherwise be split at the wrong level and corrupt the expression.
+    """
+    if not re.search(r"(?i)\bCASE\b", text):
+        return text
+    out: list[str] = []
+    n = len(text)
+    i = 0
+    depth = 0
+    in_single = False
+    while i < n:
+        ch = text[i]
+        if in_single:
+            out.append(ch)
+            if ch == "'":
+                if i + 1 < n and text[i + 1] == "'":
+                    out.append(text[i + 1])
+                    i += 2
+                    continue
+                in_single = False
+            i += 1
+            continue
+        if ch == "'":
+            in_single = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        elif (
+            depth == 0
+            and re.match(r"(?is)CASE\b", text[i:i + 5])
+            and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_"))
+        ):
+            end = _case_end_index(text, i)
+            if end is not None:
+                segment = text[i:end]
+                if i == 0 and end == n:
+                    return text
+                out.append(f"({segment})")
+                i = end
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def _extract_matching_case_body(text: str) -> tuple[str, bool]:
@@ -2317,6 +3084,26 @@ def _try_parse_case(
             "else_branch": ast,
         }
     return ast
+
+
+def _try_parse_sql_column_ref(text: str, default_entity: str) -> dict[str, Any] | None:
+    """Parse ``Entity.[Spaced Name]``, ``[Spaced Name]``, or ``Entity.Col`` refs."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    ent_bracket = re.match(
+        r"^(?P<ent>[#A-Za-z_][#A-Za-z0-9_]*)\.\[(?P<col>[^\]]+)\]\s*$",
+        raw,
+    )
+    if ent_bracket:
+        return _column_ref(
+            ent_bracket.group("ent"),
+            bare_ident(ent_bracket.group("col")),
+        )
+    only_bracket = re.match(r"^\[(?P<col>[^\]]+)\]\s*$", raw)
+    if only_bracket:
+        return _column_ref(default_entity, bare_ident(only_bracket.group("col")))
+    return None
 
 
 def _column_ref(

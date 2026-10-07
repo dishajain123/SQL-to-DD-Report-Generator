@@ -169,7 +169,14 @@ def build_metadata(
     # here, or every column derived from the same procedure ends up with an
     # identical, duplicated "Business Purpose". Always derive a description
     # scoped to this specific target_entity/target_column instead.
-    description = _describe_column_derivation(target_entity, target_column, ast, mutation_count)
+    try:
+        from app.report.rule_narrative import executive_business_purpose_line
+
+        description = executive_business_purpose_line(target_entity, target_column, formula)
+    except Exception:
+        description = _describe_column_derivation(target_entity, target_column, ast, mutation_count)
+    if not description:
+        description = _describe_column_derivation(target_entity, target_column, ast, mutation_count)
 
     if errors:
         logger.info(

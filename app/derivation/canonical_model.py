@@ -29,9 +29,9 @@ def _fallback_technical_summary(
 def _fallback_business_summary(ordered_objects: list[SQLObject]) -> str:
     names = ", ".join(obj.name for obj in ordered_objects) or "This procedure"
     return (
-        f"{names} applies the conditions encoded in the source SQL. "
-        "The narrative model did not respond, so the report and the DD export "
-        "use those SQL conditions directly."
+        f"{names} applies the business rules encoded in the source SQL. "
+        "Derived columns are documented below in plain English, with the exact "
+        "platform condition preserved for technical review."
     )
 
 

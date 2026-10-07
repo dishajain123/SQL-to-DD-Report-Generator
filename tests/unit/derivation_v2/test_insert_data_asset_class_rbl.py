@@ -114,3 +114,76 @@ def test_cte_dimproduct_asset_norm_has_no_alias_a_leak():
     assert "ALWYS_STD" in formula
     assert 'THEN("CONDI_STD")' in formula
     assert validate_expression(formula).passed, validate_expression(formula).errors
+
+
+_NOT_EXISTS_CHARGE_OFF = """
+UPDATE ACL SET
+   Asset_Norm='ALWYS_NPA'
+   ,DegReason='NPA DUE TO CREDIT CARD SETTLEMENT - Always NPA'
+ FROM ##ACCOUNTCAL ACL
+ WHERE AccountBlkCode2 in ('K','E','W') AND FinalAssetClassAlt_Key=1
+ AND NOT exists (SELECT 1 FROM ExceptionFinalStatusType A
+                              WHERE A.EffectiveFromTimeKey<=@TIMEKEY AND A.EffectiveToTimeKey >=@TIMEKEY
+							  and acl.CustomerAcID=a.ACID
+                             AND A.StatusType='Charge Off')
+"""
+
+_MANUAL_UPGRADE = """
+ UPDATE A SET ASSET_NORM='ALWYS_STD',
+   flgdeg='N'
+   ,FlgUpg='N'
+   ,DegReason=NULL
+  FROM ##ACCOUNTCAL A
+  INNER JOIN Manual_Upgrade B ON A.CustomerAcID=B.[Account No]
+  WHERE VALID_UPTO>='2021-10-25'
+  and [Account No] not in(select [Account No] from Manual_NPA)
+"""
+
+
+def test_not_exists_exception_status_projects_to_valid_degreason_formula():
+    _, debug = generate_for_sql(
+        _NOT_EXISTS_CHARGE_OFF, "##ACCOUNTCAL", "DegReason", llm_client=None
+    )
+    formula = debug["formula"]
+    assert formula
+    assert "Charge Off" in formula or "CHARGE" in formula.upper()
+    compact = formula.replace(" ", "")
+    assert 'THEN("Y")ELSE("Y")' not in compact
+    assert "MIN(" not in formula.upper()
+    assert validate_expression(formula).passed, validate_expression(formula).errors
+
+
+def test_manual_upgrade_not_in_subquery_yields_flgdeg_formula():
+    _, debug = generate_for_sql(
+        _MANUAL_UPGRADE, "##ACCOUNTCAL", "flgdeg", llm_client=None
+    )
+    formula = debug["formula"]
+    assert formula
+    assert "Manual_NPA" in formula or "MANUAL_NPA" in formula.upper()
+    assert "MIN(" not in formula.upper()
+    assert validate_expression(formula).passed, validate_expression(formula).errors
+
+
+def test_getminimumdate_udf_lowers_to_row_level_if():
+    from app.derivation.v2.ast_compiler import compile_ast_to_4x_string
+    from app.derivation.v2.ast_optimize import optimize_expression_ast
+    from app.derivation.v2.phase3_ast_generator import parse_sql_expression_to_ast
+
+    ast = parse_sql_expression_to_ast(
+        "[RBL_MISDB].PRO.GETMINIMUMDATE(BillDueDt,InterestOverdueDate,NULL)",
+        default_entity="AccountCal",
+        target_column="OverDueSinceDt",
+    )
+    assert ast.get("function_name") != "__UNSUPPORTED_SQL__"
+    optimized = optimize_expression_ast(
+        ast, target_entity="AccountCal", target_column="OverDueSinceDt"
+    )
+    formula = compile_ast_to_4x_string(
+        optimized, target_entity="AccountCal", target_column="OverDueSinceDt"
+    )
+    upper = formula.upper()
+    assert "MIN(" not in upper
+    assert "MAX(" not in upper
+    assert "GETMINIMUMDATE" not in upper
+    assert "IF(" in formula
+    assert validate_expression(formula).passed, validate_expression(formula).errors

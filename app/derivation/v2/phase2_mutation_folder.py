@@ -111,6 +111,12 @@ _JOIN_KEY_EQUALITY_RE = re.compile(
 )
 
 
+def _is_inner_style_join(join: "JoinInfo") -> bool:
+    """True for joins whose ON clause restricts which target rows are updated."""
+    join_type = (join.join_type or "JOIN").upper()
+    return not any(kw in join_type for kw in ("LEFT", "RIGHT", "FULL"))
+
+
 def _join_filter_terms(join: "JoinInfo") -> list[str]:
     """Extra row-filtering predicates in a JOIN's ON clause, beyond the
     structural ``<this>.<col> = <other>.<col>`` linking key(s).
@@ -129,8 +135,7 @@ def _join_filter_terms(join: "JoinInfo") -> list[str]:
     """
     if not join.on_clause:
         return []
-    join_type = (join.join_type or "JOIN").upper()
-    if any(kw in join_type for kw in ("LEFT", "RIGHT", "FULL")):
+    if not _is_inner_style_join(join):
         return []
     alias = (join.alias or join.table or "").strip().strip('"[]').upper()
     if not alias:
@@ -165,7 +170,13 @@ def _resolve_join_filter_condition(
     """
     terms: list[str] = []
     for join in joins:
-        terms.extend(_join_filter_terms(join))
+        extra = _join_filter_terms(join)
+        if extra:
+            terms.extend(extra)
+        elif _is_inner_style_join(join) and (join.on_clause or "").strip():
+            # Pure key-equality ON clauses are stripped by ``_join_filter_terms``,
+            # but an UPDATE … INNER JOIN still only touches matching rows.
+            terms.append(join.on_clause.strip())
     if not terms:
         return None
     resolved = [
@@ -325,6 +336,112 @@ class MutationSourceIndex:
         )
 
 
+_BARE_IDENT_RE = re.compile(r"(?<![\w.@#\[\]:\"])([A-Za-z_]\w*)")
+
+
+def _written_columns_by_table(
+    source: "MutationSourceIndex",
+    lineage: LineageMap,
+    entity_map: dict[str, str] | None,
+) -> dict[str, set[str]]:
+    """``{NORMALIZED_TABLE: {COLUMN,…}}`` assigned by any UPDATE in the object.
+
+    File-local evidence of which table owns a column; computed once per source.
+    """
+    cached = getattr(source, "_written_cols_cache", None)
+    if cached is not None:
+        return cached
+    out: dict[str, set[str]] = {}
+    for stmt in source.updates:
+        alias_map, _ = _parse_update_sources(
+            (stmt.get("head") or "").strip(),
+            (stmt.get("from_clause") or "").strip(),
+            lineage,
+            entity_map,
+        )
+        written = _resolve_update_target_tables((stmt.get("head") or "").strip(), alias_map)
+        for assign in _iter_set_assignments(stmt.get("set_clause") or ""):
+            tables = list(written)
+            if assign["alias"] and alias_map.get(assign["alias"].upper()):
+                tables = [alias_map[assign["alias"].upper()]]
+            for table in tables:
+                key = normalize_table_name(str(table)).upper()
+                out.setdefault(key, set()).add(bare_ident(assign["column"]).upper())
+    source._written_cols_cache = out  # type: ignore[attr-defined]
+    return out
+
+
+def _augment_written_cols_with_join_temp_schemas(
+    written_cols: dict[str, set[str]],
+    alias_map: dict[str, str],
+    lineage: LineageMap,
+) -> dict[str, set[str]]:
+    """Add ``SELECT INTO #temp`` column names so bare refs qualify to the join alias."""
+    out: dict[str, set[str]] = {k: set(v) for k, v in written_cols.items()}
+    for _alias, table in alias_map.items():
+        key = normalize_table_name(str(table)).upper()
+        schema = lineage.temp_table_columns.get(normalize_table_name(str(table))) or []
+        if not schema:
+            continue
+        bucket = out.setdefault(key, set())
+        for col in schema:
+            bucket.add(bare_ident(col).upper())
+    return out
+
+
+def _qualify_foreign_bare_columns(
+    text: str | None,
+    alias_map: dict[str, str],
+    written_tables: list[str],
+    written_cols: dict[str, set[str]],
+) -> str | None:
+    """Qualify a bare column that only a JOINED table (never the UPDATE target)
+    is assigned in this object, e.g. ``UPDATE A SET T = ISNULL(RestructureProvision,0)
+    FROM ##AccountCal A JOIN PRO.AdvAcRestructureCal B`` -> ``B.RestructureProvision``.
+
+    T-SQL binds an unqualified name to whichever in-scope table owns it; without
+    a schema, the only evidence available is the columns this object itself
+    assigns per table. A column is rewritten only when exactly one non-target
+    joined table owns it and the target table does not.
+    """
+    if not text or not alias_map:
+        return text
+    target_keys = {normalize_table_name(str(t)).upper() for t in written_tables}
+    owners: dict[str, str] = {}  # column -> alias, for columns owned by one foreign table
+    ambiguous: set[str] = set()
+    seen_tables: set[str] = set()
+    for alias, table in alias_map.items():
+        key = normalize_table_name(str(table)).upper()
+        if key in target_keys or key in seen_tables or "." in alias:
+            continue
+        seen_tables.add(key)
+        for col in written_cols.get(key, ()):
+            if col in owners:
+                ambiguous.add(col)
+            owners[col] = alias
+    if not owners:
+        return text
+    target_cols: set[str] = set()
+    for key in target_keys:
+        target_cols |= written_cols.get(key, set())
+
+    def _sub(segment: str) -> str:
+        def repl(match: re.Match[str]) -> str:
+            ident = match.group(1)
+            col = ident.upper()
+            if col not in owners or col in ambiguous or col in target_cols:
+                return ident
+            tail = segment[match.end():].lstrip()
+            if tail[:1] in {"(", ".", ":"}:
+                return ident
+            return f"{owners[col]}.{ident}"
+
+        return _BARE_IDENT_RE.sub(repl, segment)
+
+    parts = re.split(r"('(?:[^']|'')*')", text)
+    return "".join(p if p.startswith("'") else _sub(p) for p in parts)
+
+
 def fold_column_mutations(
     sql_text: str,
     target_entity: str,
@@ -396,8 +513,22 @@ def fold_column_mutations(
                     continue
 
             ordinal += 1
+            expr_text = assign["expr"]
+            where_text = where_clause
+            if len(set(map(str, alias_map.values()))) > 1:
+                written_cols = _augment_written_cols_with_join_temp_schemas(
+                    _written_columns_by_table(source, lineage, entity_map),
+                    alias_map,
+                    lineage,
+                )
+                expr_text = _qualify_foreign_bare_columns(
+                    expr_text, alias_map, written_tables, written_cols
+                )
+                where_text = _qualify_foreign_bare_columns(
+                    where_text, alias_map, written_tables, written_cols
+                )
             resolved_expr = _resolve_expression_tables(
-                assign["expr"],
+                expr_text,
                 alias_map,
                 lineage,
                 entity_map,
@@ -407,7 +538,7 @@ def fold_column_mutations(
             resolved_where = None
             if where_clause:
                 resolved_where = _resolve_expression_tables(
-                    where_clause,
+                    where_text,
                     alias_map,
                     lineage,
                     entity_map,
@@ -437,7 +568,10 @@ def fold_column_mutations(
             # Inside an IF/ELSE chain, even an UPDATE without WHERE is "guarded"
             # by mutual exclusion — do not treat ELSE as a global unguarded reset.
             in_control = branch is not None
-            guarded = bool(where_clause) or (
+            join_filter_condition = _resolve_join_filter_condition(
+                joins, alias_map, lineage, entity_map, target_entity_norm
+            )
+            guarded = bool(where_clause) or bool(join_filter_condition) or (
                 in_control and branch.kind in {"IF", "ELSEIF"}
             )
 
@@ -458,9 +592,7 @@ def fold_column_mutations(
                     control_branch_index=branch.index if branch else None,
                     control_branch_kind=branch.kind if branch else None,
                     outer_condition=outer_cond,
-                    join_filter_condition=_resolve_join_filter_condition(
-                        joins, alias_map, lineage, entity_map, target_entity_norm
-                    ),
+                    join_filter_condition=join_filter_condition,
                     dependency_refs=_dedupe_refs(dep_refs),
                     exception_scope=_scope_for_offset(stmt_start),
                     workflow_gate=gate.name if gate else None,
@@ -528,7 +660,10 @@ def fold_column_mutations(
             dep_refs.extend(extract_subquery_dependency_refs(where_clause))
         dep_refs.extend(_join_dependency_refs(joins, alias_map))
         in_control = branch is not None
-        guarded = bool(where_clause) or (
+        join_filter_condition = _resolve_join_filter_condition(
+            joins, alias_map, lineage, entity_map, target_entity_norm
+        )
+        guarded = bool(where_clause) or bool(join_filter_condition) or (
             in_control and branch.kind in {"IF", "ELSEIF"}
         )
 
@@ -551,9 +686,7 @@ def fold_column_mutations(
                 control_branch_index=branch.index if branch else None,
                 control_branch_kind=branch.kind if branch else None,
                 outer_condition=outer_cond,
-                join_filter_condition=_resolve_join_filter_condition(
-                    joins, alias_map, lineage, entity_map, target_entity_norm
-                ),
+                join_filter_condition=join_filter_condition,
                 dependency_refs=_dedupe_refs(dep_refs),
                 exception_scope=_scope_for_offset(stmt_start),
                 workflow_gate=gate.name if gate else None,
@@ -617,7 +750,10 @@ def fold_column_mutations(
             dep_refs.extend(extract_subquery_dependency_refs(where_clause))
         dep_refs.extend(_join_dependency_refs(joins, alias_map))
         in_control = branch is not None
-        guarded = bool(where_clause) or (
+        join_filter_condition = _resolve_join_filter_condition(
+            joins, alias_map, lineage, entity_map, target_entity_norm
+        )
+        guarded = bool(where_clause) or bool(join_filter_condition) or (
             in_control and branch.kind in {"IF", "ELSEIF"}
         )
 
@@ -640,9 +776,7 @@ def fold_column_mutations(
                 control_branch_index=branch.index if branch else None,
                 control_branch_kind=branch.kind if branch else None,
                 outer_condition=outer_cond,
-                join_filter_condition=_resolve_join_filter_condition(
-                    joins, alias_map, lineage, entity_map, target_entity_norm
-                ),
+                join_filter_condition=join_filter_condition,
                 dependency_refs=_dedupe_refs(dep_refs),
                 exception_scope=_scope_for_offset(stmt_start),
                 workflow_gate=gate.name if gate else None,
@@ -780,7 +914,7 @@ def fold_column_mutations(
         target_col,
         len(mutations),
     )
-    mutations.sort(key=lambda m: m.source_position)
+    mutations.sort(key=lambda m: (m.source_position, m.statement_index))
     mutations = _apply_table_resets(
         mutations, source.resets, target_entity_norm, entity_map
     )
@@ -925,8 +1059,23 @@ def prune_redundant_ast(node: dict[str, Any] | None, _memo=None) -> dict[str, An
     """
     if _memo is None:
         from app.derivation.v2.ast_limits import check_formula_expansion
-        check_formula_expansion(node)
+
         _memo = {}
+        pruned = _prune_redundant_ast_impl(node, _memo)
+        if isinstance(pruned, dict):
+            from app.derivation.v2.ast_optimize import (
+                collapse_degenerate_if_branches,
+                enforce_later_update_precedence,
+            )
+
+            pruned = enforce_later_update_precedence(pruned)
+            pruned = collapse_degenerate_if_branches(pruned)
+            check_formula_expansion(pruned)
+        return pruned
+    return _prune_redundant_ast_impl(node, _memo)
+
+
+def _prune_redundant_ast_impl(node: dict[str, Any] | None, _memo) -> dict[str, Any] | None:
     if id(node) in _memo:
         return _memo[id(node)]
     if not isinstance(node, dict):
@@ -935,25 +1084,36 @@ def prune_redundant_ast(node: dict[str, Any] | None, _memo=None) -> dict[str, An
     _memo[id(node)] = cleaned
     for key, value in list(cleaned.items()):
         if isinstance(value, dict) and "type" in value:
-            cleaned[key] = prune_redundant_ast(value, _memo)
+            cleaned[key] = _prune_redundant_ast_impl(value, _memo)
         elif isinstance(value, list):
             cleaned[key] = [
-                prune_redundant_ast(item, _memo) if isinstance(item, dict) else item for item in value
+                _prune_redundant_ast_impl(item, _memo) if isinstance(item, dict) else item
+                for item in value
             ]
     if cleaned.get("type") != "IF_THEN_ELSE":
         return cleaned
 
-    # Children are already pruned, so peeling repeated identical guards off
-    # the THEN side is enough (handles IF(A) THEN(IF(A) THEN(IF(A) ...))).
+    # Peel repeated identical guards on the THEN side. When the inner arm is
+    # ``IF(G) THEN NULL ELSE <real>``, promote <real> (same rule as ast_optimize)
+    # so a widening NULL pass does not shadow ADDDAY/CASE logic under ``G``.
+    from app.derivation.v2.ast_optimize import _is_null_literal_ast
+
     then_branch = cleaned.get("then_branch")
-    condition_sig = _ast_signature(cleaned.get("condition"))
+    condition_sig = guard_formula_signature(cleaned.get("condition"))
     while (
         isinstance(then_branch, dict)
         and then_branch.get("type") == "IF_THEN_ELSE"
-        and "then_branch" in then_branch
-        and _ast_signature(then_branch.get("condition")) == condition_sig
+        and guard_formula_signature(then_branch.get("condition")) == condition_sig
     ):
-        then_branch = then_branch.get("then_branch")
+        inner_then = then_branch.get("then_branch")
+        inner_else = then_branch.get("else_branch")
+        if _is_null_literal_ast(inner_then) and isinstance(inner_else, dict):
+            then_branch = inner_else
+            cleaned["then_branch"] = then_branch
+            continue
+        if not isinstance(inner_then, dict):
+            break
+        then_branch = inner_then
         cleaned["then_branch"] = then_branch
 
     outer = _predicate_column(cleaned.get("condition"), "ISNOTEMPTY")
@@ -961,7 +1121,11 @@ def prune_redundant_ast(node: dict[str, Any] | None, _memo=None) -> dict[str, An
         inner = _predicate_column(then_branch.get("condition"), "ISEMPTY")
         if inner and inner == outer:
             replacement = then_branch.get("else_branch")
-            cleaned["then_branch"] = prune_redundant_ast(replacement, _memo) if isinstance(replacement, dict) else replacement
+            cleaned["then_branch"] = (
+                _prune_redundant_ast_impl(replacement, _memo)
+                if isinstance(replacement, dict)
+                else replacement
+            )
 
     else_branch = cleaned.get("else_branch")
     if (
@@ -977,10 +1141,10 @@ def prune_redundant_ast(node: dict[str, Any] | None, _memo=None) -> dict[str, An
 
     flattened = _try_flatten_join_assignment_zero_default(cleaned)
     if flattened is not None:
-        return prune_redundant_ast(flattened, _memo)
+        return _prune_redundant_ast_impl(flattened, _memo)
     deduped_clamp = _try_dedupe_coalesce_negative_clamp(cleaned)
     if deduped_clamp is not None:
-        return prune_redundant_ast(deduped_clamp, _memo)
+        return _prune_redundant_ast_impl(deduped_clamp, _memo)
     cond = cleaned.get("condition")
     if isinstance(cond, dict):
         deduped_cond = _dedupe_or_condition_ast(cond)
@@ -1068,6 +1232,40 @@ def _condition_is_expr_equals_zero(condition: Any, expr: dict[str, Any]) -> bool
     return False
 
 
+def _try_reconstruct_zero_comparison_subject(
+    node: Any,
+    ops: set[str],
+) -> dict[str, Any] | None:
+    """Undo ``_distribute_if_over_comparisons`` on ``expr < 0`` / ``expr <= 0``.
+
+    ``IF(c) THEN (a<0) ELSE (b<0)`` reconstructs as ``IF(c) THEN a ELSE b``.
+    """
+    if not isinstance(node, dict):
+        return None
+    if node.get("type") == "BINARY_OP":
+        if str(node.get("operator") or "").strip() not in ops:
+            return None
+        if not _is_zero_literal(node.get("right")):
+            return None
+        left = node.get("left")
+        return left if isinstance(left, dict) else None
+    if node.get("type") != "IF_THEN_ELSE":
+        return None
+    then_v = _try_reconstruct_zero_comparison_subject(node.get("then_branch"), ops)
+    else_v = _try_reconstruct_zero_comparison_subject(node.get("else_branch"), ops)
+    if then_v is None or else_v is None:
+        return None
+    cond = node.get("condition")
+    if not isinstance(cond, dict):
+        return None
+    return {
+        "type": "IF_THEN_ELSE",
+        "condition": cond,
+        "then_branch": then_v,
+        "else_branch": else_v,
+    }
+
+
 def _try_dedupe_coalesce_negative_clamp(node: dict[str, Any]) -> dict[str, Any] | None:
     """Collapse ``IF(COALESCE(deriv,0)<0) THEN 0 ELSE deriv`` (or the same with
     ``deriv`` inlined in the guard) into ``MAX(deriv, 0)``.
@@ -1076,6 +1274,11 @@ def _try_dedupe_coalesce_negative_clamp(node: dict[str, Any]) -> dict[str, Any] 
     while the ELSE arm still carries the same tree — the export then lists every
     ``@TIMEKEY`` / ``DATEDIFF`` arm twice. When guard and ELSE payloads match,
     ``MAX`` is exact for the integer DPD metrics this pattern serves.
+
+    Also matches the 4X-safe distributed form produced by
+    ``_distribute_if_over_comparisons``:
+
+        IF(IF(c) THEN(a<0) ELSE(b<0)) THEN 0 ELSE IF(c) THEN a ELSE b
     """
     if node.get("type") != "IF_THEN_ELSE" or not _is_zero_literal(node.get("then_branch")):
         return None
@@ -1083,22 +1286,27 @@ def _try_dedupe_coalesce_negative_clamp(node: dict[str, Any]) -> dict[str, Any] 
     if not isinstance(else_branch, dict):
         return None
     cond = node.get("condition")
-    if not isinstance(cond, dict) or cond.get("type") != "BINARY_OP":
-        return None
-    if str(cond.get("operator") or "").strip() not in {"<", "<="}:
-        return None
-    if not _is_zero_literal(cond.get("right")):
-        return None
-    left = cond.get("left")
-    if not isinstance(left, dict):
+    if not isinstance(cond, dict):
         return None
     inner: dict[str, Any] | None = None
-    if left.get("type") == "FUNCTION_CALL" and str(left.get("function_name") or "").upper() == "COALESCE":
-        args = left.get("arguments") or []
-        if len(args) == 2 and _is_zero_literal(args[1]):
-            inner = args[0] if isinstance(args[0], dict) else None
-    elif _ast_signature(left) == _ast_signature(else_branch):
-        inner = left
+    if cond.get("type") == "BINARY_OP":
+        if str(cond.get("operator") or "").strip() not in {"<", "<="}:
+            return None
+        if not _is_zero_literal(cond.get("right")):
+            return None
+        left = cond.get("left")
+        if not isinstance(left, dict):
+            return None
+        if left.get("type") == "FUNCTION_CALL" and str(left.get("function_name") or "").upper() == "COALESCE":
+            args = left.get("arguments") or []
+            if len(args) == 2 and _is_zero_literal(args[1]):
+                inner = args[0] if isinstance(args[0], dict) else None
+        elif _ast_signature(left) == _ast_signature(else_branch):
+            inner = left
+    if inner is None:
+        reconstructed = _try_reconstruct_zero_comparison_subject(cond, {"<", "<="})
+        if reconstructed is not None and _ast_signature(reconstructed) == _ast_signature(else_branch):
+            inner = reconstructed
     if inner is None or _ast_signature(inner) != _ast_signature(else_branch):
         return None
     zero_lit = {"type": "LITERAL", "value_type": "NUMBER", "value": 0}
@@ -1120,6 +1328,12 @@ def _try_flatten_join_assignment_zero_default(node: dict[str, Any]) -> dict[str,
 
     is equivalent when an earlier pass reset the column to 0 and ``src`` is
     only written under the join.
+
+    Also matches the 4X-safe distributed form produced by
+    ``_distribute_if_over_comparisons``:
+
+        IF(IF(join) THEN(src==0) ELSE(0==0)) THEN default
+        ELSE IF(join) THEN src ELSE 0
     """
     if node.get("type") != "IF_THEN_ELSE":
         return None
@@ -1132,10 +1346,14 @@ def _try_flatten_join_assignment_zero_default(node: dict[str, Any]) -> dict[str,
         return None
     if not _is_zero_literal(outer_else.get("else_branch")):
         return None
-    if not _condition_is_expr_equals_zero(node.get("condition"), outer_else):
-        return None
     default_value = node.get("then_branch")
     if not isinstance(default_value, dict) or default_value.get("type") != "LITERAL":
+        return None
+
+    cond = node.get("condition")
+    direct = _condition_is_expr_equals_zero(cond, outer_else)
+    distributed = _condition_is_distributed_join_zero_check(cond, join_cond, source_value)
+    if not direct and not distributed:
         return None
 
     coalesce_source = {
@@ -1160,6 +1378,29 @@ def _try_flatten_join_assignment_zero_default(node: dict[str, Any]) -> dict[str,
     }
 
 
+def _is_zero_equals_zero(node: Any) -> bool:
+    if not isinstance(node, dict) or node.get("type") != "BINARY_OP":
+        return False
+    if str(node.get("operator") or "").strip() not in {"==", "="}:
+        return False
+    return _is_zero_literal(node.get("left")) and _is_zero_literal(node.get("right"))
+
+
+def _condition_is_distributed_join_zero_check(
+    condition: Any,
+    join_cond: dict[str, Any],
+    source_value: dict[str, Any],
+) -> bool:
+    """True for ``IF(join) THEN(src==0) ELSE(0==0)`` (distributed ``prior==0``)."""
+    if not isinstance(condition, dict) or condition.get("type") != "IF_THEN_ELSE":
+        return False
+    if _ast_signature(condition.get("condition")) != _ast_signature(join_cond):
+        return False
+    if not _condition_is_expr_equals_zero(condition.get("then_branch"), source_value):
+        return False
+    return _is_zero_equals_zero(condition.get("else_branch"))
+
+
 def _ast_signature(node: Any) -> Any:
     """Hashable, comparison-only form of an AST subtree.
 
@@ -1180,6 +1421,96 @@ def _ast_signature(node: Any) -> Any:
     if isinstance(node, list):
         return tuple(_ast_signature(item) for item in node)
     return node
+
+
+def _literals_equal_for_guard(a: Any, b: Any) -> bool:
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return False
+    if a.get("type") != "LITERAL" or b.get("type") != "LITERAL":
+        return False
+    return a.get("value") == b.get("value") and (
+        str(a.get("value_type") or "").upper() == str(b.get("value_type") or "").upper()
+    )
+
+
+def normalize_guard_conjunct(node: Any) -> Any:
+    """Canonical form for duplicate-guard detection and narrowing-fold matching.
+
+    Maps ``COALESCE(Col, 'N') == 'N'`` and bare ``Col == 'N'`` to the same
+    shape so chronological folds do not treat procedurally identical UPDATE
+    guards as distinct conjuncts.
+    """
+    if not isinstance(node, dict):
+        return node
+    ntype = node.get("type")
+    if ntype == "BINARY_OP" and str(node.get("operator") or "").upper() == "AND":
+        left = normalize_guard_conjunct(node.get("left"))
+        right = normalize_guard_conjunct(node.get("right"))
+        return {"type": "BINARY_OP", "operator": "AND", "left": left, "right": right}
+    if ntype == "BINARY_OP" and str(node.get("operator") or "").upper() == "OR":
+        left = normalize_guard_conjunct(node.get("left"))
+        right = normalize_guard_conjunct(node.get("right"))
+        return {"type": "BINARY_OP", "operator": "OR", "left": left, "right": right}
+    if ntype == "BINARY_OP" and str(node.get("operator") or "") == "==":
+        left = node.get("left")
+        right = node.get("right")
+        if isinstance(left, dict) and left.get("type") == "FUNCTION_CALL":
+            fn = str(left.get("function_name") or "").upper()
+            if fn == "COALESCE":
+                args = left.get("arguments") or []
+                if len(args) >= 2 and isinstance(right, dict) and _literals_equal_for_guard(
+                    args[1], right
+                ):
+                    return {
+                        "type": "BINARY_OP",
+                        "operator": "==",
+                        "left": normalize_guard_conjunct(args[0]),
+                        "right": right,
+                    }
+        return {
+            "type": "BINARY_OP",
+            "operator": "==",
+            "left": normalize_guard_conjunct(left),
+            "right": normalize_guard_conjunct(right),
+        }
+    if ntype == "FUNCTION_CALL":
+        return {
+            **node,
+            "arguments": [
+                normalize_guard_conjunct(a) if isinstance(a, dict) else a
+                for a in (node.get("arguments") or [])
+            ],
+        }
+    return node
+
+
+def guard_conjunct_signature(node: Any) -> Any:
+    """Signature of a guard conjunct after ``normalize_guard_conjunct``."""
+    if not isinstance(node, dict):
+        return _ast_signature(node)
+    return _ast_signature(normalize_guard_conjunct(node))
+
+
+def flatten_and_conjuncts(node: dict[str, Any]) -> list[dict[str, Any]]:
+    if node.get("type") != "BINARY_OP" or str(node.get("operator") or "").upper() != "AND":
+        return [node]
+    parts: list[dict[str, Any]] = []
+    left = node.get("left")
+    right = node.get("right")
+    if isinstance(left, dict):
+        parts.extend(flatten_and_conjuncts(left))
+    if isinstance(right, dict):
+        parts.extend(flatten_and_conjuncts(right))
+    return parts or [node]
+
+
+def guard_formula_signature(node: Any) -> Any:
+    """Order-independent signature for a full row guard (AND of conjuncts)."""
+    if not isinstance(node, dict):
+        return _ast_signature(node)
+    normed = normalize_guard_conjunct(node)
+    parts = flatten_and_conjuncts(normed)
+    return tuple(sorted(guard_conjunct_signature(p) for p in parts))
 
 
 def _predicate_column(node: dict[str, Any] | None, function_name: str) -> tuple[str, str] | None:
@@ -1519,7 +1850,13 @@ def _entity_keys(name: str) -> set[str]:
     stripped = bare.lstrip("#")
     if "." in stripped:
         stripped = stripped.split(".")[-1]
-    return {text.upper(), bare.upper(), stripped.upper(), f"##{stripped}".upper()}
+    keys = {text.upper(), bare.upper(), stripped.upper(), f"##{stripped}".upper()}
+    # Permanent staging tables (e.g. PRO.AccountCal_Stg for ##AccountCal) fold
+    # under the logical entity name (AccountCal) when no explicit entity map
+    # is supplied.
+    if stripped.upper().endswith("_STG") and len(stripped) > 4:
+        keys |= _entity_keys(stripped[:-4])
+    return keys
 
 
 def _resolve_table_entity(
@@ -1609,7 +1946,7 @@ def _qualify_bare_identifiers(text: str, table: str) -> str:
             while j < n and text[j].isspace():
                 j += 1
             is_call = j < n and text[j] == "("
-            is_qualifier = j < n and text[j] == "."
+            is_qualifier = j < n and text[j] in {".", ":"}
             if (
                 is_call
                 or is_qualifier
@@ -1682,6 +2019,9 @@ def _resolve_expression_tables(
         # Never entity-qualify T-SQL scalars.
         if qual.startswith("@") or col.startswith("@"):
             return match.group(0)
+        # Spaced / punctuated identifiers cannot travel as ``Entity::Col``
+        # markers (the marker regex is ``[A-Za-z0-9_]+``). Keep T-SQL
+        # ``Table.[Account No]`` so phase3's bracket parser can read them.
         # Only rewrite known aliases / temps from this statement.
         table = alias_map.get(qual.upper())
         if table is None:
@@ -1690,9 +2030,81 @@ def _resolve_expression_tables(
                 table = normalize_table_name(qual)
             else:
                 return match.group(0)
+        if re.search(r"[^\w]", col) and not isinstance(table, DerivedTable):
+            physical = normalize_table_name(str(table))
+            return f"{physical}.[{col}]"
+        table_norm = normalize_table_name(str(table))
+        if table_norm.startswith("#") and not table_norm.startswith("##"):
+            # Session ``#temp`` joins (Cohort_No_PERC_2, TEMPTABLE, …) are not
+            # root entities — encode as a relationship hop on the UPDATE target
+            # instead of resolving through lineage (which can mis-route
+            # UCIF_ID to DerivativeDetail, or collapse CP.* onto AccountCal.*).
+            return _session_temp_column_marker(
+                table_norm, col, default_entity, entity_map
+            )
+
         if isinstance(table, DerivedTable):
+            derived_norm = normalize_table_name(str(table))
+            if derived_norm.startswith("#") and not derived_norm.startswith("##"):
+                return _session_temp_column_marker(
+                    derived_norm, col, default_entity, entity_map
+                )
             projection = table.projections.get(col.upper())
             if projection is not None:
+                if re.search(r"(?is)\b(MIN|MAX|SUM|STRING_AGG)\s*\(", projection):
+                    single_agg = re.match(
+                        r"(?is)^\s*(?:MIN|MAX)\s*\(\s*(?P<inner>[^()]+)\)\s*$",
+                        projection.strip(),
+                    )
+                    if single_agg:
+                        # ``MIN(col, ["GroupCol"])`` (see _attach_groupby_to_bare_aggregate):
+                        # only ``col`` is a column reference. The bracketed GROUP BY list
+                        # is a list literal and must not be alias-resolved or
+                        # bare-qualified (that produced ``X::col, X.["GroupCol"]``).
+                        agg_args = re.match(
+                            r"(?is)^(?P<col>[^,\[\]]+?)\s*(?:,\s*(?P<grp>\[.*\]))?$",
+                            single_agg.group("inner").strip(),
+                        )
+                        agg_col = (
+                            agg_args.group("col").strip()
+                            if agg_args
+                            else single_agg.group("inner").strip()
+                        )
+                        agg_group_list = (
+                            (agg_args.group("grp") or "").strip() if agg_args else ""
+                        )
+                        inner = _resolve_expression_tables(
+                            agg_col,
+                            table.inner_alias_map,
+                            lineage,
+                            entity_map,
+                            default_entity,
+                            use_derived_formula=use_derived_formula,
+                            default_source_table=_pick_primary_source_table(
+                                table.inner_alias_map
+                            ),
+                        )
+                        inner_up = inner.upper()
+                        if (
+                            "::" in inner
+                            and "MIN(" not in inner_up
+                            and "MAX(" not in inner_up
+                        ):
+                            func = single_agg.group(0).strip().split("(", 1)[0].upper()
+                            ent_norm = normalize_table_name(default_entity).upper().lstrip("#")
+                            if (
+                                func == "MIN"
+                                and ent_norm.endswith("CUSTOMERCAL")
+                                and col.upper() == "FINALNPADT"
+                            ):
+                                if agg_group_list:
+                                    return f"MIN({inner}, {agg_group_list})"
+                                return f"MIN({inner})"
+                            return inner
+                    # Customer/account roll-ups: keep the derived-table hop instead
+                    # of re-expanding MIN(CASE…) trees onto the wrong entity level.
+                    ent = _normalize_entity(default_entity, entity_map)
+                    return f'"{ent}"."{qual}"."{col}"'
                 inner = _resolve_expression_tables(
                     projection,
                     table.inner_alias_map,
@@ -1707,6 +2119,12 @@ def _resolve_expression_tables(
                 return f"({inner})"
         ref = lineage.resolve_column(table, col, entity_map)
         if use_derived_formula and getattr(ref, "derived_formula", None):
+            table_norm = normalize_table_name(table)
+            default_norm = normalize_table_name(default_entity)
+            if table_norm.startswith("#") and default_norm.upper() != table_norm.upper().lstrip("#"):
+                ent = _normalize_entity(default_entity, entity_map)
+                hop = bare_ident(table_norm.lstrip("#"))
+                return f'"{ent}"."{hop}"."{col}"'
             # Temp-table mutation checkpoint (Phase 1) — splice the folded
             # expression in verbatim instead of a flat entity/column marker,
             # so this reference inherits e.g. a staging-table markup pass
@@ -1762,15 +2180,93 @@ def _resolve_expression_tables(
         return f"{ref.entity}::{ref.column}"
 
     pattern = re.compile(
-        r"(?P<qual>[#A-Za-z_][A-Za-z0-9_]*)\.(?P<col>\[?[A-Za-z_][A-Za-z0-9_]*\]?)"
+        r"(?P<qual>[#A-Za-z_][A-Za-z0-9_]*)\.(?P<col>\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_]*)"
     )
     # Never rewrite text inside single-quoted string literals: ``'D.FDSEC'``
     # is data, not an ``alias.column`` reference, and rewriting it would embed
     # an entity prefix in the literal (``"DimProduct.FDSEC"``).
     segments = re.split(r"('(?:[^']|'')*')", expression)
-    return "".join(
+    rewritten = "".join(
         seg if seg.startswith("'") else pattern.sub(repl, seg) for seg in segments
     )
+    return _qualify_unambiguous_bare_brackets(rewritten, alias_map, default_entity)
+
+
+def _qualify_unambiguous_bare_brackets(
+    expression: str,
+    alias_map: dict[str, str],
+    default_entity: str,
+) -> str:
+    """Qualify leftover ``[Account No]`` when exactly one non-target table is in scope.
+
+    T-SQL binds a bare bracketed name in WHERE to the joined table that owns
+    it (``Manual_Upgrade.[Account No]``). Without this, the token is parsed
+    as a column of the UPDATE target. Identifiers inside ``IN (SELECT …)``
+    subqueries are left untouched so the subquery still projects from its
+    own FROM table.
+    """
+    target = normalize_table_name(default_entity).upper().lstrip("#")
+    others: list[str] = []
+    for table in dict.fromkeys(alias_map.values()):
+        name = normalize_table_name(str(table))
+        if name.upper().lstrip("#") == target:
+            continue
+        others.append(name)
+    if len(others) != 1:
+        return expression
+    table = others[0]
+
+    segments = re.split(r"('(?:[^']|'')*')", expression)
+    return "".join(
+        seg if seg.startswith("'") else _qualify_bare_brackets_outside_parens(seg, table)
+        for seg in segments
+    )
+
+
+def _qualify_bare_brackets_outside_parens(text: str, table: str) -> str:
+    out: list[str] = []
+    depth = 0
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "(":
+            depth += 1
+            out.append(ch)
+            i += 1
+            continue
+        if ch == ")":
+            depth = max(0, depth - 1)
+            out.append(ch)
+            i += 1
+            continue
+        if (
+            depth == 0
+            and ch == "["
+            and (i == 0 or text[i - 1] not in ".abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
+        ):
+            close = text.find("]", i)
+            if close > i:
+                out.append(f"{table}.[{text[i + 1:close]}]")
+                i = close + 1
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _session_temp_column_marker(
+    table_norm: str,
+    column: str,
+    default_entity: str,
+    entity_map: dict[str, str] | None,
+) -> str:
+    """Encode ``#session_temp``.col without tracing lineage through its UNION body."""
+    rel = bare_ident(normalize_table_name(table_norm).lstrip("#"))
+    ent = _normalize_entity(default_entity, entity_map)
+    if lineage_keeps_target_hop(ent, rel):
+        return f'"{ent}"."{rel}"."{column}"'
+    return _cross_entity_column_marker(ent, rel, column)
 
 
 def _cross_entity_column_marker(default_entity: str, rel: str, column: str) -> str:

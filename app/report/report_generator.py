@@ -20,8 +20,14 @@ import re
 from lark import Lark, Tree, Token
 
 from app.models.core import CanonicalModel, DDRow, Dialect, JobPlan, SQLObject, StructuralInfo
-from app.report.condition_explainer import explain_expression
-from app.report.process_metadata import build_at_a_glance_lines
+from app.report.process_metadata import build_at_a_glance_lines, reporting_tables_written
+from app.report.rule_narrative import (
+    brief_formula_summary,
+    brief_join_summary,
+    brief_row_condition_summary,
+    build_stakeholder_rule_explanation,
+    executive_business_purpose_line,
+)
 from app.utils.identity import canonical_expression_key, canonical_logical_name
 from app.utils.sql_aliases import (
     collect_known_reference_names,
@@ -432,11 +438,6 @@ def _business_meaning_from_formula(column_name: str, expression: str) -> str:
     return f"SQL-derived logic for {column} based on the listed dependencies."
 
 
-def _is_fallback_business_meaning(rule: "_RuleGroup") -> bool:
-    fallback = _business_meaning_from_formula(rule.column_name, rule.formula).strip()
-    return " ".join(rule.business_meaning.split()).strip() == " ".join(fallback.split()).strip()
-
-
 @dataclass(frozen=True)
 class _RuleGroup:
     rule_id: str
@@ -527,8 +528,12 @@ def _build_rule_groups(dd_rows: list[DDRow], objects: dict[str, SQLObject]) -> l
             formula = resolve_aliases_in_expression(formula, alias_map, quote_replacements=True)
         known_names = _row_known_reference_names(first, objects)
         business_meaning = first.business_meaning.strip() if getattr(first, "business_meaning", "").strip() else ""
-        if not business_meaning:
-            business_meaning = _business_meaning_from_formula(first.column_name, formula)
+        executive = executive_business_purpose_line(first.entity_name, first.column_name, formula)
+        generic = _business_meaning_from_formula(first.column_name, formula)
+        if not business_meaning or " ".join(business_meaning.split()) == " ".join(generic.split()):
+            business_meaning = executive
+        elif executive and len(business_meaning) > 180:
+            business_meaning = executive
         rule_groups.append(
             _RuleGroup(
                 rule_id=rule_id,
@@ -559,11 +564,7 @@ def _rules_by_entity(rule_groups: list[_RuleGroup]) -> list[tuple[str, list[_Rul
 
 
 def _human_readable_explanation(rule: _RuleGroup) -> str:
-    formula = rule.formula or ""
-    explanation = explain_expression(formula)
-    if explanation:
-        return explanation
-    return "This platform condition could not be rendered safely in plain English, but the exact machine-readable condition is preserved above."
+    return build_stakeholder_rule_explanation(rule.entity_name, rule.column_name, rule.formula or "")
 
 
 def _tables_involved_lines(
@@ -642,7 +643,15 @@ def _tables_involved_lines(
         if looks_like_column:
             continue
         filtered_tables.append(table)
-    if not filtered_tables:
+    session_staging = sorted(
+        {
+            t
+            for t in all_tables
+            if (t or "").startswith("#") and not (t or "").startswith("##")
+        }
+    )
+
+    if not filtered_tables and not session_staging:
         return []
 
     lines: list[str] = ["### Tables Involved", ""]
@@ -668,6 +677,12 @@ def _tables_involved_lines(
         used_by = ", ".join(sorted(used_by_names)) or "—"
         lines.append(f"| {table} | {role} | {columns} | {used_by} |")
     lines.append("")
+    if session_staging:
+        tags = ", ".join(f"`{t}`" for t in session_staging)
+        lines.append(
+            f"**Session staging (internal, not exported):** {tags}"
+        )
+        lines.append("")
     return lines
 
 
@@ -1017,13 +1032,17 @@ def _execution_context_lines(rule: _RuleGroup) -> list[str]:
         lines.append("| Step | Line | Scope | Gate | Row condition | Joined via | Value |")
         lines.append("|---|---|---|---|---|---|---|")
         for step in steps:
-            joins = "; ".join(step.join_conditions)
+            row_summary = brief_row_condition_summary(step.row_condition)
+            value_summary = brief_formula_summary(
+                step.assigned_value, column_name=rule.column_name
+            )
+            join_cell = brief_join_summary(step.join_conditions)
             lines.append(
                 f"| {step.step} | {step.source_line or '—'} | {step.scope} | "
                 f"{_flatten_for_table_cell(step.workflow_gate or '') or '—'} | "
-                f"`{_flatten_for_table_cell(step.row_condition) or '(all rows)'}` | "
-                f"{('`' + _flatten_for_table_cell(joins) + '`') if joins else '—'} | "
-                f"`{_flatten_for_table_cell(step.assigned_value)}` |"
+                f"{_flatten_for_table_cell(row_summary)} | "
+                f"{join_cell or '—'} | "
+                f"{_flatten_for_table_cell(value_summary)} |"
             )
         lines.append("")
         for step in steps:
@@ -1083,9 +1102,7 @@ def _rule_card_lines(rule: _RuleGroup, step_number: int | None = None) -> list[s
     lines.extend(_execution_context_lines(rule))
 
     if rule.depends_on:
-        lines.append("**Depends On**")
-        for dep in rule.depends_on:
-            lines.append(f"- {dep}")
+        lines.append("**Depends On:** " + ", ".join(f"`{dep}`" for dep in rule.depends_on))
         lines.append("")
 
     lines.append("---")
@@ -1153,6 +1170,7 @@ def generate_report(
             objects,
             structural_infos,
             business_rule_count=len(rule_groups),
+            dd_rows=list(dd_rows),
         )
     )
 

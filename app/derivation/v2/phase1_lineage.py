@@ -3,6 +3,9 @@
 Builds a symbol map from ``#LocalTable.Column`` → root entity column
 references. Global temps (``##AccountCal``, ``##CUSTOMERCAL``, …) are
 treated as root interface entities and are never traced outside the script.
+
+Non-exportable staging names (``*_BKUP``, ``TEMPTABLE*``, ``CTE_*``) are
+classified via :func:`app.derivation.v2.sql_text.is_staging_derivation_entity`.
 """
 from __future__ import annotations
 
@@ -211,6 +214,18 @@ def _ingest_select_projection(
         lineage.root_entities.add(primary_root)
 
     projections = parse_select_list(select_list)
+    dest_column_names: list[str] = []
+    if explicit_target_columns and len(explicit_target_columns) == len(projections):
+        dest_column_names = [bare_ident(c) for c in explicit_target_columns if bare_ident(c)]
+    else:
+        for src_qual, src_col, dest_alias, _raw in projections:
+            name = bare_ident(dest_alias or src_col or "")
+            if name:
+                dest_column_names.append(name)
+    if dest_column_names and not _is_global_temp(target):
+        lineage.temp_table_columns.setdefault(
+            normalize_table_name(target), dest_column_names
+        )
     if explicit_target_columns and len(explicit_target_columns) == len(projections):
         # Strict zero-indexed ordinal alignment: column Ci pairs ONLY with
         # projection Ei, even when some Ej in between is a CASE/function

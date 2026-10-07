@@ -530,7 +530,7 @@ def _render_submission_tab() -> None:
                 except ValueError as exc:
                     input_error = str(exc)
         else:
-            input_error = "No .sql files were found in samples/sql."
+            input_error = "No .sql files were found in samples/sql/PRO_SPs_Sequenced."
     else:
         pasted_sql = st.text_area(
             "Paste SQL procedure text",

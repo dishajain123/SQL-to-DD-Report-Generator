@@ -4,7 +4,9 @@ import pytest
 
 from app.derivation.v2.ast_compiler import compile_ast_to_4x_string
 from app.derivation.v2.phase3_ast_generator import parse_sql_expression_to_ast
-from app.derivation.v2.sql_text import extract_insert_select
+from app.derivation.v2.pipeline import generate_for_sql
+from app.derivation.v2.sql_text import extract_insert_select, extract_select_into
+from app.grammar.validator import validate_expression
 from app.parsing.sql_lex import normalize_comparison_spacing
 
 
@@ -25,15 +27,107 @@ def test_dateadd_offset_may_contain_commas():
     assert "DPD_Seller" in formula and "ReportDate" in formula
 
 
-def test_dateadd_month_is_flagged_not_silently_mapped():
+def test_dateadd_month_maps_to_period_not_addday():
+    formula = _compile("DATEADD(MONTH, -3, ProcessDate)")
+    assert formula.startswith("PERIOD(")
+    assert '"MONTH"' in formula
+    assert "ADDDAY" not in formula
+    assert "ProcessDate" in formula
+    assert validate_expression(formula).passed
+
+
+def test_dateadd_yy_and_mm_aliases_map_to_period():
+    year = _compile("DATEADD(YY, @SUB_Days, SysNPA_Dt)")
+    month = _compile("DATEADD(MM, @SUB_Days + @DB1_Days, SysNPA_Dt)")
+    assert year.startswith("PERIOD(") and '"YEAR"' in year
+    assert month.startswith("PERIOD(") and '"MONTH"' in month
+    assert validate_expression(year).passed
+    assert validate_expression(month).passed
+
+
+def test_dateadd_week_is_addday_times_seven():
+    formula = _compile("DATEADD(WEEK, 2, ProcessDate)")
+    compact = " ".join(formula.split())
+    assert formula.startswith("ADDDAY(")
+    assert "* 7" in compact or ", 14)" in compact or ",14)" in compact.replace(" ", "")
+    assert validate_expression(formula).passed
+
+
+def test_dateadd_hour_is_still_flagged():
     ast = parse_sql_expression_to_ast(
-        "DATEADD(MONTH, -3, ProcessDate)",
+        "DATEADD(HOUR, 1, ProcessDate)",
         default_entity="AccountCal",
         target_column="X",
     )
     assert ast["function_name"] == "__UNSUPPORTED_SQL__"
-    with pytest.raises(ValueError, match="no exact 4X equivalent"):
+    with pytest.raises(ValueError, match="DATEADD\\(HOUR"):
         compile_ast_to_4x_string(ast)
+
+
+def test_eomonth_two_arg_is_eom_of_period():
+    formula = _compile("EOMONTH(ProcessDate, -3)")
+    compact = formula.replace(" ", "")
+    assert compact.startswith("EOM(PERIOD(")
+    assert '"MONTH"' in formula
+    assert validate_expression(formula).passed
+
+
+def test_nullif_maps_to_if_then_null():
+    formula = _compile("NULLIF(Asset_Norm, 'ALWYS_STD')")
+    compact = formula.replace(" ", "")
+    assert "THEN(NULL)" in compact
+    assert "ALWYS_STD" in formula
+    assert validate_expression(formula).passed
+
+
+def test_scalar_subquery_top_1_lookup_is_column_ref():
+    formula = _compile(
+        "(SELECT TOP 1 AssetClassAlt_Key FROM DimAssetClass "
+        "WHERE AssetClassShortName='LOS' AND EffectiveFromTimeKey<=@TIMEKEY)"
+    )
+    assert "DimAssetClass" in formula
+    assert "AssetClassAlt_Key" in formula
+    assert "TOP" not in formula.upper()
+    assert validate_expression(formula).passed
+
+
+def test_select_into_except_does_not_swallow_anti_join_into_where():
+    sql = """
+    SELECT CustomerAcID INTO #T
+    FROM AdvAcBasicDetail A
+    WHERE A.SourceAlt_Key = 1
+    EXCEPT
+    SELECT CustomerAcID FROM Pro.ContExcsSinceDtAccountCal WHERE EffectiveToTimekey = 49999
+    """
+    entries = extract_select_into(sql)
+    assert entries
+    where = entries[0]["where_clause"]
+    assert "EXCEPT" not in where.upper()
+    assert "SourceAlt_Key" in where
+    assert "49999" not in where
+
+
+def test_npa_erosion_month_aging_folds_to_period():
+    sql = """
+    UPDATE A SET A.SysAssetClassAlt_Key = (
+        CASE WHEN DATEADD(MONTH, @SUB_Days, A.SysNPA_Dt) > @PROCESSDATE
+             THEN (SELECT AssetClassAlt_Key FROM DimAssetClass WHERE AssetClassShortName='SUB')
+             ELSE A.SysAssetClassAlt_Key
+        END)
+    FROM ##CUSTOMERCAL A
+    INNER JOIN DimAssetClass B ON A.SysAssetClassAlt_Key = B.AssetClassAlt_Key
+    WHERE B.AssetClassShortName NOT IN ('STD','LOS')
+      AND A.SysNPA_Dt IS NOT NULL
+    """
+    row, debug = generate_for_sql(sql, "##CUSTOMERCAL", "SysAssetClassAlt_Key", llm_client=None)
+    expr = debug["formula"]
+    assert expr
+    assert "PERIOD(" in expr
+    assert '"MONTH"' in expr
+    assert "ADDDAY" not in expr
+    assert "DimAssetClass" in expr
+    assert validate_expression(expr).passed, validate_expression(expr).errors
+
 
 
 def test_string_agg_is_flagged():

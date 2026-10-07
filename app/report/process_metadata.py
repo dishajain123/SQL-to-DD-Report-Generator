@@ -4,7 +4,8 @@ from __future__ import annotations
 import re
 from typing import Iterable
 
-from app.models.core import CanonicalModel, Dialect, SQLObject, StructuralInfo
+from app.models.core import CanonicalModel, DDRow, Dialect, SQLObject, StructuralInfo
+from app.utils.identity import canonical_logical_name
 
 _HISTORY_TABLE_RE = re.compile(
     r"(?i)(history|hist|audit|trail|log|movement|event)",
@@ -96,13 +97,18 @@ def _format_inputs(objects: Iterable[SQLObject]) -> str:
     return ", ".join(parts) if parts else "None"
 
 
-def _visible_tables(names: Iterable[str]) -> list[str]:
+def _visible_tables(names: Iterable[str], *, include_global_temps: bool = False) -> list[str]:
     visible: list[str] = []
     seen: set[str] = set()
     for name in names:
         table = (name or "").strip()
-        if not table or table.startswith("#") or table.startswith("@"):
+        if not table or table.startswith("@"):
             continue
+        if table.startswith("#"):
+            if include_global_temps and table.startswith("##"):
+                pass
+            else:
+                continue
         bare = table.split(".")[-1]
         if len(bare) <= 2 and bare.isalpha() and "." not in table:
             continue
@@ -112,6 +118,53 @@ def _visible_tables(names: Iterable[str]) -> list[str]:
         seen.add(key)
         visible.append(table)
     return visible
+
+
+def _display_table_label(table: str) -> str:
+    token = (table or "").strip()
+    if token.startswith("##"):
+        return token[2:] or token
+    return token
+
+
+def reporting_tables_written(
+    structural_infos: dict[str, StructuralInfo] | None,
+    object_ids: list[str],
+    dd_rows: list[DDRow] | None = None,
+) -> list[str]:
+    """Business-facing write targets: persistent tables, global cal temps, and DD entities."""
+    names: list[str] = []
+    seen: set[str] = set()
+
+    def add(name: str) -> None:
+        label = _display_table_label(name).strip()
+        if not label:
+            return
+        key = canonical_logical_name(label)
+        if key in seen:
+            return
+        seen.add(key)
+        names.append(label)
+
+    if dd_rows:
+        for row in dd_rows:
+            add(row.entity_name)
+
+    if structural_infos:
+        for oid in object_ids:
+            info = structural_infos.get(oid)
+            if info is None:
+                continue
+            for table in info.tables_written or []:
+                token = (table or "").strip()
+                if token.startswith("##") or not token.startswith("#"):
+                    add(token)
+            for table in (info.columns_written_by_table or {}):
+                token = (table or "").strip()
+                if token.startswith("##") or not token.startswith("#"):
+                    add(token)
+
+    return sorted(names, key=lambda t: canonical_logical_name(t))
 
 
 def _produces_audit_trail(tables: Iterable[str]) -> str:
@@ -126,6 +179,7 @@ def build_at_a_glance_lines(
     objects: dict[str, SQLObject],
     structural_infos: dict[str, StructuralInfo] | None,
     business_rule_count: int,
+    dd_rows: list[DDRow] | None = None,
 ) -> list[str]:
     """Markdown At-a-Glance table for the business report header."""
     object_ids: list[str] = []
@@ -179,19 +233,34 @@ def build_at_a_glance_lines(
         ]
 
     visible_reads = _filter_noise(reads)
-    visible_writes = _visible_tables(writes)
-    audit = _produces_audit_trail([*visible_reads, *visible_writes, *reads, *writes])
+    business_writes = reporting_tables_written(structural_infos, object_ids, dd_rows)
+    read_labels = [_display_table_label(t) for t in visible_reads]
+    tables_written_cell = str(len(business_writes)) if business_writes else "0"
+    tables_read_cell = str(len(read_labels)) if read_labels else "0"
+    audit = _produces_audit_trail([*visible_reads, *business_writes, *reads, *writes])
 
     rows = [
         ("Procedure", f"`{procedure}`"),
         ("Dialect", dialect),
         ("Input", inputs),
         ("Business rules", str(business_rule_count)),
-        ("Tables read", str(len(visible_reads))),
-        ("Tables written", str(len(visible_writes))),
+        ("Tables read", tables_read_cell),
+        ("Tables written", tables_written_cell),
         ("Produces audit trail", audit),
     ]
     lines = ["## At a Glance", "", "| | |", "|---|---|"]
     lines.extend(f"| {label} | {value} |" for label, value in rows)
     lines.append("")
+    if read_labels:
+        lines.append(
+            "**Tables read:** "
+            + ", ".join(f"`{name}`" for name in sorted(read_labels, key=str.upper))
+        )
+        lines.append("")
+    if business_writes:
+        lines.append(
+            "**Tables written:** "
+            + ", ".join(f"`{name}`" for name in business_writes)
+        )
+        lines.append("")
     return lines

@@ -484,7 +484,7 @@ def test_report_resolves_aliases_to_source_table_names(tmp_path):
 
     assert '"ACCOUNTCAL"."AccountEntityID"' in text
     assert "a.AccountEntityID" not in text
-    assert "Depends On" in text
+    assert "**Depends On:**" in text
     assert "ACCOUNTCAL.AccountEntityID" in text
 
 

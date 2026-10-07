@@ -152,7 +152,11 @@ def _compile_sql(
         node = parse_sql_expression_to_ast(
             sql, default_entity=entity, target_column=column, as_condition=as_condition
         )
-        return format_expression_syntax(compile_ast_to_4x_string(node))
+        return format_expression_syntax(
+            compile_ast_to_4x_string(
+                node, target_entity=entity, target_column=column
+            )
+        )
     except Exception:  # an unparseable step is still worth listing verbatim
         return " ".join(sql.split())
 

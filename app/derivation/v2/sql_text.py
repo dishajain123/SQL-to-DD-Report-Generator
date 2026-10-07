@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from bisect import bisect_left
 from dataclasses import dataclass
 from functools import lru_cache
@@ -43,10 +44,44 @@ def _strip_sql_comments_with_map(sql: str) -> tuple[str, list[int]]:
     return _strip_sql_comments_impl(sql or "", with_map=True)
 
 
+def normalize_unicode_space_separators(sql: str) -> str:
+    """Map Unicode space separators (SSMS/Word paste) to ASCII space outside literals."""
+    if not sql:
+        return sql
+    out: list[str] = []
+    in_single = False
+    i = 0
+    n = len(sql)
+    while i < n:
+        ch = sql[i]
+        if in_single:
+            out.append(ch)
+            if ch == "'" and i + 1 < n and sql[i + 1] == "'":
+                out.append(sql[i + 1])
+                i += 2
+                continue
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if ch == "'":
+            in_single = True
+            out.append(ch)
+            i += 1
+            continue
+        if unicodedata.category(ch) == "Zs" and ch not in "\n\r\t":
+            out.append(" ")
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _strip_sql_comments_impl(sql: str, *, with_map: bool) -> tuple[str, list[int]]:
     # Keep source coordinates stable across all scanners, including nested
     # comments. Normalize comparison tokens in code only; parse_statement
     # records these recoveries for the completeness/review gate.
+    sql = normalize_unicode_space_separators(sql)
     text, _ = normalize_comparison_spacing(sql)
     text = mask_sql(text, quotes=False)
     return text, list(range(len(sql))) if with_map else []
@@ -118,13 +153,41 @@ def normalize_table_name(name: str) -> str:
     return text
 
 
+def is_staging_derivation_entity(entity: str) -> bool:
+    """Non-exportable intermediate objects (backup temps, CTE shells, scratch tables).
+
+    Global interface temps (``##AccountCal`` / ``##CustomerCal``) are **not**
+    staging — they are business derivation targets. Session-local ``#temp``
+    tables (single hash, including ``TEMPDB..#FOO``) are always staging.
+    """
+    raw = (entity or "").strip().strip('"')
+    token = raw.split(".")[-1].strip("[]") if raw else ""
+    if token.startswith("#") and not token.startswith("##"):
+        return True
+    name = normalize_table_name(entity or "").upper().lstrip("#")
+    if not name:
+        return False
+    if name.endswith("_BKUP"):
+        return True
+    if name.startswith("CTE_"):
+        return True
+    if name.startswith("TEMPTABLE"):
+        return True
+    if name in {"TEMPTABLEDPD", "TEMPTABLENPA"}:
+        return True
+    # Session scratch tables in PRO SPs (not the ``TEMPLATE`` spelling).
+    if name.startswith("TEMP") and name != "TEMPLATE":
+        return True
+    return False
+
+
 def lineage_keeps_target_hop(entity: str, relationship: str | None = None) -> bool:
     """Whether a column ref should keep target→hop→column in compiled 4X.
 
-    ACCOUNTCAL derivations that read sibling cal/global-temp hops keep the
-    three-part path (``"ACCOUNTCAL"."CUSTOMERCAL"."RiskFlag"``). CUSTOMERCAL
-    (and other non-ACCOUNTCAL targets) collapse to the physical source table
-    (``"CUSTOMERBASICDETAIL"."CustomerEntityID"``).
+    Only **sibling** ``##AccountCal`` / ``##CustomerCal`` interface reads use the
+    three-part path (``"ACCOUNTCAL"."CUSTOMERCAL"."RiskFlag"``). Joined physical
+    tables (``PUI_CAL``, ``AdvAcRestructureCal``), session ``#temp`` tables, and
+    derived subquery aliases (``C``) collapse to the joined source entity in 4X.
     """
     ent = normalize_table_name(entity or "").upper().lstrip("#")
     if ent.endswith("CUSTOMERCAL"):
@@ -134,13 +197,92 @@ def lineage_keeps_target_hop(entity: str, relationship: str | None = None) -> bo
         if relationship
         else ""
     )
-    if ent.endswith("ACCOUNTCAL") and rel:
+    if not rel:
+        return False
+    if ent.endswith("ACCOUNTCAL") and rel.endswith("CUSTOMERCAL"):
+        return True
+    if ent.endswith("CUSTOMERCAL") and rel.endswith("ACCOUNTCAL"):
         return True
     return False
 
 
+def is_ephemeral_sql_alias(name: str) -> bool:
+    """Statement-local alias (``A``, ``B``, ``C``) — not a physical entity name."""
+    text = bare_ident(name or "")
+    if not text or text.startswith("#") or text.startswith("@"):
+        return False
+    if len(text) > 3:
+        return False
+    return bool(re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", text))
+
+
+def should_collapse_target_join_hop(
+    entity: str,
+    relationship: str | None,
+    target_entity: str | None,
+) -> bool:
+    """Whether ``Target.Rel.Col`` should compile as ``Rel.Col`` (drop target prefix)."""
+    if not relationship or not target_entity:
+        return False
+    ent = normalize_table_name(entity or "").upper().lstrip("#")
+    tgt = normalize_table_name(target_entity or "").upper().lstrip("#")
+    if ent != tgt:
+        return False
+    if lineage_keeps_target_hop(entity, relationship):
+        return False
+    if is_ephemeral_sql_alias(relationship):
+        return False
+    return True
+
+
 def bare_ident(name: str) -> str:
     return (name or "").strip().strip("[]").strip('"').strip()
+
+
+def _parse_simple_select_projection(select_item: str) -> tuple[str | None, str]:
+    """Parse one SELECT-list item into ``(optional_table_qualifier, column_name)``.
+
+    Supports bracketed identifiers with spaces (``[Account No]``) and
+    ``Table.[Account No]`` forms common in staging / upload tables.
+    """
+    text = (select_item or "").strip()
+    text = re.sub(r"(?is)^DISTINCT\s+", "", text)
+    text = re.sub(
+        r"(?is)^TOP\s+\(?\s*\d+\s*\)?\s+(?:PERCENT\s+)?",
+        "",
+        text,
+    )
+    m = re.match(
+        r"(?is)^(?:\[?(?P<table>[^.\]]+)\]?\.)?\[?(?P<col>[^\]]+)\]?\s*$",
+        text,
+    )
+    if not m:
+        return None, bare_ident(text)
+    table = bare_ident(m.group("table")) if m.group("table") else None
+    return table, bare_ident(m.group("col"))
+
+
+def _qualify_predicate_columns(predicate: str, table: str) -> str:
+    """Qualify bare and bracketed column tokens with a subquery source table."""
+    text = _qualify_bare_columns(predicate or "", table)
+    table_norm = normalize_table_name(table)
+
+    def repl_bracket(match: re.Match[str]) -> str:
+        col = match.group(1).strip()
+        if not col or col.startswith("@"):
+            return match.group(0)
+        return f"{table_norm}.{col}"
+
+    return re.sub(r"(?<![.\w\]])\[([^\]]+)\](?!\s*\()", repl_bracket, text)
+
+
+def _sql_column_ref(table: str, column: str) -> str:
+    """Render ``table.column`` for bracketed or spaced identifiers."""
+    col = bare_ident(column)
+    tbl = normalize_table_name(table)
+    if re.search(r"(?i)[^\w]", col):
+        return f"{tbl}.[{col}]"
+    return f"{tbl}.{col}"
 
 
 # One to three dotted parts: Table, Schema.Table, Db.Schema.Table (each
@@ -764,12 +906,37 @@ def exists_condition_to_row_predicate(condition: str | None) -> str | None:
     pred = _extract_where_predicate(inner)
     if not pred:
         return None
-    # Drop trailing GROUP BY / ORDER BY; keep HAVING as AND-able fragment when present.
+    _, from_rest = _split_select_list(inner)
+    from_table = _first_from_table(from_rest) if from_rest else None
+    alias_map = _alias_map_from_from_clause(from_rest)
+    # Drop trailing GROUP BY / ORDER BY; keep non-aggregate HAVING only.
     having = _extract_having_clause(pred)
     pred = _strip_group_order(pred)
+    pred = _rewrite_qualified_aliases(pred, alias_map)
+    if having and re.search(r"(?is)\b(COUNT|SUM|AVG|MIN|MAX)\s*\(", having):
+        having = None
+    if from_table:
+        pred = _qualify_predicate_columns(pred, from_table)
+        if having:
+            having = _rewrite_qualified_aliases(having, alias_map)
+            having = _qualify_predicate_columns(having, from_table)
     if having:
         return f"({pred}) AND ({having})" if pred else having
     return pred.strip() or None
+
+
+def exists_subquery_to_row_predicate(condition: str | None) -> tuple[str | None, list[str]]:
+    """Project ``EXISTS (SELECT …)`` to a row predicate and dependency refs."""
+    if not condition:
+        return None, []
+    text = condition.strip()
+    if not re.match(r"(?is)^EXISTS\s*\(", text):
+        return text, []
+    deps = extract_subquery_dependency_refs(text)
+    pred = exists_condition_to_row_predicate(text)
+    if pred and not re.match(r"(?is)^EXISTS\b", pred.strip()):
+        return pred, deps
+    return None, deps
 
 
 def in_subquery_to_row_predicate(lhs: str, subquery: str) -> tuple[str | None, list[str]]:
@@ -796,22 +963,19 @@ def in_subquery_to_row_predicate(lhs: str, subquery: str) -> tuple[str | None, l
 
     parts: list[str] = []
     proj = (select_list or "").strip()
-    # Single projected identifier (optionally qualified)
-    proj_col = None
-    proj_m = re.match(
-        r"(?is)^(?:DISTINCT\s+)?(?:\[?#?#?[A-Za-z_][A-Za-z0-9_]*\]?\.)?(?P<col>\[?[A-Za-z_][A-Za-z0-9_]*\]?)\s*$",
-        proj,
-    )
-    if proj_m and lhs.strip():
-        proj_col = bare_ident(proj_m.group("col"))
-        if from_table:
-            parts.append(f"{normalize_table_name(from_table)}.{proj_col} = {lhs.strip()}")
+    table_qual, proj_col = _parse_simple_select_projection(proj)
+    if proj_col and lhs.strip():
+        src_table = table_qual or (normalize_table_name(from_table) if from_table else "")
+        if src_table:
+            parts.append(f"{_sql_column_ref(src_table, proj_col)} = {lhs.strip()}")
         else:
             parts.append(f"{proj_col} = {lhs.strip()}")
 
     if where_pred:
+        alias_map = _alias_map_from_from_clause(rest)
+        where_pred = _rewrite_qualified_aliases(where_pred, alias_map)
         if from_table:
-            where_pred = _qualify_bare_columns(where_pred, from_table)
+            where_pred = _qualify_predicate_columns(where_pred, from_table)
         parts.append(f"({where_pred})")
     # HAVING with aggregates is not row-level 4X — keep deps, skip the clause.
     if having and not re.search(r"(?is)\b(COUNT|SUM|AVG|MIN|MAX)\s*\(", having):
@@ -822,29 +986,94 @@ def in_subquery_to_row_predicate(lhs: str, subquery: str) -> tuple[str | None, l
     return " AND ".join(parts), deps
 
 
-def _qualify_bare_columns(predicate: str, table: str) -> str:
-    """Prefix bare column identifiers with ``table.`` for cross-entity resolution."""
-    table_norm = normalize_table_name(table)
-    keywords = {
-        "AND", "OR", "NOT", "IS", "NULL", "IN", "EXISTS", "BETWEEN", "LIKE",
-        "CASE", "WHEN", "THEN", "ELSE", "END", "TRUE", "FALSE",
-    }
+def dim_asset_class_in_use_hop_only(subquery: str) -> str | None:
+    """When ``IN (SELECT … FROM DimAssetClass WHERE ShortName='X')``, return ``X``."""
+    body = (subquery or "").strip()
+    if not re.search(r"(?is)\bDimAssetClass\b", body):
+        return None
+    match = re.search(
+        r"(?is)AssetClassShortName(?:Enum)?\s*=\s*'([^']+)'",
+        body,
+    )
+    if not match:
+        return None
+    return bare_ident(match.group(1)).upper()
+
+
+_SUBQUERY_KEYWORDS = {
+    "AND", "OR", "NOT", "IS", "NULL", "IN", "EXISTS", "BETWEEN", "LIKE",
+    "CASE", "WHEN", "THEN", "ELSE", "END", "TRUE", "FALSE",
+    "SELECT", "FROM", "WHERE", "GROUP", "ORDER", "HAVING", "JOIN", "ON",
+    "AS", "DISTINCT", "TOP", "BY", "UNION", "ALL", "INNER", "LEFT",
+    "RIGHT", "FULL", "OUTER", "CROSS", "APPLY",
+}
+
+
+def _alias_map_from_from_clause(from_rest: str) -> dict[str, str]:
+    """``{ALIAS_OR_TABLE: physical_table}`` from a subquery FROM/JOIN list."""
+    mapping: dict[str, str] = {}
+    for table, alias, _on in parse_from_join_clause(from_rest or ""):
+        if not table:
+            continue
+        mapping[table.upper()] = table
+        mapping[normalize_table_name(table).upper()] = table
+        if alias:
+            mapping[alias.upper()] = table
+    return mapping
+
+
+def _rewrite_qualified_aliases(pred: str, alias_to_table: dict[str, str]) -> str:
+    """Rewrite ``alias.col`` using the subquery's own FROM aliases."""
+    if not pred or not alias_to_table:
+        return pred or ""
 
     def repl(match: re.Match[str]) -> str:
-        token = match.group(0)
-        if token.upper() in keywords:
-            return token
-        if token.startswith("@") or token.startswith("#"):
-            return token
-        # Already qualified or function name followed by (
-        return f"{table_norm}.{token}"
+        qual = match.group("qual")
+        col = match.group("col")
+        table = alias_to_table.get(qual.upper())
+        if not table:
+            return match.group(0)
+        return _sql_column_ref(table, col)
 
-    # Only replace identifiers that are not already qual.col and not after '.'
     return re.sub(
-        r"(?<![.\w])(@?[A-Za-z_][A-Za-z0-9_]*)\b(?!\s*\()",
+        r"(?P<qual>[#A-Za-z_][A-Za-z0-9_]*)\.(?P<col>\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_]*)",
         repl,
-        predicate or "",
+        pred,
     )
+
+
+def _qualify_bare_columns(predicate: str, table: str) -> str:
+    """Prefix bare column identifiers with ``table.`` for cross-entity resolution.
+
+    Never rewrites an identifier that is already a qualifier (``A.col`` or
+    ``Entity::Col``) — those are aliases / phase-2 markers, not columns of
+    ``table``. String literals are left untouched so ``AssetClassShortName='LOS'``
+    does not become ``'DimAssetClass.LOS'``.
+    """
+    table_norm = normalize_table_name(table)
+    segments = re.split(r"('(?:''|[^'])*')", predicate or "")
+    out: list[str] = []
+    for seg in segments:
+        if seg.startswith("'"):
+            out.append(seg)
+            continue
+
+        def repl(match: re.Match[str]) -> str:
+            token = match.group(0)
+            if token.upper() in _SUBQUERY_KEYWORDS:
+                return token
+            if token.startswith("@") or token.startswith("#"):
+                return token
+            return f"{table_norm}.{token}"
+
+        out.append(
+            re.sub(
+                r"(?<![.\w:])(@?[A-Za-z_][A-Za-z0-9_]*)\b(?!\s*(?:\(|\.|::))",
+                repl,
+                seg,
+            )
+        )
+    return "".join(out)
 
 
 def extract_subquery_dependency_refs(sql_fragment: str) -> list[str]:
@@ -1048,6 +1277,14 @@ def extract_merge_using_row_predicate(using_body: str) -> str | None:
     text = (using_body or "").strip()
     if not text:
         return None
+    # ``USING (SELECT …) S`` / ``… ) AS Source`` — the alias sits after the
+    # subquery's closing paren, so a naive outer-paren strip never runs and
+    # ``WHERE`` inside the subquery is missed (depth > 0).
+    text = re.sub(
+        r"(?is)\)\s*(?:AS\s+)?[A-Za-z_][A-Za-z0-9_]*\s*$",
+        ")",
+        text,
+    ).strip()
     if text.startswith("(") and text.endswith(")") and _parens_balanced(text[1:-1]):
         text = text[1:-1].strip()
     if not re.search(r"(?is)\bSELECT\b", text):
@@ -1277,19 +1514,22 @@ def extract_select_into(sql: str) -> list[dict[str, str]]:
         if from_match:
             pos = from_match.end()
             from_clause, pos = _read_until_keyword(
-                text, pos, {"WHERE", "GROUP", "ORDER", "HAVING"}, stop_at_statement=True
+                text, pos, {"WHERE", "GROUP", "ORDER", "HAVING", "EXCEPT", "INTERSECT", "UNION"},
+                stop_at_statement=True,
             )
         where_match = _WS_WHERE_KW.match(text, pos)
         if where_match:
             pos = where_match.end()
             where_clause, pos = _read_until_keyword(
-                text, pos, {"GROUP", "ORDER", "HAVING"}, stop_at_statement=True
+                text, pos, {"GROUP", "ORDER", "HAVING", "EXCEPT", "INTERSECT", "UNION"},
+                stop_at_statement=True,
             )
         group_match = _WS_GROUP_BY_KW.match(text, pos)
         if group_match:
             pos = group_match.end()
             group_by_clause, pos = _read_until_keyword(
-                text, pos, {"ORDER", "HAVING"}, stop_at_statement=True
+                text, pos, {"ORDER", "HAVING", "EXCEPT", "INTERSECT", "UNION"},
+                stop_at_statement=True,
             )
         results.append(
             {
@@ -1371,6 +1611,18 @@ def parse_select_list(
             )
             if alias_m:
                 alias = bare_ident(alias_m.group("alias"))
+            if alias is None or alias.upper() == "END":
+                # ``CASE … END AS Col`` / ``CASE … END Col``: the alias follows
+                # the closing END, not a ``)`` (without it the projection's
+                # output column was dropped from the temp table's schema).
+                end_alias_m = re.search(
+                    r"(?is)\bEND\s+(?:AS\s+)?(?P<alias>\[?[A-Za-z_][A-Za-z0-9_]*\]?)\s*$",
+                    chunk,
+                )
+                if end_alias_m and bare_ident(end_alias_m.group("alias")).upper() != "END":
+                    alias = bare_ident(end_alias_m.group("alias"))
+                elif alias is not None and alias.upper() == "END":
+                    alias = None
             results.append((None, None, eq_alias or alias, chunk))
             continue
         match = _SELECT_ITEM_COL_AS_RE.fullmatch(chunk)
@@ -1638,7 +1890,7 @@ def _extract_all_insert_select(sql: str) -> list[dict[str, str]]:
         # a dangling ``UNION ALL`` (which surfaced as an untranslated value).
         while True:
             select_list, pos = _read_until_keyword(
-                text, pos, {"FROM", "UNION"}, stop_at_statement=True
+                text, pos, {"FROM", "UNION", "EXCEPT", "INTERSECT"}, stop_at_statement=True
             )
             from_body = ""
             where_clause = ""
@@ -1647,13 +1899,15 @@ def _extract_all_insert_select(sql: str) -> list[dict[str, str]]:
                 from_body, pos = _read_until_keyword(
                     text,
                     pos,
-                    {"WHERE", "GROUP", "ORDER", "HAVING", "UNION"},
+                    {"WHERE", "GROUP", "ORDER", "HAVING", "UNION", "EXCEPT", "INTERSECT"},
                     stop_at_statement=True,
                 )
             if _WHERE_KW.match(text, pos):
                 pos += len("WHERE")
                 where_clause, pos = _read_until_keyword(
-                    text, pos, {"GROUP", "ORDER", "HAVING", "UNION"}, stop_at_statement=True
+                    text, pos,
+                    {"GROUP", "ORDER", "HAVING", "UNION", "EXCEPT", "INTERSECT"},
+                    stop_at_statement=True,
                 )
             results.append(
                 {

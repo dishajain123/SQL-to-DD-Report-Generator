@@ -969,10 +969,13 @@ def test_plain_scalar_subquery_resolves_to_column_ref():
         target_column="FinalAssetClassAlt_Key",
     )
     assert node["type"] == "COLUMN_REF"
-    assert node["entity"] == "DimAssetClass"
+    assert node["entity"] == "CustomerCal"
+    assert node["relationship"] == "STD"
     assert node["column"] == "AssetClassAlt_Key"
-    formula = compile_ast_to_4x_string(node)
-    assert formula == '"DimAssetClass"."AssetClassAlt_Key"'
+    formula = compile_ast_to_4x_string(
+        node, target_entity="CustomerCal", target_column="FinalAssetClassAlt_Key"
+    )
+    assert formula == '"CustomerCal"."STD"."AssetClassAlt_Key"'
     assert validate_expression(formula).valid
 
 
@@ -993,6 +996,73 @@ def test_unresolvable_exists_subquery_raises_instead_of_always_true():
         compile_ast_to_4x_string(node)
 
 
+def test_exists_subquery_projects_qualified_row_predicate():
+    node = parse_sql_expression_to_ast(
+        "EXISTS(SELECT 1 FROM PRO.ACCOUNTCAL_Hist WHERE EffectiveFromTimeKey>@TIMEKEY)",
+        default_entity="AccountCal",
+        target_column="DegReason",
+        as_condition=True,
+    )
+    assert node.get("function_name") != "__UNRESOLVED_SUBQUERY_PREDICATE__"
+    formula = compile_ast_to_4x_string(
+        node, target_entity="AccountCal", target_column="DegReason"
+    )
+    assert validate_expression(formula).valid, formula
+    assert "EffectiveFromTimeKey" in formula
+
+
+def test_not_in_subquery_bracketed_column_projects_row_predicate():
+    node = parse_sql_expression_to_ast(
+        "B.[Account No] NOT IN (SELECT [Account No] FROM Manual_NPA)",
+        default_entity="AccountCal",
+        target_column="DegReason",
+        as_condition=True,
+    )
+    assert node.get("function_name") != "__UNRESOLVED_SUBQUERY_PREDICATE__"
+    formula = compile_ast_to_4x_string(
+        node, target_entity="AccountCal", target_column="DegReason"
+    )
+    assert validate_expression(formula).valid, formula
+    assert "Manual_NPA" in formula
+    assert "Account" in formula
+
+
+def test_manual_upgrade_where_with_not_in_subquery_parses():
+    where = (
+        "VALID_UPTO>='2021-10-25' and Manual_Upgrade.[Account No] "
+        "not in(select [Account No] from Manual_NPA)"
+    )
+    node = parse_sql_expression_to_ast(
+        where,
+        default_entity="AccountCal",
+        target_column="DegReason",
+        as_condition=True,
+    )
+    assert node.get("function_name") != "__UNRESOLVED_SUBQUERY_PREDICATE__"
+    formula = compile_ast_to_4x_string(
+        node, target_entity="AccountCal", target_column="DegReason"
+    )
+    assert validate_expression(formula).valid, formula
+
+
+def test_insert_rbl_account_cal_degreason_is_non_empty_under_budget():
+    from pathlib import Path
+
+    from app.derivation.v2.pipeline import generate_for_sql
+
+    sql_path = (
+        Path(__file__).resolve().parents[3]
+        / "samples/sql/PRO_SPs_Sequenced/01_S00_PRO.InsertDataforAssetClassficationRBL.StoredProcedure.sql"
+    )
+    sql = sql_path.read_text(encoding="utf-8", errors="replace")
+    row, debug = generate_for_sql(sql, "AccountCal", "DegReason", llm_client=None)
+    formula = debug.get("formula") or row.display_derivation_expression or ""
+    assert formula, row.validation_errors
+    assert len(formula) <= 8000, len(formula)
+    assert validate_expression(formula).valid, validate_expression(formula).errors
+    assert not row.validation_errors
+
+
 def test_plain_scalar_subquery_inside_case_else_branch():
     """The lookup subquery shape from PRO.Final_AssetClass_Npadate: a CASE
     ELSE branch falling back to a DimAssetClass key lookup."""
@@ -1007,9 +1077,11 @@ def test_plain_scalar_subquery_inside_case_else_branch():
     )
     assert node["type"] == "IF_THEN_ELSE"
     assert node["else_branch"]["type"] == "COLUMN_REF"
-    assert node["else_branch"]["entity"] == "DimAssetClass"
-    formula = compile_ast_to_4x_string(node)
-    assert '"DimAssetClass"."AssetClassAlt_Key"' in formula
+    assert node["else_branch"]["relationship"] == "STD"
+    formula = compile_ast_to_4x_string(
+        node, target_entity="AccountCal", target_column="FinalAssetClassAlt_Key"
+    )
+    assert '"AccountCal"."STD"."AssetClassAlt_Key"' in formula
     assert validate_expression(formula).valid, formula
 
 

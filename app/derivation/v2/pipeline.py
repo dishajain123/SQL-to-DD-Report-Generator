@@ -21,12 +21,17 @@ from app.derivation.v2.ast_compiler import (
 )
 from app.derivation.v2.execution_steps import build_execution_steps, is_identity_write
 from app.derivation.v2.phase1_lineage import LineageMap, build_lineage_map
-from app.derivation.v2.phase2_mutation_folder import MutationPass, MutationSourceIndex, fold_column_mutations
+from app.derivation.v2.phase2_mutation_folder import (
+    MutationPass,
+    MutationSourceIndex,
+    _written_columns_by_table,
+    fold_column_mutations,
+)
 from app.derivation.v2.phase3_ast_generator import generate_ast
 from app.derivation.derivation_option import format_expression_syntax
 from app.derivation.v2.phase4_metadata import build_metadata, metadata_to_dd_row
 from app.derivation.v2.semantic_checks import mutation_semantic_errors
-from app.derivation.v2.sql_text import extract_declared_column_types, normalize_table_name
+from app.derivation.v2.sql_text import extract_declared_column_types, is_staging_derivation_entity, normalize_table_name
 from app.models.core import (
     CanonicalModel,
     DDRow,
@@ -290,6 +295,13 @@ def _derive_column(
             "exact behaviour needs a platform workflow step that evaluates the gate."
         )
 
+    if is_staging_derivation_entity(entity):
+        advisories.append(
+            f"{entity}.{column} is written on an intermediate staging/backup object "
+            "(temp table, CTE alias, or *_BKUP); it is not a core Data Dictionary "
+            "export target — formula completeness is best-effort."
+        )
+
     declared_types = extract_declared_column_types(sql_text)
     declared = _declared_column_type(declared_types, fold_entity or entity, entity, column=column)
     data_type = (
@@ -372,7 +384,23 @@ def _build_column_jobs(
             lineage_by_oid[oid] = build_lineage_map(obj.raw_sql, entity_name_map)
 
         source_index = MutationSourceIndex.build(obj.raw_sql)
-        columns_by_table = info.columns_written_by_table or {}
+        columns_by_table = dict(info.columns_written_by_table or {})
+        # sqlglot occasionally omits SET targets on complex UPDATEs; the regex
+        # mutation index still sees columns like AccountCal.FinalAssetClassAlt_Key.
+        for table_key, col_names in _written_columns_by_table(
+            source_index, lineage_by_oid[oid], entity_name_map
+        ).items():
+            display_table = table_key
+            for existing in columns_by_table:
+                if normalize_table_name(existing).upper() == table_key.upper():
+                    display_table = existing
+                    break
+            bucket = columns_by_table.setdefault(display_table, [])
+            upper_seen = {c.upper() for c in bucket}
+            for col in sorted(col_names):
+                if col.upper() not in upper_seen:
+                    bucket.append(col)
+                    upper_seen.add(col.upper())
         # The same logical column is often written under case-variant spellings
         # (``Asset_Norm`` / ``ASSET_NORM``, ``##AccountCal`` / ``##ACCOUNTCAL``).
         # Mutation folding is case-insensitive, so one job covers all spellings;
