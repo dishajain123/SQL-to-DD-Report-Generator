@@ -121,6 +121,11 @@ def _resolve_column_entity_for_compile(entity: str, column: str) -> str:
 
 def _quote_entity_for_4x(entity: str) -> str:
     """Quote a physical entity for 4X, preserving ``#`` on session scratch tables."""
+    raw = (entity or "").strip()
+    if raw.startswith("#") and not raw.startswith("##"):
+        # A session temp that shares its bare name with a permanent table keeps its
+        # ``#`` so the two stay distinct entities.
+        return f'"#{_clean_entity_qualifier(raw)}"'
     clean = _clean_entity_qualifier(entity)
     if is_staging_derivation_entity(clean) and not clean.startswith("##"):
         base = clean.lstrip("#")
@@ -206,6 +211,11 @@ def _compile_ast_to_4x_string(node: dict[str, Any] | None) -> str:
         # distribute_if_over_comparisons); never wrap value-IFs in comparisons.
         wrap_left = node["left"].get("type") in {"BINARY_OP"} and not _PLAIN_NUMBER_RE.fullmatch(left)
         wrap_right = node["right"].get("type") in {"BINARY_OP"} and not _PLAIN_NUMBER_RE.fullmatch(right)
+        if operator in {"+", "-", "*", "/"}:
+            # ``IF(..)THEN(..)ELSE(0) + IF(..)…`` is ambiguous without grouping:
+            # the ``+`` would read as part of the first IF's ELSE value.
+            wrap_left = wrap_left or node["left"].get("type") == "IF_THEN_ELSE"
+            wrap_right = wrap_right or node["right"].get("type") == "IF_THEN_ELSE"
         if wrap_left:
             left = f"({left})"
         if wrap_right:
@@ -285,7 +295,7 @@ def _compile_ast_to_4x_string(node: dict[str, Any] | None) -> str:
     if node_type == "COLUMN_REF":
         column = str(node.get("column") or "").strip()
         entity = _resolve_column_entity_for_compile(
-            _clean_entity_qualifier(str(node.get("entity") or "").strip()),
+            _clean_keep_session_hash(str(node.get("entity") or "").strip()),
             column,
         )
         relationship = node.get("relationship")
@@ -300,7 +310,7 @@ def _compile_ast_to_4x_string(node: dict[str, Any] | None) -> str:
         if not relationship and _looks_like_numeric_decimal_parts(entity, column):
             return f"{entity}.{column}"
         if relationship:
-            relationship = _clean_entity_qualifier(str(relationship))
+            relationship = _clean_keep_session_hash(str(relationship))
             if _is_at_variable(relationship):
                 return _compile_at_variable(relationship)
             if relationship.upper() == entity.upper():
@@ -466,6 +476,19 @@ def _format_numeric_literal(value: Any) -> str:
 _KNOWN_SCHEMA_PREFIXES = {"PRO", "DBO", "SYS", "TEMPDB"}
 
 
+def _clean_keep_session_hash(text: str) -> str:
+    """``_clean_entity_qualifier`` that keeps a single ``#`` (session temp).
+
+    A session temp sharing its bare name with a permanent table is exported as
+    ``#X``; stripping the hash here would print it as the permanent ``X``.
+    """
+    raw = (text or "").strip()
+    cleaned = _clean_entity_qualifier(raw)
+    if raw.startswith("#") and not raw.startswith("##") and cleaned and not cleaned.startswith("#"):
+        return f"#{cleaned}"
+    return cleaned
+
+
 def _clean_entity_qualifier(text: str) -> str:
     """Strip redundant/duplicated schema and entity qualifiers.
 
@@ -627,12 +650,24 @@ def _compile_if_then_else(node: dict[str, Any]) -> str:
             merged.append((cond, then_b))
     deduped = merged
 
+    default_text = (
+        _compile_ast_to_4x_string(_repair_value_branch(default_node)) if has_else else None
+    )
+    if default_text is not None:
+        # A trailing arm that yields the same text as the ELSE is dead weight:
+        # ``IF(c)THEN(x)ELSE(x)`` is just ``x`` (the two ``x`` can differ in the
+        # tree — hop vs. bare column, int vs. float — yet print identically).
+        while deduped and deduped[-1][1] == default_text:
+            deduped.pop()
+        if not deduped:
+            return default_text
+
     first_cond, first_then = deduped[0]
     parts = [f"IF({first_cond})THEN({first_then})"]
     for cond, then_b in deduped[1:]:
         parts.append(f"ELSEIF({cond})THEN({then_b})")
-    if has_else:
-        parts.append(f"ELSE({_compile_ast_to_4x_string(_repair_value_branch(default_node))})")
+    if default_text is not None:
+        parts.append(f"ELSE({default_text})")
     return "".join(parts)
 
 
@@ -672,11 +707,12 @@ _NAME_TYPE_HINTS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (DATA_TYPE_INTEGER, re.compile(
         # (?<!AC)(?<!DIS): "Account" / "Discount" are not counters.
         r"(?i)(DAYS$|_DAYS_|(?<!AC)(?<!DIS)COUNT$|CNT$|_KEY$|ALTKEY$|TIMEKEY|QTY$|"
-        r"SEQ$|STEP$|RANK$|YEARS$|MONTHS$)"
+        r"SEQ$|STEP$|RANK$|YEARS$|MONTHS$|^DPD_|^REFPERIOD)"
     )),
     (DATA_TYPE_DECIMAL, re.compile(
         r"(?i)(AMT|AMOUNT|(?<!GLO)BAL$|BALANCE|PENAL|INTEREST|RATE$|PCT|PERCENT|RATIO|PRINCIPAL|"
-        r"EXPOSURE|PROVISION|LIMIT$|VALUE$|PRICE|FEE$|FEES$|CHARGE)"
+        r"EXPOSURE|PROVISION|PROVSECURED|PROVUNSECURED|PROVCOVER|PROVDFV|"
+        r"LIMIT$|VALUE$|PRICE|FEE$|FEES$|CHARGE)"
     )),
     (DATA_TYPE_STRING, re.compile(
         r"(?i)(FLAG|FLG$|YN$|CODE$|TYPE$|BUCKET|STATUS|NAME$|CLASS$|REASON|DESC|MESSAGE|"

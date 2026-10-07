@@ -234,6 +234,8 @@ def build_ast_from_mutations(
     independent_arms: list[tuple[int, int, dict[str, Any], dict[str, Any]]] = []
     independent_base: dict[str, Any] | None = None
     skipped_set_based_source = False
+    deferred_clamps: list[tuple[str, str, dict[str, Any], list[dict[str, Any]]]] = []
+    saw_floor_clamp = False
 
     for segment in _segment_mutations_by_control_flow(mutations):
         group_id = segment[0].control_branch_group if segment else None
@@ -285,6 +287,21 @@ def build_ast_from_mutations(
                     target_entity,
                     target_column,
                 )
+                # ``SET Col = Bound WHERE Col > Bound`` (cap) on a running multi-pass
+                # total: apply it once, over the final total. Folding each cap in
+                # place tests a stale ``Col`` (the deep prior is not inlined into
+                # guards) and repeats identical caps.
+                clamp = _classify_total_clamp(raw_cond, then_node, target_entity, target_column)
+                if clamp is not None and clamp[0] == "floor":
+                    saw_floor_clamp = True
+                if (
+                    clamp is not None
+                    and clamp[0] == "cap"
+                    and isinstance(ast, dict)
+                    and _nested_if_depth(ast) >= 1
+                ):
+                    deferred_clamps.append(clamp)
+                    continue
                 collapsed_ast = None
                 if self_ref_chain and self_ref_chain_base is not None:
                     if self_ref_chain_class == "A":
@@ -372,6 +389,36 @@ def build_ast_from_mutations(
                 independent_arms = []
                 independent_base = None
 
+                # ``SET Col = ISNULL(Col,0) + Y WHERE g`` after a multi-pass chain is
+                # additive: the earlier passes still apply to rows matching ``g``.
+                # Folding it as ``IF(g) THEN(Col + Y) ELSE(prior)`` makes the arms
+                # mutually exclusive and drops the earlier passes for matching rows.
+                increment = _self_increment_operand(then_node, target_entity, target_column)
+                if (
+                    increment is not None
+                    and isinstance(ast, dict)
+                    and _nested_if_depth(ast) >= 1
+                    and not _references_self_column(raw_cond, target_entity, target_column)
+                    and not _references_self_column(increment, target_entity, target_column)
+                ):
+                    ast = {
+                        "type": "BINARY_OP",
+                        "operator": "+",
+                        "left": ast,
+                        "right": {
+                            "type": "IF_THEN_ELSE",
+                            "condition": raw_cond,
+                            "then_branch": increment,
+                            "else_branch": {"type": "LITERAL", "value_type": "NUMBER", "value": 0},
+                        },
+                    }
+                    self_ref_chain = []
+                    self_ref_chain_base = None
+                    self_ref_chain_class = None
+                    literal_chain = []
+                    literal_chain_base = None
+                    continue
+
                 then_node_sub = _substitute_prior_value(
                     then_node, ast, target_entity, target_column
                 )
@@ -413,6 +460,9 @@ def build_ast_from_mutations(
                 literal_chain_base = None
                 independent_arms = []
                 independent_base = None
+
+    if deferred_clamps and isinstance(ast, dict):
+        ast = _apply_deferred_clamps(ast, deferred_clamps, with_floor=saw_floor_clamp)
 
     if isinstance(ast, dict):
         ast = enforce_later_update_precedence(ast)
@@ -887,12 +937,37 @@ def _is_literal_ast(node: Any) -> bool:
     return isinstance(node, dict) and node.get("type") == "LITERAL"
 
 
+def _is_concat_call(node: Any) -> bool:
+    return (
+        isinstance(node, dict)
+        and node.get("type") == "FUNCTION_CALL"
+        and str(node.get("function_name") or "").upper() == "CONCAT"
+        and isinstance(node.get("arguments"), list)
+    )
+
+
+def _is_empty_string_coalesce(node: Any) -> bool:
+    if not (
+        isinstance(node, dict)
+        and node.get("type") == "FUNCTION_CALL"
+        and str(node.get("function_name") or "").upper() == "COALESCE"
+    ):
+        return False
+    args = node.get("arguments") or []
+    return (
+        len(args) == 2
+        and isinstance(args[1], dict)
+        and args[1].get("type") == "LITERAL"
+        and args[1].get("value") == ""
+    )
+
+
 def _null_safe_concat_arguments(args: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """``CONCAT(col, ',', 'text')`` → ``CONCAT(COALESCE(col,''), ',', 'text')``."""
     empty = {"type": "LITERAL", "value_type": "STRING", "value": ""}
     wrapped: list[dict[str, Any]] = []
     for arg in args:
-        if isinstance(arg, dict) and _is_string_literal_node(arg):
+        if isinstance(arg, dict) and (_is_string_literal_node(arg) or _is_empty_string_coalesce(arg)):
             wrapped.append(arg)
         else:
             wrapped.append(
@@ -1026,6 +1101,139 @@ def _prior_reference_for_guard(prior: Any, entity: str, column: str) -> Any:
     return prior
 
 
+def _classify_total_clamp(
+    raw_cond: Any,
+    then_node: Any,
+    entity: str,
+    column: str,
+) -> tuple[str, str, dict[str, Any], list[dict[str, Any]]] | None:
+    """Recognise ``SET Col = Bound WHERE Col > Bound [AND …]`` (cap) or
+    ``SET Col = 0 WHERE Col < 0`` (floor); extra conjuncts must not read ``Col``.
+
+    Returns ``(kind, operator, bound, extra_conjuncts)``.
+    """
+    if not isinstance(raw_cond, dict) or not isinstance(then_node, dict):
+        return None
+    parts = _flatten_and_conjuncts(raw_cond)
+    for i, part in enumerate(parts):
+        if not isinstance(part, dict) or part.get("type") != "BINARY_OP":
+            continue
+        op = str(part.get("operator") or "").strip()
+        left, right = part.get("left"), part.get("right")
+        if not (
+            _is_self_column_ref(left, entity, column)
+            or _coalesce_or_isnull_of_self(left, entity, column)
+        ):
+            continue
+        extras = [p for j, p in enumerate(parts) if j != i]
+        if any(_references_self_column(e, entity, column) for e in extras):
+            return None
+        if (
+            op in {">", ">="}
+            and then_node.get("type") == "COLUMN_REF"
+            and not _is_self_column_ref(then_node, entity, column)
+            and isinstance(right, dict)
+            and _ast_signature(right) == _ast_signature(then_node)
+        ):
+            return ("cap", op, then_node, extras)
+        if op in {"<", "<="} and _is_zero_literal(right) and _is_zero_literal(then_node):
+            return ("floor", op, then_node, extras)
+    return None
+
+
+def _floor_subject(node: Any) -> dict[str, Any] | None:
+    """``x`` for an already-folded floor ``IF(x < 0) THEN 0 ELSE x``; else ``None``."""
+    if not isinstance(node, dict) or node.get("type") != "IF_THEN_ELSE":
+        return None
+    cond = node.get("condition")
+    if not (
+        isinstance(cond, dict)
+        and cond.get("type") == "BINARY_OP"
+        and str(cond.get("operator") or "").strip() == "<"
+        and _is_zero_literal(cond.get("right"))
+        and _is_zero_literal(node.get("then_branch"))
+    ):
+        return None
+    subject = node.get("else_branch")
+    if isinstance(subject, dict) and _ast_signature(cond.get("left")) == _ast_signature(subject):
+        return subject
+    return None
+
+
+def _apply_deferred_clamps(
+    total: dict[str, Any],
+    clamps: list[tuple[str, str, dict[str, Any], list[dict[str, Any]]]],
+    with_floor: bool = False,
+) -> dict[str, Any]:
+    """Wrap ``total`` in each distinct deferred cap/floor (later passes outermost)."""
+    kept: list[tuple[Any, frozenset]] = []
+    result = total
+    for kind, op, bound, extras in clamps:
+        base_key = (kind, op, _ast_signature(bound))
+        extra_sigs = frozenset(_ast_signature(e) for e in extras)
+        # An earlier clamp with the same bound and no more conditions already
+        # covers every row this one would touch (``WHERE t>NB`` vs the later
+        # ``WHERE t>NB AND NB>0``): stacking it only repeats the total.
+        if any(bk == base_key and prior <= extra_sigs for bk, prior in kept):
+            continue
+        kept.append((base_key, extra_sigs))
+        if with_floor and kind == "cap" and op == ">" and not extras:
+            # Standard clamp: IF(t > Bound) THEN Bound ELSEIF(t < 0) THEN 0 ELSE t.
+            # ``_keep_inline`` stops the optimizer hoisting the total's IF terms out
+            # of these comparisons (which multiplies the formula into one branch
+            # per combination) and stops the floor being rewritten into MAX().
+            subject = _floor_subject(result) or result
+            zero = {"type": "LITERAL", "value_type": "NUMBER", "value": 0}
+            result = {
+                "type": "IF_THEN_ELSE",
+                "condition": {
+                    "type": "BINARY_OP", "operator": ">", "left": subject,
+                    "right": bound, "_keep_inline": True,
+                },
+                "then_branch": bound,
+                "else_branch": {
+                    "type": "IF_THEN_ELSE",
+                    "condition": {
+                        "type": "BINARY_OP", "operator": "<", "left": subject,
+                        "right": zero, "_keep_inline": True,
+                    },
+                    "then_branch": zero,
+                    "else_branch": subject,
+                },
+            }
+            continue
+        compare = {
+            "type": "BINARY_OP",
+            "operator": op,
+            "left": result,
+            "right": bound if kind == "cap" else {"type": "LITERAL", "value_type": "NUMBER", "value": 0},
+        }
+        result = {
+            "type": "IF_THEN_ELSE",
+            "condition": _rebuild_and_conjuncts([compare, *extras]),
+            "then_branch": bound,
+            "else_branch": result,
+        }
+    return result
+
+
+def _self_increment_operand(node: Any, entity: str, column: str) -> dict[str, Any] | None:
+    """``Y`` for ``Col + Y`` / ``Y + Col`` / ``COALESCE(Col,0) + Y``; else ``None``."""
+    if not isinstance(node, dict) or node.get("type") != "BINARY_OP":
+        return None
+    if str(node.get("operator") or "").strip() != "+":
+        return None
+    left, right = node.get("left"), node.get("right")
+    for own, other in ((left, right), (right, left)):
+        if not isinstance(other, dict):
+            continue
+        if _is_self_column_ref(own, entity, column) or _coalesce_or_isnull_of_self(
+            own, entity, column
+        ):
+            return other
+    return None
+
+
 def _nested_if_depth(node: Any) -> int:
     if not isinstance(node, dict):
         return 0
@@ -1090,6 +1298,16 @@ def _is_cross_column_null_default_guard(cond_sql: str, target_column: str) -> bo
     """
     if not cond_sql:
         return False
+    # A null-default fill is gated on a sibling being NULL/0. A guard that tests
+    # ``IS NOT NULL`` is a business predicate (``WHERE DPD_Breach_Date IS NOT NULL
+    # AND SP_ExpiryDate >= @DATE``), so the assignment must stay in the fold.
+    if re.search(r"(?i)\bIS\s+NOT\s+NULL\b", cond_sql):
+        return False
+    # Every top-level AND term of a fill guard is itself a null/zero test of a sibling.
+    # Any other predicate (``<> 'ALWYS_STD'``, ``> 0``, an OR group, ``IN``) makes the
+    # guard a business condition that must stay in the formula.
+    if any(not _is_null_test_term(term) for term in _split_top_level(cond_sql, "AND")):
+        return False
     col = bare_ident(target_column)
     col_re = re.escape(col)
     if re.search(
@@ -1121,6 +1339,22 @@ def _is_cross_column_null_default_guard(cond_sql: str, target_column: str) -> bo
 
 
 _ORDERING_TAIL_RE = re.compile(r"\s*(?:>=|<=|<>|!=|>|<)")
+
+_NULL_TEST_TERM_RES = (
+    re.compile(r"(?is)^[\w.:\[\]\"#]+\s+IS\s+NULL$"),
+    re.compile(
+        r"(?is)^(?:ISNULL|COALESCE)\s*\(\s*[\w.:\[\]\"#]+\s*,\s*[^,()]+\)\s*==?\s*[^\s()]+$"
+    ),
+    re.compile(r"(?is)^ISEMPTY\s*\([^()]*\)$"),
+)
+
+
+def _is_null_test_term(term: str) -> bool:
+    """``X IS NULL`` / ``ISNULL(X,0)=0`` / ``ISEMPTY(X)`` — a sibling null/zero test."""
+    text = (term or "").strip()
+    while text.startswith("(") and text.endswith(")") and _balanced(text[1:-1]):
+        text = text[1:-1].strip()
+    return any(rx.match(text) for rx in _NULL_TEST_TERM_RES)
 
 
 def _isnull_call_has_ordering_comparison(text: str, start: int) -> bool:
@@ -1420,13 +1654,22 @@ class _ValuePredicateMixingError(ValueError):
     """Raised when an assigned value folds to a bare row-level comparison."""
 
 
+def _plain_entity_name(name: Any) -> str:
+    """Upper-cased entity name without the global-temp ``##`` prefix."""
+    text = str(name or "").strip().strip('"').upper()
+    return text[2:] if text.startswith("##") else text
+
+
 def _is_self_column_ref(node: dict[str, Any], entity: str, column: str) -> bool:
     if not isinstance(node, dict) or node.get("type") != "COLUMN_REF":
         return False
-    if node.get("relationship"):
+    relationship = node.get("relationship")
+    # A hop from an entity to itself (``AccountCal`` → ``##AccountCal``) is the
+    # entity's own column, not a join to another table.
+    if relationship and _plain_entity_name(relationship) != _plain_entity_name(node.get("entity")):
         return False
     return (
-        str(node.get("entity") or "").upper() == str(entity or "").upper()
+        _plain_entity_name(node.get("entity")) == _plain_entity_name(entity)
         and str(node.get("column") or "").upper() == str(column or "").upper()
     )
 
@@ -1909,6 +2152,33 @@ def parse_sql_expression_to_ast(
                 ],
             }
 
+    # CHOOSE(index, v1, v2, …) → IF(index == 1) THEN(v1) ELSEIF(index == 2) THEN(v2) … ELSE(NULL)
+    choose = re.match(r"(?is)^CHOOSE\s*\((?P<args>.*)\)$", text)
+    if choose and _balanced(choose.group("args")):
+        choose_args = _split_top_level(choose.group("args"), ",")
+        if len(choose_args) >= 2:
+            index_node = parse_sql_expression_to_ast(
+                choose_args[0], default_entity=default_entity, target_column=target_column
+            )
+            chosen: dict[str, Any] = {"type": "LITERAL", "value_type": "NULL", "value": None}
+            for position in range(len(choose_args) - 1, 0, -1):
+                chosen = {
+                    "type": "IF_THEN_ELSE",
+                    "condition": {
+                        "type": "BINARY_OP",
+                        "operator": "==",
+                        "left": index_node,
+                        "right": {"type": "LITERAL", "value_type": "NUMBER", "value": position},
+                    },
+                    "then_branch": parse_sql_expression_to_ast(
+                        choose_args[position],
+                        default_entity=default_entity,
+                        target_column=target_column,
+                    ),
+                    "else_branch": chosen,
+                }
+            return chosen
+
     # Generic known functions: MIN/MAX/SUM/COUNT/ABS/ROUND/CONCAT/...
     gen_fn = re.match(
         r"(?is)^(?P<fn>MIN|MAX|SUM|COUNT|ABS|ROUND|CONCAT|DATEDIFF|LEN|UPPER|LOWER)\s*\((?P<args>.*)\)$",
@@ -1950,15 +2220,25 @@ def parse_sql_expression_to_ast(
         lhs, op, rhs = arithmetic
         left = parse_sql_expression_to_ast(lhs, default_entity=default_entity, target_column=target_column)
         right = parse_sql_expression_to_ast(rhs, default_entity=default_entity, target_column=target_column)
-        if op == "+" and (_is_string_literal_node(left) or _is_string_literal_node(right)):
+        if op == "+" and (
+            _is_string_literal_node(left)
+            or _is_string_literal_node(right)
+            or _is_concat_call(left)
+            or _is_concat_call(right)
+        ):
             # T-SQL overloads "+" for string concatenation, but the 4X
             # grammar treats +/- as numeric-only -- CONCAT is the platform's
             # documented equivalent (see app/grammar/validator.py's
-            # "numeric-only operators" check).
+            # "numeric-only operators" check). ``'a' + ' ' + col`` parses as
+            # ``('a' + ' ') + col``: an operand that is already a CONCAT is
+            # flattened in so the chain stays one CONCAT, never ``CONCAT(..) + col``.
+            flat: list[dict[str, Any]] = []
+            for side in (left, right):
+                flat.extend(side["arguments"] if _is_concat_call(side) else [side])
             return {
                 "type": "FUNCTION_CALL",
                 "function_name": "CONCAT",
-                "arguments": _null_safe_concat_arguments([left, right]),
+                "arguments": _null_safe_concat_arguments(flat),
             }
         addday = _should_use_addday_for_arithmetic(left, right, target_column)
         if not addday and op == "+":

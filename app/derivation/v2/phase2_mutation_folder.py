@@ -371,13 +371,57 @@ def _written_columns_by_table(
     return out
 
 
+_QUALIFIED_READ_RE = re.compile(r"(?<![\w.@#\[\]\"])([A-Za-z_]\w*)\.\[?([A-Za-z_]\w*)\]?")
+
+
+def _dim_read_columns_by_table(
+    source: "MutationSourceIndex",
+    lineage: LineageMap,
+    entity_map: dict[str, str] | None,
+) -> dict[str, set[str]]:
+    """``{DIM_TABLE: {COLUMN,…}}`` seen qualified as ``alias.col`` in any UPDATE.
+
+    A lookup attribute (``DimParameter.ParameterShortNameEnum``) is read as
+    ``D.ParameterShortNameEnum`` in one statement and bare in another; the
+    qualified reads are file-local proof of which table owns it. Limited to
+    ``Dim*`` lookup tables: fact tables share column names with their own
+    target, where a bare name must keep meaning the UPDATE target's column.
+    """
+    cached = getattr(source, "_dim_read_cols_cache", None)
+    if cached is not None:
+        return cached
+    out: dict[str, set[str]] = {}
+    for stmt in source.updates:
+        alias_map, _ = _parse_update_sources(
+            (stmt.get("head") or "").strip(),
+            (stmt.get("from_clause") or "").strip(),
+            lineage,
+            entity_map,
+        )
+        text = " ".join(
+            str(stmt.get(k) or "") for k in ("set_clause", "from_clause", "where_clause")
+        )
+        for alias, col in _QUALIFIED_READ_RE.findall(text):
+            table = alias_map.get(alias.upper())
+            if not table or isinstance(table, DerivedTable):
+                continue
+            key = normalize_table_name(str(table)).upper()
+            if key.lstrip("#").startswith("DIM"):
+                out.setdefault(key, set()).add(bare_ident(col).upper())
+    source._dim_read_cols_cache = out  # type: ignore[attr-defined]
+    return out
+
+
 def _augment_written_cols_with_join_temp_schemas(
     written_cols: dict[str, set[str]],
     alias_map: dict[str, str],
     lineage: LineageMap,
+    dim_read_cols: dict[str, set[str]] | None = None,
 ) -> dict[str, set[str]]:
     """Add ``SELECT INTO #temp`` column names so bare refs qualify to the join alias."""
     out: dict[str, set[str]] = {k: set(v) for k, v in written_cols.items()}
+    for key, cols in (dim_read_cols or {}).items():
+        out.setdefault(key, set()).update(cols)
     for _alias, table in alias_map.items():
         key = normalize_table_name(str(table)).upper()
         schema = lineage.temp_table_columns.get(normalize_table_name(str(table))) or []
@@ -457,6 +501,26 @@ def fold_column_mutations(
     mutations: list[MutationPass] = []
     ordinal = 0
 
+    # ``#X`` (session temp) and ``X`` (permanent table) sharing a bare name are
+    # separate entities; ``#X`` targets keep their hash and only see temp writes.
+    _raw_target = str(target_entity or "").strip()
+    target_is_hash = _raw_target.startswith("#") and not _raw_target.startswith("##")
+    target_bare_upper = bare_ident(normalize_table_name(_raw_target).lstrip("#")).upper()
+    if target_is_hash:
+        target_entity_norm = "#" + bare_ident(normalize_table_name(_raw_target).lstrip("#"))
+
+    def _collision_side_ok(tables: list[str]) -> bool:
+        if target_bare_upper not in lineage.hash_collisions:
+            return True
+        for table in tables:
+            norm = normalize_table_name(str(table))
+            if bare_ident(norm.lstrip("#")).upper() != target_bare_upper:
+                continue
+            is_temp = norm.startswith("#") and not norm.startswith("##")
+            if is_temp != target_is_hash:
+                return False
+        return True
+
     # Map UPDATE source offsets → IF/ELSE branch (comment-stripped coordinates).
     source = source_index or MutationSourceIndex.build(sql_text)
     if source.sql_text != sql_text:
@@ -487,6 +551,63 @@ def fold_column_mutations(
             return None, None
         return resolve(branch.condition), gates_by_arm.get((branch.group_id, branch.index))
 
+    _written_back_cache: dict[str, bool] = {}
+
+    def _temp_written_back(temp_norm: str) -> bool:
+        """True when ``temp_norm``'s rows are copied into ``target_col`` by some
+        other statement (UPDATE … FROM #temp, INSERT … SELECT FROM #temp, MERGE)."""
+        key = temp_norm.upper()
+        if key in _written_back_cache:
+            return _written_back_cache[key]
+        pattern = re.compile(rf"(?i)(?<![\w#]){re.escape(temp_norm)}(?!\w)")
+        found = False
+        for _idx, wb_stmt, _asg in source.updates_by_column.get(target_col.upper(), []):
+            wb_head = (wb_stmt.get("head") or "").strip()
+            wb_from = (wb_stmt.get("from_clause") or "").strip()
+            if not pattern.search(wb_from):
+                continue
+            wb_map, _wb_joins = _parse_update_sources(wb_head, wb_from, lineage, entity_map)
+            written = _resolve_update_target_tables(wb_head, wb_map)
+            if any(normalize_table_name(str(w)).upper() == key for w in written):
+                continue  # the temp's own UPDATE, not a copy into another table
+            found = True
+            break
+        if not found:
+            for ins in source.inserts:
+                cols = [bare_ident(c).upper() for c in (ins.get("cols") or "").split(",")]
+                if target_col.upper() in cols and pattern.search(ins.get("from_body") or ""):
+                    if normalize_table_name(ins.get("target") or "").upper() != key:
+                        found = True
+                        break
+        if not found:
+            for merge in source.merges:
+                body = " ".join(
+                    str(merge.get(k) or "") for k in ("using_body", "source_table", "set_clause")
+                )
+                if target_col.upper() in body.upper() and pattern.search(body):
+                    found = True
+                    break
+        _written_back_cache[key] = found
+        return found
+
+    def _skip_unwritten_session_temp(tables: list[str]) -> bool:
+        """A write into a session ``#temp`` that is not this target's own table, and
+        whose rows are never copied back into the target column, is not a write to
+        the target at all (``SELECT … INTO #DPD`` / ``UPDATE #DPD`` copies of
+        ``##AccountCal`` columns). Folding it only injects stray arms into the
+        target's formula."""
+        if not tables:
+            return False
+        for table in tables:
+            norm = normalize_table_name(str(table))
+            if not norm.startswith("#") or norm.startswith("##"):
+                return False
+            if _entity_keys(target_entity_norm) & _entity_keys(norm):
+                return False
+            if _temp_written_back(norm):
+                return False
+        return True
+
     for stmt_index, stmt, assignments in source.updates_by_column.get(target_col.upper(), []):
         head = (stmt.get("head") or "").strip()
         set_clause = (stmt.get("set_clause") or "").strip()
@@ -507,10 +628,14 @@ def fold_column_mutations(
                 if resolved:
                     tables_for_assign = [resolved]
 
+            if not _collision_side_ok(tables_for_assign):
+                continue
             if not _targets_entity(tables_for_assign, target_entity_norm, entity_map, lineage):
                 # Also accept writes on local temps whose primary root is the target.
                 if not _targets_via_lineage(tables_for_assign, target_entity_norm, lineage):
                     continue
+            if _skip_unwritten_session_temp(tables_for_assign):
+                continue
 
             ordinal += 1
             expr_text = assign["expr"]
@@ -520,6 +645,7 @@ def fold_column_mutations(
                     _written_columns_by_table(source, lineage, entity_map),
                     alias_map,
                     lineage,
+                    _dim_read_columns_by_table(source, lineage, entity_map),
                 )
                 expr_text = _qualify_foreign_bare_columns(
                     expr_text, alias_map, written_tables, written_cols
@@ -604,9 +730,13 @@ def fold_column_mutations(
     update_stmt_count = len(source.updates)
     for ins_index, ins in enumerate(source.inserts):
         target_table = normalize_table_name(ins.get("target") or "")
+        if not _collision_side_ok([target_table]):
+            continue
         if not _targets_entity([target_table], target_entity_norm, entity_map, lineage):
             if not _targets_via_lineage([target_table], target_entity_norm, lineage):
                 continue
+        if _skip_unwritten_session_temp([target_table]):
+            continue
 
         col_names = [bare_ident(c) for c in (ins.get("cols") or "").split(",") if bare_ident(c)]
         select_parts = split_csv_respecting_parens(ins.get("select_list") or "")
@@ -636,8 +766,12 @@ def fold_column_mutations(
         where_clause = (ins.get("where_clause") or "").strip() or None
         expr = _strip_trailing_select_alias(select_parts[col_idx].strip())
 
+        # An unqualified projection column (``INSERT … SELECT UCIF_ID FROM ##AccountCal``)
+        # means "the single source table's column", exactly as in SELECT INTO below —
+        # otherwise it resolves to the INSERT target itself (a self-reference).
         resolved_expr = _resolve_expression_tables(
-            expr, alias_map, lineage, entity_map, target_entity_norm
+            expr, alias_map, lineage, entity_map, target_entity_norm,
+            default_source_table=_pick_primary_source_table(alias_map),
         )
         resolved_where = None
         if where_clause:
@@ -701,9 +835,13 @@ def fold_column_mutations(
     insert_select_count = len(source.inserts)
     for si_index, si in enumerate(source.selects):
         target_table = normalize_table_name(si.get("target") or "")
+        if not _collision_side_ok([target_table]):
+            continue
         if not _targets_entity([target_table], target_entity_norm, entity_map, lineage):
             if not _targets_via_lineage([target_table], target_entity_norm, lineage):
                 continue
+        if _skip_unwritten_session_temp([target_table]):
+            continue
 
         projections = parse_select_list(si.get("select_list") or "")
         try:
@@ -713,6 +851,22 @@ def fold_column_mutations(
                 if (dest_alias or src_col or "").upper() == target_col.upper()
             )
         except StopIteration:
+            continue
+
+        # ``SELECT SUM(ISNULL(TotalProvision,0)) TotalProvision INTO #TotalProvCust
+        # … GROUP BY CustomerEntityId`` only shares the root's *lineage*; it is a
+        # different-grain roll-up into a session temp, not a write to the root
+        # entity's own column. Folding it in would append an unguarded pass after
+        # every real UPDATE and reset the column to ``COALESCE(Col, 0)``.
+        if (
+            target_table.startswith("#")
+            and not target_table.startswith("##")
+            and not (_entity_keys(target_entity_norm) & _entity_keys(target_table))
+            and (si.get("group_by") or "").strip()
+            and re.search(
+                r"(?is)\b(?:SUM|COUNT|AVG|MIN|MAX)\s*\(", projections[col_idx][3] or ""
+            )
+        ):
             continue
 
         from_body = si.get("from_body") or ""
@@ -788,6 +942,8 @@ def fold_column_mutations(
     prior_stmt_count = update_stmt_count + insert_select_count + len(source.selects)
     for merge_index, merge in enumerate(source.merges):
         target_table = normalize_table_name(merge.get("target") or "")
+        if not _collision_side_ok([target_table]):
+            continue
         if not _targets_entity([target_table], target_entity_norm, entity_map, lineage):
             if not _targets_via_lineage([target_table], target_entity_norm, lineage):
                 continue
@@ -1288,6 +1444,8 @@ def _try_dedupe_coalesce_negative_clamp(node: dict[str, Any]) -> dict[str, Any] 
     cond = node.get("condition")
     if not isinstance(cond, dict):
         return None
+    if cond.get("_keep_inline"):
+        return None  # explicit ``ELSEIF(total < 0) THEN 0`` floor — keep as written
     inner: dict[str, Any] | None = None
     if cond.get("type") == "BINARY_OP":
         if str(cond.get("operator") or "").strip() not in {"<", "<="}:
@@ -1417,7 +1575,9 @@ def _ast_signature(node: Any) -> Any:
             if key in _IDENTIFIER_KEYS and isinstance(value, str):
                 value = value.upper()
             items.append((key, _ast_signature(value)))
-        return tuple(sorted(items))
+        # Keys are unique within one dict, so order by key only; comparing the
+        # signature values would raise on ``None`` vs ``str`` literal leaves.
+        return tuple(sorted(items, key=lambda kv: str(kv[0])))
     if isinstance(node, list):
         return tuple(_ast_signature(item) for item in node)
     return node
@@ -1510,7 +1670,9 @@ def guard_formula_signature(node: Any) -> Any:
         return _ast_signature(node)
     normed = normalize_guard_conjunct(node)
     parts = flatten_and_conjuncts(normed)
-    return tuple(sorted(guard_conjunct_signature(p) for p in parts))
+    # ``repr`` gives a total, deterministic order; the signatures themselves can hold
+    # ``None`` and ``str`` leaves at the same position, which Python cannot compare.
+    return tuple(sorted((guard_conjunct_signature(p) for p in parts), key=repr))
 
 
 def _predicate_column(node: dict[str, Any] | None, function_name: str) -> tuple[str, str] | None:
@@ -2040,14 +2202,14 @@ def _resolve_expression_tables(
             # instead of resolving through lineage (which can mis-route
             # UCIF_ID to DerivativeDetail, or collapse CP.* onto AccountCal.*).
             return _session_temp_column_marker(
-                table_norm, col, default_entity, entity_map
+                table_norm, col, default_entity, entity_map, lineage.hash_collisions
             )
 
         if isinstance(table, DerivedTable):
             derived_norm = normalize_table_name(str(table))
             if derived_norm.startswith("#") and not derived_norm.startswith("##"):
                 return _session_temp_column_marker(
-                    derived_norm, col, default_entity, entity_map
+                    derived_norm, col, default_entity, entity_map, lineage.hash_collisions
                 )
             projection = table.projections.get(col.upper())
             if projection is not None:
@@ -2260,9 +2422,12 @@ def _session_temp_column_marker(
     column: str,
     default_entity: str,
     entity_map: dict[str, str] | None,
+    hash_collisions: set[str] | None = None,
 ) -> str:
     """Encode ``#session_temp``.col without tracing lineage through its UNION body."""
     rel = bare_ident(normalize_table_name(table_norm).lstrip("#"))
+    if hash_collisions and rel.upper() in hash_collisions:
+        rel = "#" + rel  # keep the temp distinct from the same-named permanent table
     ent = _normalize_entity(default_entity, entity_map)
     if lineage_keeps_target_hop(ent, rel):
         return f'"{ent}"."{rel}"."{column}"'

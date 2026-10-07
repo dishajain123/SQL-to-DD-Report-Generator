@@ -762,18 +762,59 @@ def parse_statement(stmt_text: str, index: int, dialect: Dialect) -> StatementIn
     return info
 
 
+def _has_permanent_spelling(raw: str, bare: str) -> bool:
+    """True when ``bare`` is also written without a ``#`` (``PRO.bare`` / ``bare``)."""
+    return bool(
+        re.search(
+            rf"(?i)(?<![#\w])(?:\[?\w+\]?\s*\.\s*)*\[?{re.escape(bare)}\b", raw
+        )
+    )
+
+
+def _regex_write_target_token(info: StatementInfo) -> str:
+    """The statement's own write-target token with its real ``#`` spelling (or ``""``)."""
+    text = _strip_leading_comments(info.raw_text or "")
+    stmt = (info.statement_type or "").upper()
+    if stmt == "INSERT":
+        match = _INSERT_TARGET_RE.search(text)
+    elif stmt == "MERGE":
+        match = _MERGE_TARGET_RE.search(text)
+    elif stmt == "TRUNCATE":
+        match = _TRUNCATE_TARGET_RE.search(text)
+    elif stmt == "DELETE":
+        match = _DELETE_TARGET_RE.search(text)
+    elif stmt == "UPDATE":
+        from_match = _UPDATE_FROM_ALIAS_RE.search(text)
+        if from_match:
+            return _clean_regex_table_name(from_match.group("table"))
+        match = _UPDATE_TARGET_RE.search(text)
+    else:
+        match = _SELECT_INTO_TARGET_RE.search(text)
+    return _clean_regex_table_name(match.group(1)) if match else ""
+
+
 def _restore_temp_hash_prefixes(info: StatementInfo) -> None:
-    """Re-attach `#` / `##` when sqlglot stripped them from temporary tables."""
+    """Re-attach `#` / `##` when sqlglot stripped them from temporary tables.
+
+    A name used both as a ``#temp`` and as a permanent table in the SAME statement
+    (``INSERT INTO PRO.X … FROM #X``) is ambiguous by name alone: the write target
+    is whatever the statement's own target token says, never "any ``#X`` in the text".
+    """
     raw = info.raw_text or ""
     if "#" not in raw or not info.tables_written:
         return
+    own_target = _regex_write_target_token(info)
     restored: list[str] = []
     for table in info.tables_written:
         bare = table.lstrip("#")
         if re.search(rf"(?i)##{re.escape(bare)}\b", raw):
             restored.append(f"##{bare}")
         elif re.search(rf"(?i)(?<!#)#{re.escape(bare)}\b", raw) and not table.startswith("#"):
-            restored.append(f"#{bare}")
+            if _has_permanent_spelling(raw, bare):
+                token = own_target if own_target.lstrip("#").upper() == bare.upper() else ""
+                restored.append(token or table)
+            else:
+                restored.append(f"#{bare}")
         else:
             restored.append(table)
     if restored != info.tables_written:
@@ -789,10 +830,14 @@ def _restore_temp_hash_prefixes(info: StatementInfo) -> None:
         if re.search(rf"(?i)##{re.escape(bare)}\b", raw):
             read_restored.append(f"##{bare}")
         elif re.search(rf"(?i)(?<!#)#{re.escape(bare)}\b", raw) and not table.startswith("#"):
-            read_restored.append(f"#{bare}")
+            if _has_permanent_spelling(raw, bare):
+                # Both spellings are read by this statement: keep both.
+                read_restored.extend([table, f"#{bare}"])
+            else:
+                read_restored.append(f"#{bare}")
         else:
             read_restored.append(table)
-    info.tables_read = read_restored
+    info.tables_read = list(dict.fromkeys(read_restored))
 
 
 def _statement_type_from_tree(tree: exp.Expression, fallback: str) -> str:

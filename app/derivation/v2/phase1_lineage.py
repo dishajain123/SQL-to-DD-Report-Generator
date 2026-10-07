@@ -74,6 +74,10 @@ class LineageMap:
     # definition. Used to fall back to ordinal alignment when a downstream
     # INSERT ... SELECT into that temp omits an explicit column list.
     temp_table_columns: dict[str, list[str]] = field(default_factory=dict)
+    # Upper-cased bare names used BOTH as a session ``#temp`` and as a permanent
+    # table in the same procedure (``#ACCOUNT_MOVEMENT_HISTORY`` staging a load of
+    # ``PRO.ACCOUNT_MOVEMENT_HISTORY``). Their rows must stay separate entities.
+    hash_collisions: set[str] = field(default_factory=set)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -81,6 +85,7 @@ class LineageMap:
             "tables": dict(self.tables),
             "root_entities": sorted(self.root_entities),
             "temp_table_columns": dict(self.temp_table_columns),
+            "hash_collisions": sorted(self.hash_collisions),
         }
 
     def resolve_column(
@@ -182,6 +187,7 @@ def build_lineage_map(
             explicit_target_columns=col_names or None,
         )
 
+    lineage.hash_collisions = _find_hash_collisions(text)
     _capture_temp_column_mutations(lineage, text, entity_map)
     _expand_transitive(lineage)
     logger.debug(
@@ -437,6 +443,24 @@ def _capture_temp_column_mutations(
                         source_table=norm,
                         derived_formula=formula,
                     )
+
+
+_SESSION_TEMP_RE = re.compile(r"(?<![#\w])#(?P<name>[A-Za-z_][A-Za-z0-9_]*)")
+_TABLE_REF_PREFIX = (
+    r"(?is)\b(?:FROM|JOIN|INTO|UPDATE|MERGE(?:\s+INTO)?|TABLE|DELETE(?:\s+FROM)?)\s+"
+    r"(?:\[?[A-Za-z_]\w*\]?\.)*\[?"
+)
+
+
+def _find_hash_collisions(text: str) -> set[str]:
+    """Bare names that appear as a session ``#temp`` AND as a permanent table."""
+    temps = {m.group("name").upper() for m in _SESSION_TEMP_RE.finditer(text or "")}
+    collisions: set[str] = set()
+    for name in temps:
+        pattern = re.compile(_TABLE_REF_PREFIX + re.escape(name) + r"\]?(?![\w#])")
+        if pattern.search(text or ""):
+            collisions.add(name)
+    return collisions
 
 
 def _alias_map(from_body: str) -> dict[str, str]:

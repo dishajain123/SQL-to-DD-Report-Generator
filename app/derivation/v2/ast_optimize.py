@@ -216,7 +216,140 @@ def _hygiene_after_distribute(node: Any) -> Any:
     # comparison operand IF-free.
     node = _distribute_if_over_comparisons(node)
     node = _collapse_degenerate_if_branches(node)
+    # Runs last: the join/zero-default flatteners above match ``0 == 0`` shapes that
+    # this pass would fold away.
+    node = _fold_boolean_literals(node)
+    node = _collapse_degenerate_if_branches(node)
     return _compact_boolean_guards(node)
+
+
+_EQ_OPS = frozenset({"==", "="})
+_NE_OPS = frozenset({"!=", "<>"})
+_ORDER_OPS = frozenset({">", ">=", "<", "<="})
+
+
+def _bool_literal(value: bool) -> dict[str, Any]:
+    return {"type": "LITERAL", "value_type": "BOOLEAN", "value": value}
+
+
+def _is_bool_literal(node: Any) -> bool:
+    return (
+        isinstance(node, dict)
+        and node.get("type") == "LITERAL"
+        and str(node.get("value_type") or "").upper() == "BOOLEAN"
+    )
+
+
+def _is_booleanish(node: Any) -> bool:
+    if not isinstance(node, dict):
+        return False
+    kind = node.get("type")
+    if kind == "LITERAL":
+        return _is_bool_literal(node)
+    if kind == "BINARY_OP":
+        op = str(node.get("operator") or "").strip().upper()
+        return op in _EQ_OPS | _NE_OPS | _ORDER_OPS | {"AND", "OR"}
+    if kind == "MEMBERSHIP_OP":
+        return True
+    if kind == "FUNCTION_CALL":
+        return str(node.get("function_name") or "").upper() in {"ISEMPTY", "ISNOTEMPTY", "NOT"}
+    return False
+
+
+def _compare_literals(op: str, left: dict[str, Any], right: dict[str, Any]) -> bool | None:
+    """Evaluate ``lit op lit``; ``None`` when it cannot be decided statically."""
+    lt = str(left.get("value_type") or "").upper()
+    rt = str(right.get("value_type") or "").upper()
+    if lt == "NULL" or rt == "NULL" or left.get("value") is None or right.get("value") is None:
+        return False  # SQL: a comparison with NULL is never true
+    if lt == rt == "NUMBER":
+        try:
+            a, b = float(left["value"]), float(right["value"])
+        except (TypeError, ValueError):
+            return None
+    elif lt == rt == "STRING":
+        a, b = str(left["value"]).casefold(), str(right["value"]).casefold()
+    else:
+        return None
+    if op in _EQ_OPS:
+        return a == b
+    if op in _NE_OPS:
+        return a != b
+    if op == ">":
+        return a > b
+    if op == ">=":
+        return a >= b
+    if op == "<":
+        return a < b
+    if op == "<=":
+        return a <= b
+    return None
+
+
+def _negate(node: dict[str, Any]) -> dict[str, Any]:
+    return {"type": "FUNCTION_CALL", "function_name": "NOT", "arguments": [node]}
+
+
+def _fold_boolean_literals(node: Any) -> Any:
+    """Fold comparisons of two literals and the ``IF(c) THEN TRUE ELSE …`` shapes
+    they leave behind, e.g. ``(CASE WHEN c1 THEN 1 WHEN c2 THEN 1 END) = 1``
+    distributes to ``IF(c1)THEN(1==1)ELSE(IF(c2)THEN(1==1)ELSE(NULL==1))`` which
+    is just ``OR(c1, c2)``."""
+    if not isinstance(node, dict):
+        return node
+    node = _map_children(node, _fold_boolean_literals)
+    kind = node.get("type")
+    if kind == "BINARY_OP":
+        op = str(node.get("operator") or "").strip()
+        left, right = node.get("left"), node.get("right")
+        if op in _EQ_OPS | _NE_OPS | _ORDER_OPS and (
+            isinstance(left, dict) and isinstance(right, dict)
+            and left.get("type") == "LITERAL" and right.get("type") == "LITERAL"
+            and not _is_bool_literal(left) and not _is_bool_literal(right)
+        ):
+            decided = _compare_literals(op, left, right)
+            return node if decided is None else _bool_literal(decided)
+        if op.upper() in {"AND", "OR"}:
+            is_and = op.upper() == "AND"
+            for this, other in ((left, right), (right, left)):
+                if _is_bool_literal(this):
+                    if bool(this.get("value")) == is_and:
+                        return other  # AND TRUE / OR FALSE: no effect
+                    return this  # AND FALSE / OR TRUE: decided
+        return node
+    if kind != "IF_THEN_ELSE":
+        return node
+    cond, then_b, else_b = node.get("condition"), node.get("then_branch"), node.get("else_branch")
+    if _is_bool_literal(cond):
+        return then_b if cond.get("value") else else_b
+    if not (isinstance(then_b, dict) and isinstance(else_b, dict) and isinstance(cond, dict)):
+        return node
+    if not (_is_booleanish(then_b) and _is_booleanish(else_b)):
+        return node
+    if not (_is_bool_literal(then_b) or _is_bool_literal(else_b)):
+        # Boolean-valued IF (both branches are predicates): the 4X value slot cannot
+        # hold a bare comparison, so express it as OR(AND(c, t), AND(NOT(c), e)).
+        return {
+            "type": "BINARY_OP",
+            "operator": "OR",
+            "left": {"type": "BINARY_OP", "operator": "AND", "left": cond, "right": then_b},
+            "right": {
+                "type": "BINARY_OP", "operator": "AND", "left": _negate(cond), "right": else_b,
+            },
+        }
+    if _is_bool_literal(then_b) and _is_bool_literal(else_b):
+        if then_b.get("value") == else_b.get("value"):
+            return then_b
+        return cond if then_b.get("value") else _negate(cond)
+    if _is_bool_literal(then_b):
+        if then_b.get("value"):  # IF(c) THEN TRUE ELSE x  ==  c OR x
+            return {"type": "BINARY_OP", "operator": "OR", "left": cond, "right": else_b}
+        return {  # IF(c) THEN FALSE ELSE x  ==  NOT(c) AND x
+            "type": "BINARY_OP", "operator": "AND", "left": _negate(cond), "right": else_b,
+        }
+    if else_b.get("value"):  # IF(c) THEN x ELSE TRUE  ==  NOT(c) OR x
+        return {"type": "BINARY_OP", "operator": "OR", "left": _negate(cond), "right": then_b}
+    return {"type": "BINARY_OP", "operator": "AND", "left": cond, "right": then_b}
 
 
 _ARITHMETIC_OPS = frozenset({"+", "-", "*", "/"})
@@ -295,6 +428,10 @@ def _distribute_if_over_comparisons(node: Any) -> Any:
         return node
     if node.get("type") == "BINARY_OP":
         op = str(node.get("operator") or "").strip()
+        if op in _COMPARISON_OPS and node.get("_keep_inline"):
+            # Clamp guard over an additive total: keep the total's IF terms inline
+            # instead of expanding one branch per combination.
+            return _map_children(node, _distribute_if_over_comparisons)
         if op in _COMPARISON_OPS:
             left = node.get("left")
             right = node.get("right")
@@ -660,7 +797,12 @@ def _column_names_in_ast(node: dict[str, Any]) -> set[str]:
 def _heuristic_arm_outer_priority(cond: dict[str, Any], then_b: dict[str, Any]) -> int:
     """Higher score => arm should be outer (later UPDATE wins on overlap)."""
     score = 0
-    if "ALWYS_NPA" in _literal_string_values(cond):
+    # The ALWYS_NPA override is an NPA-DATE rule (``FinalNpaDt = @ProcessDate``).
+    # An arm whose guard merely mentions ALWYS_NPA but yields text (a reason
+    # string) must keep its chronological place, or it outranks later UPDATEs.
+    if "ALWYS_NPA" in _literal_string_values(cond) and (
+        _references_process_date(then_b) or _ast_node_looks_date_valued(then_b)
+    ):
         score += 1_000_000
     if _references_process_date(then_b):
         score += 800_000
@@ -940,6 +1082,7 @@ def _drop_identical_condition_elseif_arms(node: dict[str, Any]) -> dict[str, Any
         return _map_children(node, _drop_identical_condition_elseif_arms)
 
     seen_cond: dict[Any, int] = {}
+    kept_conjuncts: list[frozenset] = []
     kept: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for cond, then_b in arms:
         cond_opt = (
@@ -959,7 +1102,18 @@ def _drop_identical_condition_elseif_arms(node: dict[str, Any]) -> dict[str, Any
                 if _prefer_duplicate_guard_then_branch(then_opt, kept[idx][1]):
                     kept[idx] = (cond_opt, then_opt)
                 continue
+            # An arm whose guard contains every conjunct of an earlier arm's guard can
+            # never run (``IF(join) … ELSEIF(AND(x, join))``): the earlier arm already
+            # took every such row.
+            conj = frozenset(
+                guard_formula_signature(part) for part in _flatten_and_conditions(cond_opt)
+            )
+            if any(prior and prior < conj for prior in kept_conjuncts):
+                continue
+            kept_conjuncts.append(conj)
             seen_cond[sig] = len(kept)
+        else:
+            kept_conjuncts.append(frozenset())
         kept.append((cond_opt, then_opt))
 
     default_opt = (
@@ -972,6 +1126,19 @@ def _drop_identical_condition_elseif_arms(node: dict[str, Any]) -> dict[str, Any
     return _rebuild_if_elseif_chain(kept, default_opt)
 
 
+def _reads_column(node: Any, entity: str, column: str) -> bool:
+    """True when ``node`` contains a plain reference to ``entity.column``."""
+    for sub in _walk_ast(node) if isinstance(node, dict) else ():
+        if (
+            sub.get("type") == "COLUMN_REF"
+            and not sub.get("relationship")
+            and str(sub.get("column") or "").upper() == column
+            and str(sub.get("entity") or "").upper().lstrip("#") == entity
+        ):
+            return True
+    return False
+
+
 def _collapse_duplicate_if_then_arms(node: dict[str, Any]) -> dict[str, Any]:
     if node.get("type") != "IF_THEN_ELSE":
         return _map_children(node, _collapse_duplicate_if_then_arms)
@@ -979,6 +1146,16 @@ def _collapse_duplicate_if_then_arms(node: dict[str, Any]) -> dict[str, Any]:
     arms, default = _flatten_if_elseif_chain(node)
     if len(arms) < 2:
         return _map_children(node, _collapse_duplicate_if_then_arms)
+
+    # The chain's own column (its final ELSE is a bare reference to it). An arm whose
+    # value READS that column (``CONCAT(COALESCE(Col,''), '…')``, an append) is
+    # order-sensitive: hoisting it above the arms that sit between it and an earlier
+    # arm with the same value changes which UPDATE wins.
+    self_col = (
+        (str(default.get("entity") or "").upper().lstrip("#"), str(default.get("column") or "").upper())
+        if isinstance(default, dict) and default.get("type") == "COLUMN_REF"
+        else None
+    )
 
     merged: list[tuple[dict[str, Any], dict[str, Any]]] = []
     then_index: dict[Any, int] = {}
@@ -996,6 +1173,9 @@ def _collapse_duplicate_if_then_arms(node: dict[str, Any]) -> dict[str, Any]:
         sig = _ast_signature(then_opt)
         if sig in then_index:
             idx = then_index[sig]
+            if idx != len(merged) - 1 and self_col and _reads_column(then_opt, *self_col):
+                merged.append((cond_opt, then_opt))  # keep its chronological position
+                continue
             prev_cond, prev_then = merged[idx]
             merged[idx] = (_merge_conditions(prev_cond, cond_opt), prev_then)
         else:
@@ -1352,6 +1532,18 @@ def _terminal_else_reads_column(node: dict[str, Any], entity: str, column: str) 
     return False
 
 
+def _is_predicate_node(node: dict[str, Any]) -> bool:
+    """Comparison / AND / OR — a boolean, never a value backbone.
+
+    Collapsing one to the target column yields nonsense such as
+    ``IF(col)THEN(NetBalance > NetBalance)``.
+    """
+    if node.get("type") != "BINARY_OP":
+        return False
+    op = str(node.get("operator") or "").strip().upper()
+    return op in {"==", "=", "!=", "<>", ">", ">=", "<", "<=", "AND", "OR"}
+
+
 def _is_arithmetic_value(node: dict[str, Any]) -> bool:
     """A computed value such as ``USEDRV * ProvPerSecured`` (never an IF backbone)."""
     return (
@@ -1377,6 +1569,7 @@ def _replace_backbone_duplicates(
         and sig in backbone_sigs
         and _ast_depth(node) >= _MIN_CSE_DEPTH
         and node.get("type") != "COLUMN_REF"
+        and not _is_predicate_node(node)
         and not (_KEEP_ARITHMETIC_VALUES.get() and _is_arithmetic_value(node))
         and not (
             _KEEP_ARITHMETIC_VALUES.get()

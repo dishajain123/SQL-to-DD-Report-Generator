@@ -410,6 +410,15 @@ def _build_column_jobs(
             entity = resolve_entity_name(table, entity_name_map) or canonical_logical_name(
                 table
             )
+            # ``#X`` staging a load of permanent ``X``: keep the hash so the two do
+            # not share (and overwrite) one set of DD rows.
+            norm_table = normalize_table_name(str(table))
+            if (
+                norm_table.startswith("#")
+                and not norm_table.startswith("##")
+                and entity.lstrip("#").upper() in lineage_by_oid[oid].hash_collisions
+            ):
+                entity = "#" + entity.lstrip("#")
             # Skip obvious run-status / audit sinks that are not derivation targets.
             if _is_non_derivation_table(entity):
                 continue

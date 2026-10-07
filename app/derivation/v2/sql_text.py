@@ -379,16 +379,20 @@ def parse_from_join_clause_with_type(
 _UPDATE_KW = re.compile(r"(?is)\bUPDATE\b")
 _WS_SET_KW = re.compile(r"(?is)\s+SET\b")
 _SET_KW = re.compile(r"(?is)\bSET\b")
-_FROM_KW = re.compile(r"(?is)FROM\b")
-_UNION_SELECT_KW = re.compile(r"(?is)UNION\s+(?:ALL\s+)?SELECT\b")
-_WHERE_KW = re.compile(r"(?is)WHERE\b")
-_BEGIN_KW = re.compile(r"(?is)BEGIN\b")
-_CASE_KW = re.compile(r"(?is)CASE\b")
-_END_KW = re.compile(r"(?is)END\b")
-_IF_KW = re.compile(r"(?is)IF\b")
-_IF_OBJECT_ID = re.compile(r"(?is)IF\s+OBJECT_ID\b")
-_ELSE_IF_KW = re.compile(r"(?is)ELSE\s+IF\b|ELSEIF\b")
-_ELSE_KW = re.compile(r"(?is)ELSE\b")
+# Every keyword pattern carries a LEADING ``\b`` as well: these are matched at arbitrary
+# offsets while scanning, and without it ``IF`` matches the tail of ``…SMACLASSUcif'``
+# (a quoted table name), ``END`` the tail of ``Backend`` and so on — the parser then
+# invents a control-flow branch that swallows the following statements.
+_FROM_KW = re.compile(r"(?is)\bFROM\b")
+_UNION_SELECT_KW = re.compile(r"(?is)\bUNION\s+(?:ALL\s+)?SELECT\b")
+_WHERE_KW = re.compile(r"(?is)\bWHERE\b")
+_BEGIN_KW = re.compile(r"(?is)\bBEGIN\b")
+_CASE_KW = re.compile(r"(?is)\bCASE\b")
+_END_KW = re.compile(r"(?is)\bEND\b")
+_IF_KW = re.compile(r"(?is)\bIF\b")
+_IF_OBJECT_ID = re.compile(r"(?is)\bIF\s+OBJECT_ID\b")
+_ELSE_IF_KW = re.compile(r"(?is)\bELSE\s+IF\b|\bELSEIF\b")
+_ELSE_KW = re.compile(r"(?is)\bELSE\b")
 _UPDATE_AT = re.compile(r"(?is)UPDATE\b")
 _END_OR_ELSE = re.compile(r"(?is)(END|ELSE)\b")
 
