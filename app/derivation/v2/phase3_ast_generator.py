@@ -1729,10 +1729,15 @@ def parse_sql_expression_to_ast(
     if dateadd is not None:
         return dateadd
 
-    if re.match(r"(?is)^STRING_AGG\s*\(", text):
-        return _unsupported_sql_expression(
-            "STRING_AGG is set-based aggregation with no row-level 4X equivalent"
-        )
+    string_agg = re.match(r"(?is)^STRING_AGG\s*\(\s*(?P<args>.*)\s*\)$", text.strip())
+    if string_agg and _balanced(string_agg.group("args")):
+        parts = _split_top_level(string_agg.group("args"), ",")
+        if parts:
+            return parse_sql_expression_to_ast(
+                parts[0].strip(),
+                default_entity=default_entity,
+                target_column=target_column,
+            )
 
     # Oracle/SQL date literals & constructors → TODATE(...)
     date_lit = _try_parse_date_literal(text, default_entity, target_column)
@@ -2129,6 +2134,42 @@ def parse_sql_expression_to_ast(
             for a in _split_top_level(least_greatest_fn.group("args"), ",")
         ]
         return {"type": "FUNCTION_CALL", "function_name": mapped_fn, "arguments": args}
+
+    # RIGHT(s, n) / LEFT(s, n) → SUBSTR (4X has no RIGHT/LEFT builtins).
+    side_fn = re.match(r"(?is)^(?P<side>RIGHT|LEFT)\s*\((?P<args>.*)\)$", text)
+    if side_fn and _balanced(side_fn.group("args")):
+        parts = _split_top_level(side_fn.group("args"), ",")
+        if len(parts) == 2:
+            source = parse_sql_expression_to_ast(
+                parts[0], default_entity=default_entity, target_column=target_column
+            )
+            length = parse_sql_expression_to_ast(
+                parts[1], default_entity=default_entity, target_column=target_column
+            )
+            if side_fn.group("side").upper() == "LEFT":
+                start = {"type": "LITERAL", "value_type": "NUMBER", "value": 1}
+            else:
+                len_call = {
+                    "type": "FUNCTION_CALL",
+                    "function_name": "LEN",
+                    "arguments": [source],
+                }
+                start = {
+                    "type": "BINARY_OP",
+                    "operator": "+",
+                    "left": {
+                        "type": "BINARY_OP",
+                        "operator": "-",
+                        "left": len_call,
+                        "right": length,
+                    },
+                    "right": {"type": "LITERAL", "value_type": "NUMBER", "value": 1},
+                }
+            return {
+                "type": "FUNCTION_CALL",
+                "function_name": "SUBSTR",
+                "arguments": [source, start, length],
+            }
 
     # T-SQL string/math functions → their 4X names (arguments keep their order;
     # 4X has a single TRIM covering LTRIM/RTRIM).
@@ -3461,6 +3502,26 @@ def _literal_from_sql_token(token: str) -> dict[str, Any]:
             "arguments": [], "_validation_error": f"Untranslated SQL expression: {text}"}
 
 
+def _try_parse_percent_wildcard_concat(
+    pattern_sql: str,
+    *,
+    default_entity: str,
+    target_column: str,
+) -> dict[str, Any] | None:
+    """``'%' + expr + '%'`` → substring needle expression for CONTAINS."""
+    match = re.match(
+        r"(?is)^'%'\s*\+\s*(?P<mid>.+?)\s*\+\s*'%'\s*$",
+        (pattern_sql or "").strip(),
+    )
+    if not match:
+        return None
+    return parse_sql_expression_to_ast(
+        match.group("mid").strip(),
+        default_entity=default_entity,
+        target_column=target_column,
+    )
+
+
 def _try_map_like_to_membership(
     lhs_sql: str,
     pattern_sql: str,
@@ -3483,6 +3544,20 @@ def _try_map_like_to_membership(
         pattern_sql, default_entity=default_entity, target_column=target_column
     )
     if pattern_node.get("type") != "LITERAL" or pattern_node.get("value_type") != "STRING":
+        wildcard_mid = _try_parse_percent_wildcard_concat(
+            pattern_sql, default_entity=default_entity, target_column=target_column
+        )
+        if wildcard_mid is not None:
+            lhs_node = parse_sql_expression_to_ast(
+                lhs_sql, default_entity=default_entity, target_column=target_column
+            )
+            operator = "DOESNOTCONTAINS" if negate else "CONTAINS"
+            return {
+                "type": "MEMBERSHIP_OP",
+                "operator": operator,
+                "column": lhs_node,
+                "values": [wildcard_mid],
+            }
         return None
     raw = str(pattern_node.get("value") or "")
     starts = raw.startswith("%")

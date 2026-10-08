@@ -60,6 +60,14 @@ class JoinInfo:
 
 
 _AND_KEYWORD_RE = re.compile(r"(?i)\bAND\b")
+_BETWEEN_KEYWORD_RE = re.compile(r"(?i)\bBETWEEN\b")
+
+# DATEADD unit tokens must not be bare-qualified as ``table.YY`` etc.
+_DATEADD_UNIT_KEYWORDS = frozenset({
+    "DD", "DY", "DAY", "DAYS", "WK", "WW", "WEEK", "WEEKS",
+    "MM", "MONTH", "MONTHS", "YY", "YYYY", "YEAR", "YEARS",
+    "QQ", "QUARTER", "QUARTERS", "HH", "MI", "SS", "MS",
+})
 
 
 def _split_top_level_and_terms(text: str) -> list[str]:
@@ -70,6 +78,7 @@ def _split_top_level_and_terms(text: str) -> list[str]:
     depth = 0
     in_quote = False
     quote_char = ""
+    between_active = False
     start = 0
     i = 0
     n = len(text)
@@ -94,8 +103,17 @@ def _split_top_level_and_terms(text: str) -> list[str]:
             i += 1
             continue
         if depth == 0:
+            between_match = _BETWEEN_KEYWORD_RE.match(text, i)
+            if between_match:
+                between_active = True
+                i = between_match.end()
+                continue
             match = _AND_KEYWORD_RE.match(text, i)
             if match:
+                if between_active:
+                    between_active = False
+                    i = match.end()
+                    continue
                 terms.append(text[start:i])
                 i = match.end()
                 start = i
@@ -739,7 +757,7 @@ def fold_column_mutations(
             continue
 
         col_names = [bare_ident(c) for c in (ins.get("cols") or "").split(",") if bare_ident(c)]
-        select_parts = split_csv_respecting_parens(ins.get("select_list") or "")
+        projections = parse_select_list(ins.get("select_list") or "")
         if not col_names:
             # No explicit column list — fall back to the target table's own
             # schema ordinal position when it's a local temp whose CREATE
@@ -747,11 +765,11 @@ def fold_column_mutations(
             # schema (e.g. an untracked permanent table) we still cannot map
             # projection -> target column and must skip.
             schema_cols = lineage.temp_table_columns.get(target_table)
-            if schema_cols and len(schema_cols) == len(select_parts):
+            if schema_cols and len(schema_cols) == len(projections):
                 col_names = schema_cols
             else:
                 continue
-        if len(col_names) != len(select_parts):
+        if len(col_names) != len(projections):
             continue
 
         try:
@@ -764,14 +782,18 @@ def fold_column_mutations(
         from_body = ins.get("from_body") or ""
         alias_map, joins = _parse_update_sources("", from_body, lineage, entity_map)
         where_clause = (ins.get("where_clause") or "").strip() or None
-        expr = _strip_trailing_select_alias(select_parts[col_idx].strip())
+        expr = _strip_trailing_select_alias(projections[col_idx][3].strip())
+        expr = _attach_groupby_to_bare_aggregate(expr, ins.get("group_by") or "")
 
         # An unqualified projection column (``INSERT … SELECT UCIF_ID FROM ##AccountCal``)
         # means "the single source table's column", exactly as in SELECT INTO below —
         # otherwise it resolves to the INSERT target itself (a self-reference).
+        primary_source = _pick_primary_source_table(
+            alias_map, exclude_entities=frozenset({target_table, target_entity_norm})
+        )
         resolved_expr = _resolve_expression_tables(
             expr, alias_map, lineage, entity_map, target_entity_norm,
-            default_source_table=_pick_primary_source_table(alias_map),
+            default_source_table=primary_source,
         )
         resolved_where = None
         if where_clause:
@@ -2039,6 +2061,7 @@ def _resolve_table_entity(
 _KEYWORD_SKIP = {
     "AND", "OR", "NOT", "NULL", "TRUE", "FALSE", "CASE", "WHEN", "THEN",
     "ELSE", "END", "DISTINCT", "AS", "IS", "IN", "LIKE", "BETWEEN", "TOP",
+    *_DATEADD_UNIT_KEYWORDS,
 }
 
 
@@ -2126,22 +2149,46 @@ def _qualify_bare_identifiers(text: str, table: str) -> str:
     return "".join(out)
 
 
-def _pick_primary_source_table(alias_map: dict[str, str]) -> str | None:
+def _pick_primary_source_table(
+    alias_map: dict[str, str],
+    *,
+    exclude_entities: frozenset[str] | None = None,
+) -> str | None:
     """The one table an unqualified projection column implicitly refers to.
 
-    Mirrors phase1's ``_pick_primary_root`` preference (global temp, then
-    physical, then whatever's left) but returns ``None`` instead of
-    guessing when more than one local-temp candidate remains ambiguous --
-    leaving those bare references unresolved is safer than qualifying them
-    against the wrong table.
+    For ``INSERT … SELECT``, bare columns come from the driving source
+    tables in the FROM clause — not from the INSERT target (a global
+    ``##`` temp) and not from an arbitrary joined ``##`` peer when a
+    physical source table is present.
     """
     tables = list(dict.fromkeys(alias_map.values()))
     if not tables:
         return None
+    exclude = {
+        normalize_table_name(e).upper().lstrip("#")
+        for e in (exclude_entities or ())
+    }
+    filtered: list[str] = []
     for t in tables:
+        norm = normalize_table_name(str(t))
+        bare = bare_ident(norm.lstrip("#")).upper()
+        if bare in exclude or norm.upper() in exclude:
+            continue
+        filtered.append(t)
+    if not filtered:
+        filtered = tables
+    if exclude_entities:
+        for t in filtered:
+            if not str(t).startswith("#"):
+                return t
+        for t in filtered:
+            if str(t).startswith("##"):
+                return t
+        return filtered[0] if len(filtered) == 1 else None
+    for t in filtered:
         if t.startswith("##"):
             return t
-    for t in tables:
+    for t in filtered:
         if not t.startswith("#"):
             return t
     return tables[0] if len(tables) == 1 else None

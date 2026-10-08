@@ -243,6 +243,28 @@ def _derive_column(
 
     ast = generate_ast(primary, target_entity=entity, target_column=column, llm_client=llm_client)
     formula, compile_error = _compile(ast, entity=entity, column=column)
+    workflow_compact_note: str | None = None
+    if formula and len(formula) > 8000:
+        from app.derivation.v2.ast_optimize import workflow_passthrough_ast
+        from app.grammar.validator import validate_expression
+
+        compact_ast = workflow_passthrough_ast(entity, column)
+        compact_formula, compact_err = _compile(compact_ast, entity=entity, column=column)
+        if (
+            compact_formula
+            and len(compact_formula) <= 8000
+            and not compact_err
+            and validate_expression(compact_formula).valid
+        ):
+            ast = compact_ast
+            formula = compact_formula
+            compile_error = None
+            workflow_compact_note = (
+                f"{entity}.{column}: full folded formula exceeds the 8,000-character "
+                "grammar budget; the displayed expression is a compact passthrough. "
+                "Use the ordered execution steps and source SQL for the complete "
+                "write sequence."
+            )
     exception_formula = ""
     handler_ast: dict[str, Any] | None = None
     if main and handler:
@@ -294,6 +316,9 @@ def _derive_column(
             "branch's condition while an earlier gate holds for the run can differ, so "
             "exact behaviour needs a platform workflow step that evaluates the gate."
         )
+
+    if workflow_compact_note:
+        advisories.append(workflow_compact_note)
 
     if is_staging_derivation_entity(entity):
         advisories.append(

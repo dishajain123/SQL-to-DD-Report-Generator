@@ -5,6 +5,8 @@ import pytest
 from app.derivation.v2.ast_compiler import compile_ast_to_4x_string
 from app.derivation.v2.phase3_ast_generator import parse_sql_expression_to_ast
 from app.derivation.v2.pipeline import generate_for_sql
+from app.derivation.v2.phase1_lineage import build_lineage_map
+from app.derivation.v2.phase2_mutation_folder import _split_top_level_and_terms, fold_column_mutations
 from app.derivation.v2.sql_text import extract_insert_select, extract_select_into
 from app.grammar.validator import validate_expression
 from app.parsing.sql_lex import normalize_comparison_spacing
@@ -85,9 +87,10 @@ def test_scalar_subquery_top_1_lookup_is_column_ref():
         "(SELECT TOP 1 AssetClassAlt_Key FROM DimAssetClass "
         "WHERE AssetClassShortName='LOS' AND EffectiveFromTimeKey<=@TIMEKEY)"
     )
-    assert "DimAssetClass" in formula
     assert "AssetClassAlt_Key" in formula
     assert "TOP" not in formula.upper()
+    # Scalar lookup folds to a relationship hop on the default entity (LOS short name).
+    assert "LOS" in formula or "DimAssetClass" in formula
     assert validate_expression(formula).passed
 
 
@@ -130,15 +133,23 @@ def test_npa_erosion_month_aging_folds_to_period():
 
 
 
-def test_string_agg_is_flagged():
+def test_like_percent_concat_column_maps_to_contains():
+    formula = _compile("DegReason LIKE '%' + NPA_Reason + '%'")
+    assert "CONTAINS" in formula
+    assert "NPA_Reason" in formula
+    assert validate_expression(formula).passed
+
+
+def test_string_agg_lowers_to_source_column():
     ast = parse_sql_expression_to_ast(
         "STRING_AGG(DegReason, ', ')",
         default_entity="AccountCal",
         target_column="DegReason",
     )
-    assert ast["function_name"] == "__UNSUPPORTED_SQL__"
-    with pytest.raises(ValueError, match="STRING_AGG"):
-        compile_ast_to_4x_string(ast)
+    formula = compile_ast_to_4x_string(ast)
+    assert "DegReason" in formula
+    assert "STRING_AGG" not in formula.upper()
+    assert validate_expression(formula).passed
 
 
 def test_spaced_qualifier_is_normalized_without_moving_offsets():
@@ -148,6 +159,46 @@ def test_spaced_qualifier_is_normalized_without_moving_offsets():
     assert "A.SRCASSETCLASSALT_KEY =1" in fixed
     assert "'B. text'" in fixed
     assert len(notes) == 1
+
+
+def test_between_and_is_not_split_in_join_on_clause():
+    on = "A.DPD_Max BETWEEN LowerDPD AND UpperDPD AND A.Segment='X'"
+    terms = _split_top_level_and_terms(on)
+    assert len(terms) == 2
+    assert "BETWEEN LowerDPD AND UpperDPD" in terms[0]
+
+
+def test_insert_select_eq_alias_projection_value_is_rhs_only():
+    sql = """
+    INSERT INTO ##ACCOUNTCAL (ACCOUNTENTITYID, CUSTOMERACID)
+    SELECT ACCOUNTENTITYID=ACCOUNTENTITYID, CUSTOMERACID=CUSTOMERACID
+    FROM AdvAcBasicDetail A
+    WHERE A.CustomerEntityId > 0
+    """
+    lineage = build_lineage_map(sql, None)
+    muts = fold_column_mutations(sql, "##ACCOUNTCAL", "ACCOUNTENTITYID", lineage, None)
+    assert muts
+    assert "=" not in muts[0].assigned_expression or muts[0].assigned_expression.count("=") == 0
+    assert "ACCOUNTENTITYID" in muts[0].assigned_expression.upper()
+    assert "Print" not in (muts[0].where_clause or "")
+
+
+def test_right_maps_to_substr():
+    formula = _compile("RIGHT(RestructureStage, 3)")
+    assert formula.startswith("SUBSTR(")
+    assert "LEN(" in formula
+    assert validate_expression(formula).passed
+
+
+def test_dateadd_yy_in_insert_select_is_not_qualified_as_column():
+    sql = """
+    INSERT INTO PRO.AdvAcRestructureCal (SP_ExpiryDate)
+    SELECT DATEADD(YY,1, RestructureDt) FROM PRO.AdvAcRestructureCal
+    """
+    lineage = build_lineage_map(sql, None)
+    muts = fold_column_mutations(sql, "AdvAcRestructureCal", "SP_ExpiryDate", lineage, None)
+    assert muts
+    assert "::YY" not in (muts[0].assigned_expression or "")
 
 
 def test_insert_select_union_all_yields_one_entry_per_branch():

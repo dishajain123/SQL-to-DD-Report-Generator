@@ -67,7 +67,7 @@ path_part: STRING
 column_ref: path_part ("." path_part)*
 
 value_list: value ("," value)*
-value: STRING | NUMBER
+value: STRING | NUMBER | column_ref
 
 COMP_OP: "==" | "!=" | ">=" | "<=" | ">" | "<"
 MEMBERSHIP_OP: "NOTIN" | "IN" | "HRCHYNOTIN" | "HRCHYIN" | "CONTAINS" | "BEGINSWITH" | "ENDSWITH" | "DOESNOTCONTAINS"

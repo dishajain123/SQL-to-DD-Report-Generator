@@ -14,7 +14,7 @@ from app.parsing.sql_lex import mask_sql, normalize_comparison_spacing
 
 _STMT_START = re.compile(
     r"(?is)\b(?:UPDATE|INSERT|DELETE|MERGE|SELECT|CREATE|DROP|TRUNCATE|EXEC|EXECUTE|DECLARE|GO"
-    r"|IF|BEGIN|ELSE)\b"
+    r"|IF|BEGIN|ELSE|PRINT|COMMIT|ROLLBACK)\b"
 )
 
 _CACHE_MIN_CHARS = 4000

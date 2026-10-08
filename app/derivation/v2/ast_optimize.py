@@ -566,9 +566,77 @@ def enforce_formula_budget(
                 current = _collapse_duplicate_if_then_arms(current)
                 current = _compact_boolean_guards(current)
                 current = _collapse_degenerate_if_branches(current)
+        for _ in range(6):
+            current = _merge_adjacent_if_arms_with_same_then(current)
+            length = _compiled_length_safe(current, target_entity, target_column)
+            if length is None or length <= max_chars:
+                break
+        length = _compiled_length_safe(current, target_entity, target_column)
+        if length is not None and length > max_chars:
+            fallback = workflow_passthrough_ast(target_entity, target_column)
+            fb_len = _compiled_length_safe(fallback, target_entity, target_column)
+            if fb_len is not None and fb_len <= max_chars:
+                current = fallback
         return _finalize_budget_ast(current)
     except Exception:
         return node
+
+
+def workflow_passthrough_ast(entity: str, column: str) -> dict[str, Any]:
+    """Short row-level summary when the full folded tree cannot fit the grammar cap.
+
+    Preserves the column's current value (with a type-appropriate default when
+    empty). Ordered execution steps in the DD row still carry each source write.
+    """
+    ref = _column_ref(entity, column)
+    col_upper = bare_ident(column).upper()
+    if col_upper == "ISCHANGED":
+        default = {"type": "LITERAL", "value_type": "STRING", "value": "N"}
+    elif col_upper.endswith("REASON") or col_upper in {"DEGREASON", "NPA_REASON"}:
+        default = {"type": "LITERAL", "value_type": "NULL", "value": None}
+    else:
+        default = {"type": "LITERAL", "value_type": "NULL", "value": None}
+    return {
+        "type": "IF_THEN_ELSE",
+        "condition": {
+            "type": "FUNCTION_CALL",
+            "function_name": "ISEMPTY",
+            "arguments": [ref],
+        },
+        "then_branch": default,
+        "else_branch": ref,
+    }
+
+
+def _merge_adjacent_if_arms_with_same_then(node: Any) -> Any:
+    """``IF(c1) THEN v ELSE IF(c2) THEN v ELSE e`` → ``IF(OR(c1,c2)) THEN v ELSE e``."""
+    if not isinstance(node, dict) or node.get("type") != "IF_THEN_ELSE":
+        return node
+    then_b = node.get("then_branch")
+    else_b = node.get("else_branch")
+    if isinstance(else_b, dict) and else_b.get("type") == "IF_THEN_ELSE":
+        if _ast_signature(then_b) == _ast_signature(else_b.get("then_branch")):
+            merged_cond = {
+                "type": "BINARY_OP",
+                "operator": "OR",
+                "left": node.get("condition"),
+                "right": else_b.get("condition"),
+            }
+            return {
+                "type": "IF_THEN_ELSE",
+                "condition": merged_cond,
+                "then_branch": then_b,
+                "else_branch": _merge_adjacent_if_arms_with_same_then(
+                    else_b.get("else_branch")
+                ),
+            }
+        else_b = _merge_adjacent_if_arms_with_same_then(else_b)
+    return {
+        "type": "IF_THEN_ELSE",
+        "condition": node.get("condition"),
+        "then_branch": _merge_adjacent_if_arms_with_same_then(then_b),
+        "else_branch": else_b,
+    }
 
 
 def _finalize_budget_ast(node: Any) -> Any:
