@@ -235,7 +235,6 @@ def test_cse_replaces_duplicate_backbone_in_then_with_column_ref():
     assert after.count("ALWYS_NPA") == 1
     assert '"AccountCal"."FinalNpaDt"' in after
     assert len(after) < len(before)
-    assert "MIN(" not in after.upper()
     assert validate_expression(after).passed
 
 
@@ -337,13 +336,12 @@ def test_npa_s06_final_npa_dt_formula_is_compact_and_valid():
         assert idx_alwys < idx_ref
     for needle in ("ALWYS_NPA", "REFPERIODNPA", "FlgProcessing", "1900-01-01"):
         assert formula.count(needle) <= 1, f"{needle} repeated in: {formula[:800]}..."
-    upper = formula.upper()
-    assert "MIN(" not in upper
-    assert "MAX(" not in upper
-    assert "SUM(" not in upper
 
 
-def test_min_wrapping_if_unwraps_to_row_level_conditional():
+def test_min_wrapping_if_unwraps_to_row_level_conditional(monkeypatch):
+    monkeypatch.setattr(
+        "app.derivation.v2.platform_aggregates.NATIVE_AGGREGATES_ENABLED", False
+    )
     ast = {
         "type": "FUNCTION_CALL",
         "function_name": "MIN",
@@ -368,7 +366,7 @@ def test_min_wrapping_if_unwraps_to_row_level_conditional():
     assert validate_expression(formula).passed
 
 
-def test_s23_provision_formulas_contain_no_set_aggregates():
+def test_s23_provision_formulas_validate_with_native_aggregates():
     sql_path = (
         Path(__file__).resolve().parents[3]
         / "samples/sql/PRO_SPs_Sequenced/31_S23_PRO.UpdationTotalProvision.StoredProcedure.sql"
@@ -382,15 +380,13 @@ def test_s23_provision_formulas_contain_no_set_aggregates():
         formula = debug.get("formula") or ""
         if not formula:
             continue
-        upper = formula.upper()
-        assert "MIN(" not in upper, column
-        assert "MAX(" not in upper, column
-        assert "SUM(" not in upper, column
-        assert "COUNT(" not in upper, column
         assert validate_expression(formula).passed, validate_expression(formula).errors
 
 
-def test_count_scalar_subquery_lowers_to_literal_without_count_call():
+def test_count_scalar_subquery_compiles_as_count(monkeypatch):
+    monkeypatch.setattr(
+        "app.derivation.v2.platform_aggregates.NATIVE_AGGREGATES_ENABLED", False
+    )
     ast = {
         "type": "FUNCTION_CALL",
         "function_name": "COUNT",
@@ -403,7 +399,10 @@ def test_count_scalar_subquery_lowers_to_literal_without_count_call():
     assert validate_expression(formula).passed
 
 
-def test_ternary_min_lowers_to_nested_if_without_min_call():
+def test_ternary_min_lowers_to_nested_if_without_min_call(monkeypatch):
+    monkeypatch.setattr(
+        "app.derivation.v2.platform_aggregates.NATIVE_AGGREGATES_ENABLED", False
+    )
     ast = {
         "type": "FUNCTION_CALL",
         "function_name": "MIN",
@@ -470,7 +469,6 @@ def test_duplicate_then_or_of_equal_remainders_factors_shared_conjuncts():
     assert formula.count("AssetClassShortName") == 2
     assert "OR(" in formula
     assert "AND(" in formula
-    assert "MIN(" not in formula.upper()
     assert validate_expression(formula).passed
 
 

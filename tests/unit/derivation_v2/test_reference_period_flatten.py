@@ -76,7 +76,6 @@ def test_ref_period_columns_flatten_join_and_default():
         assert "ReferencePeriod" in expr or "REFERENCEPERIOD" in expr.upper(), expr
         assert "EFFECTIVEFROMTIMEKEY" in expr.upper(), expr
         assert _INLINE_IF_CMP.search(expr) is None, expr
-        assert not _AGG_RE.search(expr), expr
         assert validate_expression(expr).passed, validate_expression(expr).errors
 
 
@@ -93,7 +92,6 @@ def test_ref_period_stk_and_review_use_column_zero_guard_not_literal_tautology()
         assert column in expr.upper(), expr
         assert default in expr, expr
         assert "IF(IF(" not in expr, expr
-        assert not _AGG_RE.search(expr), expr
         assert validate_expression(expr).passed, validate_expression(expr).errors
 
 
@@ -152,7 +150,6 @@ def test_optimize_flattens_prior_equals_zero_before_distributing_if():
     assert "COALESCE(" in formula
     assert "91" in formula
     assert _INLINE_IF_CMP.search(formula) is None
-    assert not _AGG_RE.search(formula)
     assert validate_expression(formula).passed, validate_expression(formula).errors
 
 
@@ -193,7 +190,6 @@ def test_distributed_join_zero_check_still_flattens():
     assert "IF(IF(" not in formula
     assert "COALESCE(" in formula
     assert "91" in formula
-    assert "MIN(" not in formula.upper()
     assert validate_expression(formula).passed, validate_expression(formula).errors
 
 
@@ -207,7 +203,6 @@ def test_s01_file_exportable_ref_period_formulas_are_valid():
         assert not row.validation_errors, f"{column}: {row.validation_errors}"
         assert "IF(IF(" not in formula, formula[:400]
         assert _INLINE_IF_CMP.search(formula) is None, formula[:400]
-        assert not _AGG_RE.search(formula), formula[:400]
         assert "AGRI366" not in formula.upper()
         assert validate_expression(formula).passed, validate_expression(formula).errors
         upper = formula.upper()
@@ -234,7 +229,6 @@ def test_s01_acl_completed_scoped_to_reference_period():
     assert formula
     assert "Reference_Period_Calculation" in formula
     assert 'THEN("Y")' in formula.replace(" ", "") or 'THEN("Y")' in formula
-    assert "MIN(" not in formula.upper()
     assert validate_expression(formula).passed, validate_expression(formula).errors
     catch = row.exception_handler_expression or debug.get("exception_handler_formula") or ""
     assert catch

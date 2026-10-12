@@ -394,23 +394,26 @@ def _write_dd_xlsx(merged: list[dict], output_path: Path) -> Path:
 def is_exportable_row(row: DDRow, should_omit) -> bool:
     """Decide whether a row belongs in the CSV/Excel deliverable.
 
-    The object-level completeness gate (app/guardrails/completeness.py)
-    demotes every row of an object with any unresolved note to
-    NEEDS_REVIEW + PENDING_REVIEW and appends one blanket validation error.
-    For a large procedure that is every row, which used to leave the export
-    empty even though the report listed all of them. Gate-only rows are
-    exported (their Status column still reads PENDING_REVIEW); rows with
-    real grammar/structure errors or UNSUPPORTED rows stay withheld.
-    """
-    from app.guardrails.completeness import COMPLETENESS_GATE_REASON
+    Rows with a non-empty display formula are exported even when they need
+    review (fold skips, grammar/path flags, completeness gate). Reviewers
+    rely on the spreadsheet as the full column inventory; withholding every
+    row that has any ``validation_errors`` beyond the completeness gate
+    caused core business columns (e.g. ``FinalNpaDt``, ``DPD_IntService``)
+    to vanish from the workbook while still present in ``dd_rows.json``.
 
+    Rows without a presentable formula (empty / bare NULL / 0 / 1) stay out.
+    ``UNSUPPORTED`` rows stay out.
+    """
+    if row.review_state == ReviewState.UNSUPPORTED:
+        return False
     if row.review_state not in {ReviewState.GENERATED, ReviewState.APPROVED, ReviewState.NEEDS_REVIEW}:
         return False
-    if any(e != COMPLETENESS_GATE_REASON for e in (row.validation_errors or [])):
+    expr = (row.display_derivation_expression or "").strip()
+    if not expr or should_omit(expr):
         return False
-    if is_static_seed(row.display_derivation_expression or ""):
+    if is_static_seed(expr):
         return False
-    return not should_omit(row.display_derivation_expression or "")
+    return True
 
 
 def export_dd_rows(

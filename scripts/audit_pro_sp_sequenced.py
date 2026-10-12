@@ -19,7 +19,8 @@ from app.utils.entity_name_map import build_entity_name_map_for_tables
 
 ROOT = Path(__file__).resolve().parents[1]
 SP_DIR = ROOT / "samples" / "sql" / "PRO_SPs_Sequenced"
-_AGG_RE = re.compile(r"\b(MIN|MAX|SUM|COUNT)\s*\(", re.I)
+_AGG_CORE_RE = re.compile(r"\b(MIN|MAX|SUM|COUNT)\s*\(", re.I)
+_STRING_AGG_RE = re.compile(r"\bSTRING_AGG\s*\(", re.I)
 _CHAR_BUDGET = 8000
 _THEN_RE = re.compile(r"THEN\s*\(", re.I)
 
@@ -143,6 +144,7 @@ def audit_file(path: Path) -> dict:
 
     with_formula = 0
     agg_hits = 0
+    string_agg_hits = 0
     invalid = 0
     empty = 0
     empty_business = 0
@@ -181,13 +183,29 @@ def audit_file(path: Path) -> dict:
             else:
                 issues.append(line)
 
-        if _AGG_RE.search(expr):
-            agg_hits += 1
-            line = _issue_line(entity, column, "aggregate MIN/MAX/SUM/COUNT in formula")
+        if _STRING_AGG_RE.search(expr):
+            string_agg_hits += 1
+            line = _issue_line(
+                entity,
+                column,
+                "STRING_AGG appears in formula but is not a documented native 4X function",
+            )
             if staging:
                 staging_issues.append(line)
             else:
                 issues.append(line)
+
+        if _AGG_CORE_RE.search(expr):
+            agg_hits += 1
+            vr_agg = validate_expression(expr)
+            if not vr_agg.valid:
+                line = _issue_line(
+                    entity, column, f"aggregate formula grammar invalid: {vr_agg.error}"
+                )
+                if staging:
+                    staging_issues.append(line)
+                else:
+                    issues.append(line)
 
         dup = _duplicate_heuristic(entity, column, expr)
         if dup:
@@ -234,6 +252,7 @@ def audit_file(path: Path) -> dict:
         "empty_expressions_business": empty_business,
         "empty_expressions_staging": empty_staging,
         "aggregate_formulas": agg_hits,
+        "string_agg_formulas": string_agg_hits,
         "invalid_or_errors": invalid,
         "over_budget_formulas": over_budget_count,
         "duplicate_heuristic_flags": duplicate_heuristic_count,
@@ -257,13 +276,13 @@ def _rollup_summary(results: list[dict]) -> dict:
         "total_empty_business": sum(r["empty_expressions_business"] for r in results),
         "total_empty_staging": sum(r["empty_expressions_staging"] for r in results),
         "files_with_any_aggregate": sum(1 for r in results if r["aggregate_formulas"]),
+        "files_with_string_agg_in_formula": sum(1 for r in results if r["string_agg_formulas"]),
         "files_with_business_issues": sum(
             1 for r in results if r["issues"] or r["empty_expressions_business"]
         ),
-        "files_with_any_invalid": sum(
-            1 for r in results if r["invalid_or_errors"] or r["aggregate_formulas"]
-        ),
+        "files_with_any_invalid": sum(1 for r in results if r["invalid_or_errors"]),
         "total_aggregate_formulas": sum(r["aggregate_formulas"] for r in results),
+        "total_string_agg_formulas": sum(r["string_agg_formulas"] for r in results),
         "total_over_budget_formulas": sum(r["over_budget_formulas"] for r in results),
         "total_duplicate_heuristic_flags": sum(r["duplicate_heuristic_flags"] for r in results),
     }

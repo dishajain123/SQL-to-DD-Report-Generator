@@ -1,5 +1,7 @@
 # 4X Platform Formula Expression Reference
 
+The SQL-to-DD derivation pipeline (`app/derivation/v2`) emits formulas using **only** the control flow, functions, and operators documented in this file. The allow-list is enforced in `app/grammar/platform_library.py` and validated via `validate_expression()`.
+
 ## Control Flow
 
 ```

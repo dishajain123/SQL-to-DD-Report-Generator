@@ -72,10 +72,22 @@ def test_export_keeps_rows_gated_only_by_completeness(tmp_path):
     assert rows[0]["Status"] == "PENDING_REVIEW"
 
 
-def test_export_withholds_rows_with_real_validation_errors(tmp_path):
+def test_export_includes_rows_with_review_errors_when_formula_present(tmp_path):
     row = _sample_row(
         review_state=ReviewState.NEEDS_REVIEW,
+        status=DDStatus.PENDING_REVIEW,
         validation_errors=["grammar validation failed"],
+    )
+    rows = _read_csv(export_dd_rows([row], tmp_path / "dd.csv"))
+    assert len(rows) == 1
+    assert rows[0]["Status"] == "PENDING_REVIEW"
+
+
+def test_export_withholds_review_rows_with_no_formula(tmp_path):
+    row = _sample_row(
+        review_state=ReviewState.NEEDS_REVIEW,
+        display_derivation_expression="",
+        validation_errors=["AST compile error: unsupported"],
     )
     assert _read_csv(export_dd_rows([row], tmp_path / "dd.csv")) == []
 

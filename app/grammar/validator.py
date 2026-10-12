@@ -9,6 +9,8 @@ from pathlib import Path
 
 from lark import Lark, UnexpectedInput
 
+from app.grammar.platform_library import DOCUMENTED_4X_FUNCTIONS
+
 _GRAMMAR_PATH = Path(__file__).parent / "fourx_grammar.lark"
 
 _parser = Lark(_GRAMMAR_PATH.read_text(), parser="earley", start="start")
@@ -28,16 +30,8 @@ class ValidationResult:
         return [self.error] if self.error else []
 
 
-# Function names the grammar accepts syntactically as FUNC_NAME, cross-checked
-# here against the actual documented library so an expression using a made-up
-# function name (syntactically valid, semantically wrong) is still rejected.
-KNOWN_FUNCTIONS = {
-    "ISEMPTY", "ISNOTEMPTY", "MAX", "MIN", "COALESCE",
-    "SUBSTR", "LOWER", "UPPER", "LEN", "CONVERT", "REGEX", "CONCAT", "TRIM", "REPLACE",
-    "SOM", "EOM", "SOY", "EOY", "SOFY", "EOFY", "DATEPART", "DATEDIFF", "TODATE",
-    "ADDDAY", "PERIOD", "SOQ", "EOQ",
-    "ROUND", "ABS", "FLOOR", "CEIL", "DATE", "SUM", "COUNT",
-}
+# Cross-check parsed ``function_call`` nodes against the platform reference doc.
+KNOWN_FUNCTIONS = DOCUMENTED_4X_FUNCTIONS
 
 _INCOMPLETE_TRAILING_TOKENS = {
     "IF",
@@ -81,7 +75,6 @@ _INCOMPLETE_TRAILING_TOKENS = {
     "PERIOD",
     "SOQ",
     "EOQ",
-    "DATE",
     "SUM",
     "COUNT",
 }

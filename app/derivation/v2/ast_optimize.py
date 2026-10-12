@@ -1689,12 +1689,33 @@ def _replace_backbone_duplicates(
     return out
 
 
+def _identity_map_ast(node: Any) -> Any:
+    """Walk AST dicts without transforming nodes (preserves native aggregates)."""
+    if not isinstance(node, dict):
+        return node
+    out: dict[str, Any] = {}
+    for key, value in node.items():
+        if isinstance(value, dict):
+            out[key] = _identity_map_ast(value)
+        elif isinstance(value, list):
+            out[key] = [
+                _identity_map_ast(item) if isinstance(item, dict) else item for item in value
+            ]
+        else:
+            out[key] = value
+    return out
+
+
 def lower_set_aggregates(node: Any) -> Any:
-    """Public entry: strip set-style MIN/MAX/SUM/COUNT to row-level AST."""
+    """Public entry: strip set-style MIN/MAX/SUM/COUNT to row-level AST (legacy)."""
     return _lower_set_aggregates(node)
 
 
 def _lower_set_aggregates(node: Any) -> Any:
+    from app.derivation.v2.platform_aggregates import NATIVE_AGGREGATES_ENABLED
+
+    if NATIVE_AGGREGATES_ENABLED:
+        return _identity_map_ast(node)
     if not isinstance(node, dict):
         return node
     out = dict(node)

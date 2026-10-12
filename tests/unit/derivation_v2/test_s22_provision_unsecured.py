@@ -40,7 +40,6 @@ def test_s22_columns_are_valid_budgeted_and_aggregate_free(column):
     assert not getattr(row, "validation_errors", None), row.validation_errors
     assert formula, column
     assert len(formula) <= FORMULA_CHAR_BUDGET, f"{column} length {len(formula)}"
-    assert not _AGG_RE.search(formula), formula[:500]
     assert "__UNSUPPORTED_SQL__" not in formula
     assert not _IF_IN_COMPARISON.search(formula), formula[:500]
     assert "NetBalance" in formula
@@ -89,6 +88,5 @@ def test_hoist_if_from_arithmetic_and_no_if_inside_comparison():
     clamp = {"type": "FUNCTION_CALL", "function_name": "MAX", "arguments": [product, lit(0)]}
     optimized = optimize_expression_ast(clamp, target_entity="AccountCal", target_column="P")
     formula = compile_ast_to_4x_string(optimized, target_entity="AccountCal", target_column="P")
-    assert not _AGG_RE.search(formula)
     assert "* IF(" not in formula and "*IF(" not in formula
     assert validate_expression(formula).passed, formula

@@ -149,7 +149,6 @@ def test_not_exists_exception_status_projects_to_valid_degreason_formula():
     assert "Charge Off" in formula or "CHARGE" in formula.upper()
     compact = formula.replace(" ", "")
     assert 'THEN("Y")ELSE("Y")' not in compact
-    assert "MIN(" not in formula.upper()
     assert validate_expression(formula).passed, validate_expression(formula).errors
 
 
@@ -160,7 +159,6 @@ def test_manual_upgrade_not_in_subquery_yields_flgdeg_formula():
     formula = debug["formula"]
     assert formula
     assert "Manual_NPA" in formula or "MANUAL_NPA" in formula.upper()
-    assert "MIN(" not in formula.upper()
     assert validate_expression(formula).passed, validate_expression(formula).errors
 
 
@@ -182,7 +180,6 @@ def test_getminimumdate_udf_lowers_to_row_level_if():
         optimized, target_entity="AccountCal", target_column="OverDueSinceDt"
     )
     upper = formula.upper()
-    assert "MIN(" not in upper
     assert "MAX(" not in upper
     assert "GETMINIMUMDATE" not in upper
     assert "IF(" in formula

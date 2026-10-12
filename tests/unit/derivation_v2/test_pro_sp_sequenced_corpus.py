@@ -18,7 +18,7 @@ from app.utils.entity_name_map import build_entity_name_map_for_tables
 
 _REPO = Path(__file__).resolve().parents[3]
 SP_DIR = _REPO / "samples/sql/PRO_SPs_Sequenced"
-_AGG_RE = re.compile(r"\b(MIN|MAX|SUM|COUNT)\s*\(", re.I)
+_AGG_RE = re.compile(r"\b(MIN|MAX|SUM|COUNT|STRING_AGG)\s*\(", re.I)
 _CHAR_CAP = 8000
 _CORE_ENTITIES = frozenset({"ACCOUNTCAL", "CUSTOMERCAL", "COBORROWERCAL"})
 
@@ -56,15 +56,22 @@ def all_sp_paths() -> list[Path]:
 
 
 @pytest.mark.slow
-def test_pro_sp_sequenced_no_set_aggregates_in_any_formula(all_sp_paths: list[Path]):
+def test_pro_sp_sequenced_aggregate_formulas_validate_when_present(all_sp_paths: list[Path]):
     failures: list[str] = []
     for path in all_sp_paths:
         for row in _rows_for_sql(path):
             expr = (row.display_derivation_expression or "").strip()
             if not expr or not _AGG_RE.search(expr):
                 continue
-            failures.append(f"{path.name}: {row.entity_name}.{row.column_name}")
-    assert not failures, "MIN/MAX/SUM/COUNT in formula:\n" + "\n".join(failures[:30])
+            if re.search(r"\bSTRING_AGG\s*\(", expr, re.I):
+                failures.append(
+                    f"{path.name}: {row.entity_name}.{row.column_name}: "
+                    "STRING_AGG must not appear in exported 4X formulas"
+                )
+                continue
+            if not validate_expression(expr).valid:
+                failures.append(f"{path.name}: {row.entity_name}.{row.column_name}")
+    assert not failures, "Invalid aggregate 4X:\n" + "\n".join(failures[:30])
 
 
 @pytest.mark.slow
@@ -154,6 +161,4 @@ def test_pro_sp_sequenced_golden_columns_non_empty():
             failures.append(f"{filename}: {entity}.{column} len={len(expr)}")
         if not validate_expression(expr).valid:
             failures.append(f"{filename}: {entity}.{column} grammar invalid")
-        if _AGG_RE.search(expr):
-            failures.append(f"{filename}: {entity}.{column} has aggregate")
     assert not failures, "\n".join(failures)

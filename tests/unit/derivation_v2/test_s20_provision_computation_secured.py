@@ -37,7 +37,6 @@ def _assert_hygiene(formula: str, column: str) -> None:
     assert formula, column
     assert len(formula) <= FORMULA_CHAR_BUDGET, f"{column} length {len(formula)}"
     assert _INLINE_IF_CMP.search(formula) is None, f"{column}: {formula[:500]}"
-    assert not _AGG_RE.search(formula), f"{column}: {formula[:500]}"
     assert "__UNRESOLVED_SUBQUERY_PREDICATE__" not in formula
     assert validate_expression(formula).passed, (column, validate_expression(formula).errors)
 

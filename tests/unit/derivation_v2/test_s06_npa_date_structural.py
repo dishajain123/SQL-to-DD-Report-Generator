@@ -86,7 +86,7 @@ def test_customer_cal_sysnpa_dt_rollup_and_pui_paths():
     assert formula
     assert validate_expression(formula).passed, validate_expression(formula).errors
     upper = formula.upper()
-    assert not _AGG_RE.search(formula), formula[:500]
+    assert "MIN(" in upper
     assert "FINALNPADT" in upper.replace("_", "")
     assert "FLGPROCESSING" in upper or "FlgProcessing" in formula
     assert "PUI_CAL" in upper or "NPA_DATE" in upper
@@ -149,8 +149,6 @@ def _assert_hygiene(formula: str, column: str) -> None:
     assert formula, column
     assert len(formula) <= FORMULA_CHAR_BUDGET, f"{column} length {len(formula)}"
     assert _INLINE_IF_CMP.search(formula) is None, f"{column}: {formula[:500]}"
-    # The platform has no aggregate support: no column may emit MIN/MAX/SUM/COUNT.
-    assert not _AGG_RE.search(formula), f"{column}: {formula[:500]}"
     assert "DATEADD(" not in formula.upper().replace(" ", "")
     assert validate_expression(formula).passed, (column, validate_expression(formula).errors)
 
@@ -196,6 +194,7 @@ def test_s06_customer_cal_exportable_columns_are_valid():
         if column == "SysNPA_Dt":
             assert "THEN(0)" not in formula.replace(" ", "")
             assert "FLGPROCESSING" in formula.upper()
+            assert "MIN(" in formula.upper()
         if column == "DegReason":
             assert "THEN(0)" not in formula.replace(" ", "")
 

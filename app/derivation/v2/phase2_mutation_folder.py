@@ -24,6 +24,7 @@ from app.derivation.v2.sql_text import (
     extract_table_resets,
     extract_update_statements,
     extract_workflow_gates,
+    is_ephemeral_sql_alias,
     lineage_keeps_target_hop,
     normalize_table_name,
     parse_from_join_clause,
@@ -1178,27 +1179,86 @@ _BARE_MIN_MAX_RE = re.compile(
 )
 
 
-def _attach_groupby_to_bare_aggregate(expr: str, group_by_clause: str) -> str:
-    """Rewrite a bare ``MIN(col)``/``MAX(col)`` SELECT-INTO projection into
-    the platform's documented ``MIN(<Col>, [<GroupbyColumns>])`` form when
-    the statement has a GROUP BY (app/grammar/fourx_grammar.lark's
-    ``list_literal``; see samples/platform_docs/4x_functions_operators.md).
-    Only a bare single-column aggregate is rewritten -- anything already
-    multi-argument or wrapped in other logic is left untouched.
-    """
-    if not group_by_clause:
-        return expr
-    match = _BARE_MIN_MAX_RE.match(expr.strip())
-    if not match:
-        return expr
-    groupby_cols = []
+_STRING_AGG_RE = re.compile(
+    r"(?is)^STRING_AGG\s*\(\s*(?P<inner>.+?)\s*,\s*(?P<sep>'(?:''|[^'])*'|\"(?:\\\"|[^\"])*\")\s*\)\s*$"
+)
+
+
+def _string_agg_inner_expression(expr: str) -> str | None:
+    """Drop STRING_AGG wrapper so phase3 can resolve the inner column (no native 4X STRING_AGG)."""
+    m = _STRING_AGG_RE.match((expr or "").strip())
+    if not m:
+        return None
+    return m.group("inner").strip()
+
+
+def _parse_leading_min_max(expr: str) -> tuple[str, str, str] | None:
+    """Return ``(MIN|MAX, inner_between_parens, suffix_after_closing_paren)``."""
+    text = (expr or "").strip()
+    m = re.match(r"(?is)^(MIN|MAX)\s*\(", text)
+    if not m:
+        return None
+    fn = m.group(1).upper()
+    open_idx = m.end() - 1
+    depth = 0
+    in_quote = False
+    for i in range(open_idx, len(text)):
+        ch = text[i]
+        if ch == "'":
+            in_quote = not in_quote
+            continue
+        if in_quote:
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return fn, text[open_idx + 1 : i], text[i + 1 :].strip()
+    return None
+
+
+def _split_min_max_inner_and_group_list(inner: str) -> tuple[str, str]:
+    """Split ``expr`` and trailing ``[<GroupCols>]`` inside a MIN/MAX argument list."""
+    text = (inner or "").strip()
+    grp_m = re.search(r",\s*(\[[^\]]*\])\s*$", text)
+    if grp_m:
+        return text[: grp_m.start()].strip(), grp_m.group(1).strip()
+    return text, ""
+
+
+def _group_by_column_names(group_by_clause: str) -> list[str]:
+    names: list[str] = []
     for raw in split_csv_respecting_parens(group_by_clause):
         cleaned = raw.strip().strip('"').strip("'").rstrip(";").strip().strip('"').strip("'")
         name = bare_ident(cleaned.split(".")[-1] if cleaned else "")
         name = name.rstrip(";").strip()
         if name:
-            groupby_cols.append(name)
+            names.append(name)
+    return names
+
+
+def _attach_groupby_to_bare_aggregate(expr: str, group_by_clause: str) -> str:
+    """Rewrite ``MIN(expr)``/``MAX(expr)`` SELECT projections into
+    ``MIN(<expr>, [<GroupbyColumns>])`` when the statement has GROUP BY.
+    """
+    if not group_by_clause:
+        return expr
+    groupby_cols = _group_by_column_names(group_by_clause)
     if not groupby_cols:
+        return expr
+    parsed = _parse_leading_min_max(expr)
+    if parsed:
+        fn, inner, suffix = parsed
+        if suffix:
+            return expr
+        agg_expr, grp_list = _split_min_max_inner_and_group_list(inner)
+        if grp_list:
+            return expr
+        quoted = ", ".join(f'"{name}"' for name in groupby_cols)
+        return f"{fn}({agg_expr}, [{quoted}])"
+    match = _BARE_MIN_MAX_RE.match(expr.strip())
+    if not match:
         return expr
     quoted = ", ".join(f'"{name}"' for name in groupby_cols)
     return f"{match.group('fn').upper()}({match.group('col')}, [{quoted}])"
@@ -1828,12 +1888,6 @@ def _build_derived_table(
             if not tail:
                 continue
             name, expr = tail.group("n"), tail.group("e").strip()
-        agg = re.match(r"(?is)^STRING_AGG\s*\((?P<args>.*)\)$", expr.strip())
-        if agg:
-            # Concatenating aggregation has no row-level 4X form; the row's
-            # value is the aggregated source column itself.
-            args = split_csv_respecting_parens(agg.group("args"))
-            expr = args[0].strip() if args else expr
         expr = _attach_groupby_to_bare_aggregate(expr, group_by)
         projections[bare_ident(name).upper()] = expr
     return DerivedTable(primary, projections, inner_alias_map)
@@ -2260,30 +2314,34 @@ def _resolve_expression_tables(
                 )
             projection = table.projections.get(col.upper())
             if projection is not None:
+                string_agg_inner = _string_agg_inner_expression(projection)
+                if string_agg_inner is not None:
+                    projection = string_agg_inner
                 if re.search(r"(?is)\b(MIN|MAX|SUM|STRING_AGG)\s*\(", projection):
-                    single_agg = re.match(
-                        r"(?is)^\s*(?:MIN|MAX)\s*\(\s*(?P<inner>[^()]+)\)\s*$",
-                        projection.strip(),
-                    )
-                    if single_agg:
-                        # ``MIN(col, ["GroupCol"])`` (see _attach_groupby_to_bare_aggregate):
-                        # only ``col`` is a column reference. The bracketed GROUP BY list
-                        # is a list literal and must not be alias-resolved or
-                        # bare-qualified (that produced ``X::col, X.["GroupCol"]``).
-                        agg_args = re.match(
-                            r"(?is)^(?P<col>[^,\[\]]+?)\s*(?:,\s*(?P<grp>\[.*\]))?$",
-                            single_agg.group("inner").strip(),
-                        )
-                        agg_col = (
-                            agg_args.group("col").strip()
-                            if agg_args
-                            else single_agg.group("inner").strip()
-                        )
-                        agg_group_list = (
-                            (agg_args.group("grp") or "").strip() if agg_args else ""
-                        )
+                    min_max = _parse_leading_min_max(projection)
+                    if min_max and min_max[0] in {"MIN", "MAX"}:
+                        func, inner_raw, suffix = min_max
+                        if not suffix:
+                            agg_col, agg_group_list = _split_min_max_inner_and_group_list(
+                                inner_raw
+                            )
+                            inner = _resolve_expression_tables(
+                                agg_col,
+                                table.inner_alias_map,
+                                lineage,
+                                entity_map,
+                                default_entity,
+                                use_derived_formula=use_derived_formula,
+                                default_source_table=_pick_primary_source_table(
+                                    table.inner_alias_map
+                                ),
+                            )
+                            if agg_group_list:
+                                return f"{func}({inner}, {agg_group_list})"
+                            return f"{func}({inner})"
+                    if is_ephemeral_sql_alias(qual):
                         inner = _resolve_expression_tables(
-                            agg_col,
+                            projection,
                             table.inner_alias_map,
                             lineage,
                             entity_map,
@@ -2293,25 +2351,20 @@ def _resolve_expression_tables(
                                 table.inner_alias_map
                             ),
                         )
-                        inner_up = inner.upper()
-                        if (
-                            "::" in inner
-                            and "MIN(" not in inner_up
-                            and "MAX(" not in inner_up
-                        ):
-                            func = single_agg.group(0).strip().split("(", 1)[0].upper()
-                            ent_norm = normalize_table_name(default_entity).upper().lstrip("#")
-                            if (
-                                func == "MIN"
-                                and ent_norm.endswith("CUSTOMERCAL")
-                                and col.upper() == "FINALNPADT"
-                            ):
-                                if agg_group_list:
-                                    return f"MIN({inner}, {agg_group_list})"
-                                return f"MIN({inner})"
-                            return inner
-                    # Customer/account roll-ups: keep the derived-table hop instead
-                    # of re-expanding MIN(CASE…) trees onto the wrong entity level.
+                        return inner
+                    inner = _resolve_expression_tables(
+                        projection,
+                        table.inner_alias_map,
+                        lineage,
+                        entity_map,
+                        default_entity,
+                        use_derived_formula=use_derived_formula,
+                        default_source_table=_pick_primary_source_table(
+                            table.inner_alias_map
+                        ),
+                    )
+                    if inner != projection:
+                        return inner
                     ent = _normalize_entity(default_entity, entity_map)
                     return f'"{ent}"."{qual}"."{col}"'
                 inner = _resolve_expression_tables(
@@ -2473,8 +2526,16 @@ def _session_temp_column_marker(
 ) -> str:
     """Encode ``#session_temp``.col without tracing lineage through its UNION body."""
     rel = bare_ident(normalize_table_name(table_norm).lstrip("#"))
-    if hash_collisions and rel.upper() in hash_collisions:
-        rel = "#" + rel  # keep the temp distinct from the same-named permanent table
+    from app.grammar.entity_path_validator import is_physical_derivation_entity
+
+    if (
+        hash_collisions
+        and rel.upper() in hash_collisions
+        and table_norm.startswith("#")
+        and not table_norm.startswith("##")
+        and not is_physical_derivation_entity(rel)
+    ):
+        rel = "#" + rel  # session ``#temp`` only — not ``##AccountCal`` / permanent tables
     ent = _normalize_entity(default_entity, entity_map)
     if lineage_keeps_target_hop(ent, rel):
         return f'"{ent}"."{rel}"."{column}"'

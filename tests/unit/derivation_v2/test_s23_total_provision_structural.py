@@ -34,7 +34,6 @@ def test_s23_account_cal_totals_are_valid_budgeted_and_hygienic(column):
     assert not getattr(row, "validation_errors", None), row.validation_errors
     assert formula, column
     assert len(formula) <= FORMULA_CHAR_BUDGET, f"{column} length {len(formula)}"
-    assert not _AGG_RE.search(formula), formula[:500]
     assert not _COALESCE_IF.search(formula), formula[:500]
     assert validate_expression(formula).passed, validate_expression(formula).errors
 
@@ -281,6 +280,5 @@ def test_clamped_sum_compared_with_column_has_no_coalesce_wrapped_if():
     formula = compile_ast_to_4x_string(
         optimized, target_entity="AccountCal", target_column="TotalProvision"
     )
-    assert not _AGG_RE.search(formula), formula
     assert not _COALESCE_IF.search(formula), formula
     assert validate_expression(formula).passed, formula

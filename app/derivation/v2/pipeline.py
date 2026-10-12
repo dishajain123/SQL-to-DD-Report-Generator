@@ -27,7 +27,8 @@ from app.derivation.v2.phase2_mutation_folder import (
     _written_columns_by_table,
     fold_column_mutations,
 )
-from app.derivation.v2.phase3_ast_generator import generate_ast
+from app.derivation.v2.phase3_ast_generator import generate_ast, pop_fold_skip_notes
+from app.grammar.entity_path_validator import validate_entity_paths_in_expression
 from app.derivation.derivation_option import format_expression_syntax
 from app.derivation.v2.phase4_metadata import build_metadata, metadata_to_dd_row
 from app.derivation.v2.semantic_checks import mutation_semantic_errors
@@ -243,6 +244,7 @@ def _derive_column(
 
     ast = generate_ast(primary, target_entity=entity, target_column=column, llm_client=llm_client)
     formula, compile_error = _compile(ast, entity=entity, column=column)
+    fold_skips = pop_fold_skip_notes()
     workflow_compact_note: str | None = None
     if formula and len(formula) > 8000:
         from app.derivation.v2.ast_optimize import workflow_passthrough_ast
@@ -270,6 +272,13 @@ def _derive_column(
     if main and handler:
         handler_ast = generate_ast(handler, target_entity=entity, target_column=column)
         exception_formula, _ = _compile(handler_ast, entity=entity, column=column)
+        pop_fold_skip_notes()
+
+    path_errors: list[str] = []
+    if formula:
+        path_errors = validate_entity_paths_in_expression(formula)
+        if path_errors:
+            compile_error = compile_error or path_errors[0]
 
     meta = build_metadata(
         target_entity=entity,
@@ -284,6 +293,11 @@ def _derive_column(
         mutation_dependency_refs=[ref for m in mutations for ref in (m.dependency_refs or [])],
     )
     meta.validation_errors.extend(mutation_semantic_errors(primary, sql_text))
+    meta.validation_errors.extend(fold_skips)
+    if path_errors:
+        meta.validation_errors.extend(
+            [f"Invalid entity path in formula: {e}" for e in path_errors]
+        )
     if compile_error:
         meta.validation_errors.append(f"AST compile error: {compile_error}")
         meta.confidence = min(meta.confidence, 0.2)

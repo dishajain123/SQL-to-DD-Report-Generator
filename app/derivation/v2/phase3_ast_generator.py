@@ -11,7 +11,19 @@ from __future__ import annotations
 from app.derivation.v2.ast_limits import FormulaExpansionError
 
 import re
+from contextvars import ContextVar
 from typing import Any, Optional
+
+_FOLD_SKIP_NOTES: ContextVar[list[str] | None] = ContextVar("_FOLD_SKIP_NOTES", default=None)
+
+
+def _set_fold_skip_notes(notes: list[str]) -> None:
+    _FOLD_SKIP_NOTES.set(notes)
+
+
+def pop_fold_skip_notes() -> list[str]:
+    notes = _FOLD_SKIP_NOTES.get()
+    return list(notes or [])
 
 from app.derivation.v2.ast_optimize import (
     enforce_formula_budget,
@@ -159,8 +171,12 @@ def generate_ast(
     if not mutations:
         return _column_ref(target_entity, target_column)
 
+    fold_skip_notes: list[str] = []
+    _set_fold_skip_notes(fold_skip_notes)
     try:
-        return build_ast_from_mutations(mutations, target_entity, target_column)
+        return build_ast_from_mutations(
+            mutations, target_entity, target_column, fold_skip_notes=fold_skip_notes
+        )
     except (_ValuePredicateMixingError, FormulaExpansionError) as exc:
         # Surface through the existing compile-error channel (ast_compiler
         # raises on this sentinel) rather than letting the exception bubble
@@ -184,6 +200,8 @@ def build_ast_from_mutations(
     mutations: list[MutationPass],
     target_entity: str,
     target_column: str,
+    *,
+    fold_skip_notes: list[str] | None = None,
 ) -> dict[str, Any]:
     """Deterministic chronological fold (later guarded passes layer on top).
 
@@ -254,6 +272,14 @@ def build_ast_from_mutations(
             if _skip_mutation_in_ast_fold(mutation, target_entity, target_column):
                 if _is_set_based_unresolved_source_assignment(mutation, target_entity):
                     skipped_set_based_source = True
+                if fold_skip_notes is not None:
+                    reason = "unresolved set-based source"
+                    snippet = (mutation.raw_sql or mutation.assigned_expression or "").strip()
+                    if len(snippet) > 400:
+                        snippet = snippet[:400] + "…"
+                    fold_skip_notes.append(
+                        f"AST fold excluded mutation ({reason}; manual review required): {snippet}"
+                    )
                 continue
             ast_before_this_pass = ast
             then_node = parse_sql_expression_to_ast(
@@ -294,6 +320,8 @@ def build_ast_from_mutations(
                 clamp = _classify_total_clamp(raw_cond, then_node, target_entity, target_column)
                 if clamp is not None and clamp[0] == "floor":
                     saw_floor_clamp = True
+                    deferred_clamps.append(clamp)
+                    continue
                 if (
                     clamp is not None
                     and clamp[0] == "cap"
@@ -499,6 +527,7 @@ def build_ast_from_mutations(
             pass
     if (
         skipped_set_based_source
+        and not (fold_skip_notes or [])
         and isinstance(ast_out, dict)
         and _is_self_column_ref(ast_out, target_entity, target_column)
         and not _is_string_flag_column(target_column)
@@ -1177,6 +1206,14 @@ def _apply_deferred_clamps(
         if any(bk == base_key and prior <= extra_sigs for bk, prior in kept):
             continue
         kept.append((base_key, extra_sigs))
+        if kind == "floor":
+            zero = {"type": "LITERAL", "value_type": "NUMBER", "value": 0}
+            result = {
+                "type": "FUNCTION_CALL",
+                "function_name": "MAX",
+                "arguments": [result, zero],
+            }
+            continue
         if with_floor and kind == "cap" and op == ">" and not extras:
             # Standard clamp: IF(t > Bound) THEN Bound ELSEIF(t < 0) THEN 0 ELSE t.
             # ``_keep_inline`` stops the optimizer hoisting the total's IF terms out
@@ -1389,8 +1426,6 @@ def _skip_mutation_in_ast_fold(
 
     - Aggregates over CTE/subquery sources (``UPDATE … FROM (SELECT MAX…) a``)
       leave ``A.Col`` qualifiers that do not resolve to a platform entity.
-    - Cross-column null defaults (``SET MaxFin=0 WHERE MaxNonFin IS NULL``)
-      must not fold into the wrong column's derivation.
     """
     expr = (mutation.assigned_expression or "").strip()
     if not expr:
@@ -1399,19 +1434,6 @@ def _skip_mutation_in_ast_fold(
     if _is_set_based_unresolved_source_assignment(mutation, target_entity):
         return True
 
-    cond_sql = mutation.effective_condition or mutation.where_clause or ""
-    if mutation.guarded and cond_sql and not _condition_sql_mentions_column(
-        cond_sql, target_column
-    ):
-        try:
-            value = parse_sql_expression_to_ast(
-                expr, default_entity=target_entity, target_column=target_column
-            )
-        except Exception:
-            value = None
-        if isinstance(value, dict) and value.get("type") == "LITERAL":
-            if _is_cross_column_null_default_guard(cond_sql, target_column):
-                return True
     return False
 
 
@@ -1434,7 +1456,7 @@ def _is_set_based_unresolved_source_assignment(
             return True
     if expr.startswith('"') and re.search(r'"\s*\.\s*"[^"]+"\s*\.\s*"', expr):
         return False
-    if re.match(r"(?is)^MIN\s*\(", expr):
+    if re.match(r"(?is)^(MIN|MAX|SUM)\s*\(", expr):
         return False
     match = re.match(
         r"(?i)^(?P<qual>[A-Za-z_][\w]*)\.(?P<col>[A-Za-z_][\w]*)$",
@@ -1731,13 +1753,15 @@ def parse_sql_expression_to_ast(
 
     string_agg = re.match(r"(?is)^STRING_AGG\s*\(\s*(?P<args>.*)\s*\)$", text.strip())
     if string_agg and _balanced(string_agg.group("args")):
-        parts = _split_top_level(string_agg.group("args"), ",")
-        if parts:
-            return parse_sql_expression_to_ast(
-                parts[0].strip(),
-                default_entity=default_entity,
-                target_column=target_column,
-            )
+        from app.derivation.v2.platform_aggregates import STRING_AGG_UNSUPPORTED_MESSAGE
+
+        return {
+            "type": "FUNCTION_CALL",
+            "function_name": "__UNSUPPORTED_SQL__",
+            "arguments": [],
+            "_validation_error": STRING_AGG_UNSUPPORTED_MESSAGE,
+            "_source_sql": text.strip(),
+        }
 
     # Oracle/SQL date literals & constructors → TODATE(...)
     date_lit = _try_parse_date_literal(text, default_entity, target_column)

@@ -55,7 +55,7 @@ def test_customer_sysnpa_dt_is_derived_and_valid():
     assert not row.validation_errors, row.validation_errors
     assert validate_expression(formula).passed, validate_expression(formula).errors
     assert "Untranslated" not in formula
-    assert not re.search(r"\b(MIN|MAX|SUM|COUNT)\s*\(", formula, re.I), formula[:500]
+    assert re.search(r"\bMIN\s*\(", formula, re.I), formula[:500]
     assert "PUI_CAL" in formula.upper() or "NPA_DATE" in formula.upper()
 
 

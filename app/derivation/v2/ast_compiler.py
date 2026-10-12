@@ -15,9 +15,19 @@ from typing import Any
 
 from app.derivation.v2.ast_optimize import (
     distribute_if_over_comparisons,
-    lower_set_aggregates,
     optimize_expression_ast,
 )
+from app.derivation.v2.platform_aggregates import (
+    PLATFORM_AGGREGATE_FUNCTIONS,
+    STRING_AGG_UNSUPPORTED_MESSAGE,
+    UNSUPPORTED_PLATFORM_AGGREGATES,
+)
+from app.grammar.platform_library import (
+    DOCUMENTED_4X_FUNCTIONS,
+    PLATFORM_LIBRARY_DOC,
+    normalize_function_name_for_platform,
+)
+from app.grammar.entity_path_validator import is_physical_derivation_entity
 from app.derivation.v2.sql_text import (
     bare_ident,
     is_ephemeral_sql_alias,
@@ -59,23 +69,11 @@ ALLOWED_MEMBERSHIP_OPS = {
     "DOESNOTCONTAINS",
 }
 _MEMBERSHIP_OP_TOKENS = ALLOWED_MEMBERSHIP_OPS
-ALLOWED_FUNCTIONS = {
-    "ISEMPTY",
-    "ISNOTEMPTY",
-    "COALESCE",
-    "SOM",
-    "EOM",
-    "ADDDAY",
-    "PERIOD",
-    "DATEDIFF",
-    "TODATE",
-    "CONCAT",
-    "ABS",
-    "ROUND",
-}
 
+# Every function the compiler may emit (must match platform_library + native aggregates).
+_EMIT_FUNCTIONS = DOCUMENTED_4X_FUNCTIONS | PLATFORM_AGGREGATE_FUNCTIONS
 
-_SET_AGGREGATE_FUNCS = frozenset({"MIN", "MAX", "SUM", "COUNT"})
+_SET_AGGREGATE_FUNCS = PLATFORM_AGGREGATE_FUNCTIONS
 _COMPARISON_OPS_AST = frozenset({">", "<", ">=", "<=", "==", "!="})
 
 
@@ -123,11 +121,21 @@ def _quote_entity_for_4x(entity: str) -> str:
     """Quote a physical entity for 4X, preserving ``#`` on session scratch tables."""
     raw = (entity or "").strip()
     if raw.startswith("#") and not raw.startswith("##"):
+        cleaned = _clean_entity_qualifier(raw)
+        # Hash-collision markers must not tag global interface tables (``##AccountCal``)
+        # as session temps — only genuine scratch tables keep the ``#`` prefix.
+        if is_physical_derivation_entity(cleaned):
+            return f'"{cleaned}"'
         # A session temp that shares its bare name with a permanent table keeps its
         # ``#`` so the two stay distinct entities.
-        return f'"#{_clean_entity_qualifier(raw)}"'
+        return f'"#{cleaned}"'
     clean = _clean_entity_qualifier(entity)
-    if is_staging_derivation_entity(clean) and not clean.startswith("##"):
+    upper = bare_ident(clean).upper()
+    if (
+        is_staging_derivation_entity(clean)
+        and not clean.startswith("##")
+        and upper not in {"ACCOUNTCAL", "CUSTOMERCAL", "COBORROWERCAL"}
+    ):
         base = clean.lstrip("#")
         return f'"#{base}"'
     return f'"{clean}"'
@@ -233,16 +241,15 @@ def _compile_ast_to_4x_string(node: dict[str, Any] | None) -> str:
     if node_type == "FUNCTION_CALL":
         func = str(node.get("function_name") or "").strip().upper()
         args = node.get("arguments") or []
-        if func in _SET_AGGREGATE_FUNCS:
-            lowered = lower_set_aggregates(node)
-            if isinstance(lowered, dict) and (
-                lowered.get("type") != "FUNCTION_CALL"
-                or str(lowered.get("function_name") or "").upper() not in _SET_AGGREGATE_FUNCS
-            ):
-                return _compile_ast_to_4x_string(lowered)
+        if func in UNSUPPORTED_PLATFORM_AGGREGATES:
             raise ValueError(
-                f"Set aggregate {func} has no row-level 4X equivalent after lowering"
+                STRING_AGG_UNSUPPORTED_MESSAGE
+                if func == "STRING_AGG"
+                else f"Unsupported set aggregate: {func}"
             )
+        if func in _SET_AGGREGATE_FUNCS:
+            rendered = ", ".join(_compile_ast_to_4x_string(a) for a in args)
+            return f"{func}({rendered})"
         if func == "__UNSUPPORTED_SQL__":
             raise ValueError(node.get("_validation_error") or "Unsupported SQL expression")
         if func == "__VALUE_PREDICATE_MIXING__":
@@ -268,6 +275,11 @@ def _compile_ast_to_4x_string(node: dict[str, Any] | None) -> str:
             folded = _fold_numeric_constant(node)
             if folded is not None:
                 return _compile_literal(folded)
+        func = normalize_function_name_for_platform(func)
+        if func not in _EMIT_FUNCTIONS:
+            raise ValueError(
+                f"Function {func} is not in the documented 4X library ({PLATFORM_LIBRARY_DOC})"
+            )
         rendered = ", ".join(_compile_ast_to_4x_string(a) for a in args)
         return f"{func}({rendered})"
 
@@ -485,6 +497,8 @@ def _clean_keep_session_hash(text: str) -> str:
     raw = (text or "").strip()
     cleaned = _clean_entity_qualifier(raw)
     if raw.startswith("#") and not raw.startswith("##") and cleaned and not cleaned.startswith("#"):
+        if is_physical_derivation_entity(cleaned):
+            return cleaned
         return f"#{cleaned}"
     return cleaned
 
@@ -707,7 +721,7 @@ _NAME_TYPE_HINTS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (DATA_TYPE_INTEGER, re.compile(
         # (?<!AC)(?<!DIS): "Account" / "Discount" are not counters.
         r"(?i)(DAYS$|_DAYS_|(?<!AC)(?<!DIS)COUNT$|CNT$|_KEY$|ALTKEY$|TIMEKEY|QTY$|"
-        r"SEQ$|STEP$|RANK$|YEARS$|MONTHS$|^DPD_|^REFPERIOD)"
+        r"SEQ$|STEP$|RANK$|YEARS$|MONTHS$|^DPD_|^REFPERIOD|REFPERIODNPA$|PERIODNPA$)"
     )),
     (DATA_TYPE_DECIMAL, re.compile(
         r"(?i)(AMT|AMOUNT|(?<!GLO)BAL$|BALANCE|PENAL|INTEREST|RATE$|PCT|PERCENT|RATIO|PRINCIPAL|"

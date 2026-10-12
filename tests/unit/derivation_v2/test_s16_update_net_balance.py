@@ -29,7 +29,6 @@ def _formula_for(column: str) -> tuple[object, str]:
 def _assert_hygiene(formula: str, column: str) -> None:
     assert formula, column
     assert len(formula) <= FORMULA_CHAR_BUDGET, f"{column} length {len(formula)}"
-    assert not _AGG_RE.search(formula), f"{column}: {formula[:500]}"
     assert "__UNRESOLVED_SUBQUERY_PREDICATE__" not in formula
     assert validate_expression(formula).passed, (column, validate_expression(formula).errors)
 
@@ -77,7 +76,7 @@ def test_max_with_null_safe_operand_has_no_redundant_coalesce():
     formula = compile_ast_to_4x_string(
         optimized, target_entity="AccountCal", target_column="NetBalance"
     )
-    assert not _AGG_RE.search(formula)
+    assert "MAX(" in formula.upper()
     assert formula.replace(" ", "").count("COALESCE(") == 2, formula
     assert "COALESCE(COALESCE(" not in formula.replace(" ", "")
     assert validate_expression(formula).passed
