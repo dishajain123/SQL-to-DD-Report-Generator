@@ -31,6 +31,7 @@ from app.derivation.v2.sql_text import (
     parse_from_join_clause_with_type,
     parse_select_list,
     split_csv_respecting_parens,
+    prepare_sql_for_derivation,
     strip_sql_comments,
 )
 from app.utils.entity_name_map import resolve_entity_name
@@ -337,6 +338,7 @@ class MutationSourceIndex:
 
     @classmethod
     def build(cls, sql_text: str) -> "MutationSourceIndex":
+        sql_text = prepare_sql_for_derivation(sql_text or "")
         updates = extract_update_statements(sql_text)
         by_column: dict = {}
         for index, stmt in enumerate(updates):
@@ -345,7 +347,7 @@ class MutationSourceIndex:
                 grouped.setdefault(assignment["column"].upper(), []).append(assignment)
             for column, assignments in grouped.items():
                 by_column.setdefault(column, []).append((index, stmt, assignments))
-        stripped = strip_sql_comments(sql_text)
+        stripped = sql_text
         return cls(
             sql_text, updates, by_column,
             extract_insert_select(sql_text), extract_select_into(sql_text),
@@ -515,6 +517,7 @@ def fold_column_mutations(
     source_index: MutationSourceIndex | None = None,
 ) -> list[MutationPass]:
     """Chronologically collect UPDATE passes that mutate target_entity.column."""
+    sql_text = prepare_sql_for_derivation(sql_text or "")
     target_entity_norm = _normalize_entity(target_entity, entity_map)
     target_col = bare_ident(target_column)
     mutations: list[MutationPass] = []

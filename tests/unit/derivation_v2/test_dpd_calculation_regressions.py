@@ -9,7 +9,10 @@ import pytest
 from app.derivation.v2.ast_compiler import compile_ast_to_4x_string
 from app.derivation.v2.ast_optimize import FORMULA_CHAR_BUDGET, optimize_expression_ast
 from app.derivation.v2.phase2_mutation_folder import _try_dedupe_coalesce_negative_clamp
-from app.derivation.v2.phase3_ast_generator import _is_cross_column_null_default_guard
+from app.derivation.v2.phase3_ast_generator import (
+    _is_cross_column_null_default_guard,
+    _rewrite_sibling_null_guard_typo,
+)
 from app.derivation.v2.pipeline import generate_for_sql
 from app.grammar.validator import validate_expression
 
@@ -110,6 +113,17 @@ def test_adv_ac_restructure_columns_are_self_isempty_not_subquery_alias():
         assert column.upper() in expr.upper(), expr
         assert re.search(r"\bMAX\s*\(", expr, re.I), expr
         assert validate_expression(expr).passed, validate_expression(expr).errors
+
+
+def test_rewrite_dpd_maxfin_null_guard_typo_in_source_sql():
+    fixed = _rewrite_sibling_null_guard_typo(
+        "DPD_MaxNonFin IS NULL", "DPD_MaxFin", "0"
+    )
+    assert fixed == "DPD_MaxFin IS NULL"
+    unchanged = _rewrite_sibling_null_guard_typo(
+        "DPD_MaxNonFin IS NULL", "DPD_MaxNonFin", "0"
+    )
+    assert unchanged == "DPD_MaxNonFin IS NULL"
 
 
 def test_resolved_dimproduct_isnull_predicate_is_not_cross_column_skip():

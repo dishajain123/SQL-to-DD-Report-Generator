@@ -22,6 +22,7 @@ from app.derivation.derivation_option import (
 )
 from app.models.core import DDRow, DerivationOption, ReviewState
 from app.utils import db
+from app.report.dd_rule_explanation import build_rule_explanation
 from app.utils.identity import canonical_expression_key, canonical_logical_name
 
 COLUMNS = [
@@ -30,11 +31,10 @@ COLUMNS = [
     "Column Type",
     "Derivation Option",
     "Display Derivation Expression",
+    "Rule Explanation",
     "Effective Start Date",
     "Status",
     "Data Type",
-    "Decision Table Json",
-    "Conditional Json",
 ]
 
 _COLUMN_KEYS = {
@@ -43,11 +43,10 @@ _COLUMN_KEYS = {
     "Column Type": "column_type",
     "Derivation Option": "derivation_option",
     "Display Derivation Expression": "display_derivation_expression",
+    "Rule Explanation": "rule_explanation",
     "Effective Start Date": "effective_start_date",
     "Status": "status",
     "Data Type": "data_type",
-    "Decision Table Json": "decision_table_json",
-    "Conditional Json": "conditional_json",
 }
 
 
@@ -114,13 +113,17 @@ def dd_row_to_dict(dd: DDRow) -> dict:
         "column_type": dd.column_type.value,
         "derivation_option": option.value,
         "display_derivation_expression": display,
+        "rule_explanation": build_rule_explanation(
+            dd.entity_name,
+            dd.column_name,
+            display,
+            business_meaning=getattr(dd, "business_meaning", "") or "",
+        ),
         "effective_start_date": dd.effective_start_date.strftime("%d-%m-%Y"),
         "status": dd.status.value,
         "data_type": reconcile_data_type(
             dd.data_type, dd.display_derivation_expression, dd.column_name
         ),
-        "decision_table_json": dd.decision_table_json or "",
-        "conditional_json": dd.conditional_json or "",
     }
 
 
@@ -243,8 +246,7 @@ def _row_signature(row: dict) -> tuple:
         row["derivation_option"],
         row["status"],
         row["data_type"],
-        row["decision_table_json"],
-        row["conditional_json"],
+        row.get("rule_explanation", ""),
     )
 
 
@@ -376,11 +378,10 @@ def _write_dd_xlsx(merged: list[dict], output_path: Path) -> Path:
         "Column Type": 14,
         "Derivation Option": 20,
         "Display Derivation Expression": 80,
+        "Rule Explanation": 56,
         "Effective Start Date": 18,
         "Status": 14,
         "Data Type": 12,
-        "Decision Table Json": 24,
-        "Conditional Json": 20,
     }
     for idx, header in enumerate(COLUMNS, start=1):
         ws.column_dimensions[get_column_letter(idx)].width = widths.get(header, 16)
@@ -628,6 +629,3 @@ def write_qa_coverage_report(
         lines.extend(["", "## Write coverage ledger", "", coverage_markdown])
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return output_path
-
-    dd_rows = [_row_dict_to_dd_row(dict(row)) for row in rows]
-    return export_dd_rows_excel(dd_rows, output_path)

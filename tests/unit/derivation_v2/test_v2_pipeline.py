@@ -1,6 +1,7 @@
 """Unit tests for Derivation Engine v2 (AST pipeline)."""
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -152,7 +153,8 @@ def test_join_to_plain_table_uses_its_real_name_as_relationship():
     """
     _, debug = generate_for_sql(sql, "##ACCOUNTCAL", "ASSET_NORM", llm_client=None)
     formula = debug["formula"]
-    assert '"ACCOUNTCAL"."DimProduct"."ProductGroup"' in formula
+    assert '"DimProduct"."ProductGroup"' in formula
+    assert '"ACCOUNTCAL"."DimProduct"' not in formula.replace(" ", "")
     assert "##DimProduct" not in formula
     assert validate_expression(formula).valid
 
@@ -171,7 +173,8 @@ def test_join_to_global_temp_keeps_its_prefix_and_local_temp_traces_to_root():
     WHERE B.RiskFlag = 'Y'
     """
     _, d_global = generate_for_sql(sql_global, "##ACCOUNTCAL", "ASSET_NORM", llm_client=None)
-    assert '"ACCOUNTCAL"."CUSTOMERCAL"."RiskFlag"' in d_global["formula"]
+    assert '"CUSTOMERCAL"."RiskFlag"' in d_global["formula"].upper()
+    assert '"ACCOUNTCAL"."CUSTOMERCAL"' not in d_global["formula"].upper().replace(" ", "")
     assert validate_expression(d_global["formula"]).valid
 
     sql_local = """
@@ -184,7 +187,8 @@ def test_join_to_global_temp_keeps_its_prefix_and_local_temp_traces_to_root():
     WHERE C.RiskFlag = 'Y'
     """
     _, d_local = generate_for_sql(sql_local, "##ACCOUNTCAL", "ASSET_NORM", llm_client=None)
-    assert '"ACCOUNTCAL"."CustomerMaster"."RiskFlag"' in d_local["formula"]
+    assert '"CustomerMaster"."RiskFlag"' in d_local["formula"]
+    assert '"ACCOUNTCAL"."CustomerMaster"' not in d_local["formula"].replace(" ", "")
     assert "#CustRisk" not in d_local["formula"]
     assert validate_expression(d_local["formula"]).valid
 
@@ -1240,7 +1244,8 @@ def test_update_join_keys_feed_lineage_and_step_context():
     """
     row, debug = generate_for_sql(sql, "LoanAccount", "AssetClass")
     assert validate_expression(debug["formula"]).valid
-    assert '"LoanAccount"."CustomerMaster"."NewClass"' in debug["formula"]
+    assert '"CustomerMaster"."NewClass"' in debug["formula"]
+    assert '"LoanAccount"."CustomerMaster"' not in debug["formula"].replace(" ", "")
     refs = debug["mutations"][0]["dependency_refs"]
     assert "LoanAccount.CustomerId" in refs and "CustomerMaster.CustomerId" in refs
     assert row.execution_steps[0].join_conditions == [
@@ -1389,6 +1394,36 @@ def test_export_reconciles_data_type_against_formula_outputs():
     assert reconcile_data_type("String", 'IF("T"."X" > 1)THEN(1)ELSE(0)', "RetryCount") == "Integer"
     # A "@Var" token is a variable, not text; no literal outputs → unchanged.
     assert reconcile_data_type("Date", 'IF("T"."X" > 1)THEN("@ProcessDate")ELSE("T"."D")', "D") == "Date"
+
+
+def test_inmonthmark_daily_non_eom_join_flag_not_isempty_first():
+    """S03: bulk default N + IF daily-non-EOM join Y / null N + ELSE all Y."""
+    sql_path = (
+        ROOT
+        / "samples"
+        / "sql"
+        / "PRO_SPs_Sequenced"
+        / "08_S03_PRO.Marking_InMonthMark_Customer_Account_level.StoredProcedure.sql"
+    )
+    sql = sql_path.read_text(encoding="utf-8")
+    row, debug = generate_for_sql(sql, "##CUSTOMERCAL", "INMONTHMARK", llm_client=None)
+    formula = debug.get("formula") or row.display_derivation_expression or ""
+    assert formula, row.validation_errors
+    result = validate_expression(formula)
+    assert result.valid, f"{result.error}\nformula={formula}"
+    upper = formula.upper()
+    assert "PROC_FREQ" in upper or "@PROC_FREQ" in upper
+    assert "SOURCESYSTEMCUSTOMERID" in upper
+    assert "ACCOUNTCAL" in upper
+    # ISEMPTY must not be the first guard (it would block join matching).
+    if "ISEMPTY" in upper:
+        assert upper.index("IF(") < upper.index("ISEMPTY")
+    assert not upper.strip().startswith("IF(ISEMPTY")
+    assert '"Y"' in formula and '"N"' in formula
+    compact = re.sub(r"\s+", "", formula).upper()
+    assert "CUSTOMERCAL" in compact and "ACCOUNTCAL" in compact
+    assert compact.count("SOURCESYSTEMCUSTOMERID") >= 2
+    assert '."A".' not in formula.upper() and '."B".' not in formula.upper()
 
 
 def test_report_and_qa_list_rules_in_execution_order(tmp_path):

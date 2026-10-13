@@ -32,7 +32,8 @@ def test_final_npa_dt_customer_writeback_is_after_account_level_arms():
     assert '"ACCOUNTCAL"."REFPERIODNPA"' not in upper.replace(" ", "")
     assert "SYSNPA" in upper
     # Account-level dates are evaluated first; the customer roll-up copy follows them.
-    idx_sys = upper.find("THEN(\"ACCOUNTCAL\".\"CUSTOMERCAL\".\"SYSNPA_DT\")")
+    idx_sys = upper.find("THEN(\"CUSTOMERCAL\".\"SYSNPA_DT\")")
+    assert '"ACCOUNTCAL"."CUSTOMERCAL".' not in upper.replace(" ", "")
     if idx_sys < 0:
         idx_sys = upper.rfind("SYSNPA")
     idx_temp = upper.find("TEMPTABLENPA")
@@ -220,6 +221,27 @@ def test_s06_restructure_and_acl_columns_are_valid():
     catch = acl.exception_handler_expression or acl_debug.get("exception_handler_formula") or ""
     assert catch
     assert "NPA_Date_Calculation" in catch
+
+
+def test_s06_dpd_nocredit_oda_cap_does_not_double_threshold_guard():
+    """ODA ``DPD_NoCredit`` cap must match sibling DPD nesting on ``#TEMPTABLEDPD``."""
+    sql = _sql()
+    noc_row, noc_dbg = generate_for_sql(sql, "TEMPTABLEDPD", "DPD_NoCredit", llm_client=None)
+    int_row, int_dbg = generate_for_sql(sql, "TEMPTABLEDPD", "DPD_IntService", llm_client=None)
+    noc = noc_dbg.get("formula") or noc_row.display_derivation_expression or ""
+    ints = int_dbg.get("formula") or int_row.display_derivation_expression or ""
+    assert noc and ints
+    _assert_hygiene(noc, "DPD_NoCredit")
+    _assert_hygiene(ints, "DPD_IntService")
+    assert noc.upper().count("IF(") <= ints.upper().count("IF(") + 1, (
+        f"DPD_NoCredit more nested than IntService: {noc.count('IF(')} vs {ints.count('IF(')}"
+    )
+    assert "IF(IF(" not in noc
+    compact = noc.replace(" ", "").upper()
+    assert compact.count("REFPERIODNOCREDIT") <= ints.replace(" ", "").upper().count(
+        "REFPERIODINTSERVICE"
+    ) + 2
+    assert "SCHEMETYPE" in noc.upper() and "ODA" in noc
 
 
 def test_s06_staging_temps_are_not_business_targets():

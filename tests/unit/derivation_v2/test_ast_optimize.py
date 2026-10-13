@@ -318,6 +318,166 @@ def test_enforce_later_update_precedence_hoists_tagged_arm():
     assert "@ProcessDate" in formula or "ProcessDate" in formula
 
 
+def test_collapse_intermediate_entity_hop_refs_unit():
+    from app.derivation.v2.ast_compiler import compile_ast_to_4x_string
+    from app.derivation.v2.ast_optimize import optimize_expression_ast
+
+    ast = {
+        "type": "BINARY_OP",
+        "operator": "==",
+        "left": {
+            "type": "COLUMN_REF",
+            "entity": "AdvAcBasicDetail",
+            "column": "CustomerEntityId",
+        },
+        "right": {
+            "type": "COLUMN_REF",
+            "entity": "AccountCal",
+            "relationship": "CustomerCal",
+            "column": "CustomerEntityId",
+        },
+    }
+    out = optimize_expression_ast(ast, target_entity="AccountCal", target_column="X")
+    formula = compile_ast_to_4x_string(out, target_entity="AccountCal", target_column="X")
+    assert '"CUSTOMERCAL"."CUSTOMERENTITYID"' in formula.upper()
+    assert '"ACCOUNTCAL"."CUSTOMERCAL"' not in formula.upper().replace(" ", "")
+
+
+def test_merge_s06_temp_dpd_nocredit_oda_cap_unit():
+    from app.derivation.v2.ast_optimize import _try_merge_s06_dpd_nocredit_oda_cap
+
+    threshold = {
+        "type": "IF_THEN_ELSE",
+        "condition": {
+            "type": "BINARY_OP",
+            "operator": ">=",
+            "left": {
+                "type": "FUNCTION_CALL",
+                "function_name": "COALESCE",
+                "arguments": [
+                    {"type": "COLUMN_REF", "entity": "AccountCal", "column": "DPD_NoCredit"},
+                    {"type": "LITERAL", "value_type": "NUMBER", "value": 0},
+                ],
+            },
+            "right": {
+                "type": "FUNCTION_CALL",
+                "function_name": "COALESCE",
+                "arguments": [
+                    {"type": "COLUMN_REF", "entity": "AccountCal", "column": "RefPeriodNoCredit"},
+                    {"type": "LITERAL", "value_type": "NUMBER", "value": 0},
+                ],
+            },
+        },
+        "then_branch": {"type": "COLUMN_REF", "entity": "AccountCal", "column": "DPD_NoCredit"},
+        "else_branch": {"type": "LITERAL", "value_type": "NUMBER", "value": 0},
+    }
+    def _temp_gte(dpd: str, ref: str) -> dict:
+        return {
+            "type": "BINARY_OP",
+            "operator": ">=",
+            "left": {
+                "type": "FUNCTION_CALL",
+                "function_name": "COALESCE",
+                "arguments": [
+                    {"type": "COLUMN_REF", "entity": "#TEMPTABLEDPD", "column": dpd},
+                    {"type": "LITERAL", "value_type": "NUMBER", "value": 0},
+                ],
+            },
+            "right": {
+                "type": "FUNCTION_CALL",
+                "function_name": "COALESCE",
+                "arguments": [
+                    {"type": "COLUMN_REF", "entity": "#TEMPTABLEDPD", "column": ref},
+                    {"type": "LITERAL", "value_type": "NUMBER", "value": 0},
+                ],
+            },
+        }
+
+    or_cond = _temp_gte("DPD_IntService", "RefPeriodIntService")
+    for dpd, ref in (
+        ("DPD_NoCredit", "RefPeriodNoCredit"),
+        ("DPD_Overdrawn", "RefPeriodOverDrawn"),
+        ("DPD_Overdue", "RefPeriodOverdue"),
+    ):
+        or_cond = {"type": "BINARY_OP", "operator": "OR", "left": or_cond, "right": _temp_gte(dpd, ref)}
+    oda_cond = {
+        "type": "BINARY_OP",
+        "operator": "AND",
+        "left": {
+            "type": "BINARY_OP",
+            "operator": "==",
+            "left": {"type": "COLUMN_REF", "entity": "DimProduct", "column": "SchemeType"},
+            "right": {"type": "LITERAL", "value_type": "STRING", "value": "ODA"},
+        },
+        "right": {
+            "type": "BINARY_OP",
+            "operator": "==",
+            "left": {"type": "COLUMN_REF", "entity": "AccountCal", "column": "FlgDeg"},
+            "right": {"type": "LITERAL", "value_type": "STRING", "value": "Y"},
+        },
+    }
+    prior = {"type": "COLUMN_REF", "entity": "#TEMPTABLEDPD", "column": "DPD_NoCredit"}
+    messy = {
+        "type": "IF_THEN_ELSE",
+        "condition": oda_cond,
+        "then_branch": threshold,
+        "else_branch": {
+            "type": "IF_THEN_ELSE",
+            "condition": or_cond,
+            "then_branch": threshold,
+            "else_branch": prior,
+        },
+    }
+    from app.derivation.v2.ast_optimize import _flatten_if_elseif_chain
+
+    out = _try_merge_s06_dpd_nocredit_oda_cap(
+        messy, target_entity="TEMPTABLEDPD", target_column="DPD_NoCredit"
+    )
+    assert out is not None
+    arms, default = _flatten_if_elseif_chain(out)
+    assert len(arms) == 1
+    assert arms[0][1]["type"] == "IF_THEN_ELSE"
+    assert default == prior
+
+
+def test_collapse_nested_cap_with_shared_else_unit():
+    from app.derivation.v2.ast_optimize import _collapse_nested_cap_with_shared_else
+
+    threshold = {
+        "type": "IF_THEN_ELSE",
+        "condition": {
+            "type": "BINARY_OP",
+            "operator": ">=",
+            "left": {"type": "COLUMN_REF", "entity": "A", "column": "DPD_NoCredit"},
+            "right": {"type": "COLUMN_REF", "entity": "A", "column": "RefPeriodNoCredit"},
+        },
+        "then_branch": {"type": "COLUMN_REF", "entity": "A", "column": "DPD_NoCredit"},
+        "else_branch": {"type": "LITERAL", "value_type": "NUMBER", "value": 0},
+    }
+    nested = {
+        "type": "IF_THEN_ELSE",
+        "condition": {
+            "type": "BINARY_OP",
+            "operator": "==",
+            "left": {"type": "COLUMN_REF", "entity": "A", "column": "SchemeType"},
+            "right": {"type": "LITERAL", "value_type": "STRING", "value": "ODA"},
+        },
+        "then_branch": {
+            "type": "IF_THEN_ELSE",
+            "condition": threshold["condition"],
+            "then_branch": {"type": "COLUMN_REF", "entity": "A", "column": "RefPeriodNoCredit"},
+            "else_branch": threshold,
+        },
+        "else_branch": threshold,
+    }
+    out = _collapse_nested_cap_with_shared_else(nested)
+    assert out["type"] == "IF_THEN_ELSE"
+    assert out["then_branch"] == {"type": "COLUMN_REF", "entity": "A", "column": "RefPeriodNoCredit"}
+    assert out["else_branch"] == threshold
+    merged = out["condition"]
+    assert merged.get("type") == "BINARY_OP" and merged.get("operator") == "AND"
+
+
 def test_npa_s06_final_npa_dt_formula_is_compact_and_valid():
     sql_path = (
         Path(__file__).resolve().parents[3]
@@ -557,4 +717,73 @@ def test_dedupe_and_guard_tree_drops_self_referential_equality():
     assert pruned.get("type") == "BINARY_OP"
     assert pruned.get("operator") == "=="
     assert pruned["left"]["column"] == "FlgUpg"
+
+
+def test_inmonthmark_normalize_rewrites_ephemeral_join_aliases():
+    join = {
+        "type": "BINARY_OP",
+        "operator": "==",
+        "left": {"type": "COLUMN_REF", "entity": "A", "column": "SourceSystemCustomerID"},
+        "right": {"type": "COLUMN_REF", "entity": "B", "column": "SourceSystemCustomerID"},
+    }
+    from app.derivation.v2.ast_optimize import _normalize_inmonth_join_entity_names
+
+    out = _normalize_inmonth_join_entity_names(
+        join, target_entity="CUSTOMERCAL", target_column="INMONTHMARK"
+    )
+    assert out["left"]["entity"] == "CUSTOMERCAL"
+    assert out["right"]["entity"] == "ACCOUNTCAL"
+
+
+def test_inmonthmark_ast_rewrite_drops_leading_isempty_arm():
+    join_cond = {
+        "type": "BINARY_OP",
+        "operator": "==",
+        "left": {"type": "COLUMN_REF", "entity": "CUSTOMERCAL", "column": "SourceSystemCustomerID"},
+        "right": {"type": "COLUMN_REF", "entity": "ACCOUNTCAL", "column": "SourceSystemCustomerID"},
+    }
+    bad_inner = {
+        "type": "IF_THEN_ELSE",
+        "condition": {
+            "type": "FUNCTION_CALL",
+            "function_name": "ISEMPTY",
+            "arguments": [{"type": "COLUMN_REF", "entity": "CUSTOMERCAL", "column": "INMONTHMARK"}],
+        },
+        "then_branch": {"type": "LITERAL", "value_type": "STRING", "value": "N"},
+        "else_branch": {
+            "type": "IF_THEN_ELSE",
+            "condition": join_cond,
+            "then_branch": {"type": "LITERAL", "value_type": "STRING", "value": "Y"},
+            "else_branch": {"type": "COLUMN_REF", "entity": "CUSTOMERCAL", "column": "INMONTHMARK"},
+        },
+    }
+    ast = {
+        "type": "IF_THEN_ELSE",
+        "condition": {
+            "type": "BINARY_OP",
+            "operator": "AND",
+            "left": {"type": "VARIABLE_REF", "name": "@PROC_FREQ"},
+            "right": {
+                "type": "BINARY_OP",
+                "operator": "!=",
+                "left": {"type": "VARIABLE_REF", "name": "@PROCESSDATE"},
+                "right": {
+                    "type": "FUNCTION_CALL",
+                    "function_name": "EOM",
+                    "arguments": [{"type": "VARIABLE_REF", "name": "@PROCESSDATE"}],
+                },
+            },
+        },
+        "then_branch": bad_inner,
+        "else_branch": {"type": "LITERAL", "value_type": "STRING", "value": "Y"},
+    }
+    optimized = optimize_expression_ast(
+        ast, target_entity="CUSTOMERCAL", target_column="INMONTHMARK"
+    )
+    formula = compile_ast_to_4x_string(
+        optimized, target_entity="CUSTOMERCAL", target_column="INMONTHMARK"
+    )
+    assert "ISEMPTY" not in formula.upper()
+    assert "SOURCESYSTEMCUSTOMERID" in formula.upper()
+    assert formula.index("IF(") < formula.upper().index("SOURCESYSTEMCUSTOMERID")
 

@@ -29,6 +29,26 @@ def test_compiler_rejects_undocumented_function():
         compile_ast_to_4x_string(ast)
 
 
+def test_not_is_documented_and_compiles():
+    from app.grammar.validator import validate_expression
+
+    assert is_documented_4x_function("NOT")
+    ast = {
+        "type": "FUNCTION_CALL",
+        "function_name": "NOT",
+        "arguments": [
+            {
+                "type": "FUNCTION_CALL",
+                "function_name": "ISEMPTY",
+                "arguments": [{"type": "COLUMN_REF", "entity": "A", "column": "X"}],
+            }
+        ],
+    }
+    formula = compile_ast_to_4x_string(ast)
+    assert formula == 'NOT(ISEMPTY("A"."X"))'
+    assert validate_expression(formula).valid
+
+
 def test_compiler_emits_todate_not_date():
     ast = {
         "type": "FUNCTION_CALL",

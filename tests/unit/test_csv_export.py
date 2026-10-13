@@ -30,6 +30,9 @@ def test_export_writes_correct_headers(tmp_path):
     out = export_dd_rows([_sample_row()], tmp_path / "dd.csv")
     rows = _read_csv(out)
     assert list(rows[0].keys()) == COLUMNS
+    assert len(COLUMNS) == 9
+    assert "Decision Table Json" not in COLUMNS
+    assert "Conditional Json" not in COLUMNS
 
 
 def test_export_writes_row_data(tmp_path):
@@ -40,6 +43,10 @@ def test_export_writes_row_data(tmp_path):
     assert rows[0]["Column Name"] == "DPD_Overdue"
     assert rows[0]["Derivation Option"] == "Formula Expression"
     assert rows[0]["Display Derivation Expression"] == row.display_derivation_expression
+    assert rows[0]["Rule Explanation"].strip()
+    assert list(rows[0].keys()).index("Rule Explanation") == list(rows[0].keys()).index(
+        "Display Derivation Expression"
+    ) + 1
 
 
 def test_export_withholds_decision_table_without_display_expression(tmp_path):

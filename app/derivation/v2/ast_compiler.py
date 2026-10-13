@@ -14,6 +14,7 @@ from contextvars import ContextVar
 from typing import Any
 
 from app.derivation.v2.ast_optimize import (
+    _normalize_inmonth_join_entity_names,
     distribute_if_over_comparisons,
     optimize_expression_ast,
 )
@@ -33,7 +34,6 @@ from app.derivation.v2.sql_text import (
     is_ephemeral_sql_alias,
     is_staging_derivation_entity,
     normalize_table_name,
-    should_collapse_target_join_hop,
 )
 
 _COMPILE_TARGET_ENTITY: ContextVar[str | None] = ContextVar(
@@ -95,6 +95,11 @@ def compile_ast_to_4x_string(
             if isinstance(node, dict):
                 node = optimize_expression_ast(
                     node, target_entity=target_entity or "", target_column=target_column or ""
+                )
+                node = _normalize_inmonth_join_entity_names(
+                    node,
+                    target_entity=target_entity or "",
+                    target_column=target_column or "",
                 )
             return _compile_ast_to_4x_string(node)
         finally:
@@ -329,13 +334,14 @@ def _compile_ast_to_4x_string(node: dict[str, Any] | None) -> str:
                 # Redundant self-relationship (e.g. a join path that folded
                 # back onto its own entity) collapses to a plain column ref.
                 return f'"{entity}"."{column}"'
-            target_entity = _COMPILE_TARGET_ENTITY.get()
-            if should_collapse_target_join_hop(entity, relationship, target_entity):
-                return f'{_quote_entity_for_4x(relationship)}."{column}"'
-            return (
-                f'{_quote_entity_for_4x(entity)}.'
-                f'{_quote_entity_for_4x(relationship)}."{column}"'
-            )
+            if is_ephemeral_sql_alias(relationship):
+                # Asset-class / statement aliases (``STD``, ``LOS``, ``A``) keep
+                # the three-part ``Target.Hop.Col`` shape the platform expects.
+                return (
+                    f'{_quote_entity_for_4x(entity)}.'
+                    f'{_quote_entity_for_4x(relationship)}."{column}"'
+                )
+            return f'{_quote_entity_for_4x(relationship)}."{column}"'
         return f'{_quote_entity_for_4x(entity)}."{column}"'
 
     if node_type == "VARIABLE_REF":

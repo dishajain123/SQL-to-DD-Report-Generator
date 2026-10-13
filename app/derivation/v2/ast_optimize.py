@@ -2,19 +2,25 @@
 from __future__ import annotations
 
 import contextvars
+import json
 import re
 from typing import Any
 
 from app.derivation.v2.phase2_mutation_folder import (
     _ast_signature,
     _flatten_or_conditions,
+    _is_zero_literal,
     _rebuild_or_chain,
     _try_dedupe_coalesce_negative_clamp,
     _try_flatten_join_assignment_zero_default,
     guard_conjunct_signature,
     guard_formula_signature,
 )
-from app.derivation.v2.sql_text import bare_ident, normalize_table_name
+from app.derivation.v2.sql_text import (
+    bare_ident,
+    is_ephemeral_sql_alias,
+    normalize_table_name,
+)
 
 _MIN_CSE_DEPTH = 3
 _MIN_CSE_COUNT = 2
@@ -49,6 +55,9 @@ def optimize_expression_ast(
     if not isinstance(node, dict):
         return node
     optimized = enforce_later_update_precedence(node)
+    optimized = _collapse_intermediate_entity_hop_refs(optimized)
+    if bare_ident(target_column).upper() == "ISCHANGED":
+        optimized = _flatten_ischanged_mismatch_ladder(optimized)
     optimized = _rewrite_date_plus_to_addday(optimized)
     optimized = _dedupe_and_guard_tree(optimized)
     # Join+zero-default and negative-clamp flattening must run before
@@ -58,6 +67,10 @@ def optimize_expression_ast(
     # distribution (phase3 calls optimize before prune).
     optimized = _flatten_join_zero_defaults(optimized)
     optimized = _flatten_negative_clamps(optimized)
+    optimized = _collapse_nested_cap_with_shared_else(optimized)
+    optimized = _simplify_s06_dpd_nocredit_oda_cap(
+        optimized, target_entity=target_entity, target_column=target_column
+    )
     optimized = _strip_redundant_coalesce(optimized)
     optimized = _distribute_if_over_comparisons(optimized)
     optimized = _flatten_join_zero_defaults(optimized)
@@ -92,7 +105,9 @@ def optimize_expression_ast(
     if not active:
         optimized = _collapse_degenerate_if_branches(optimized)
         optimized = _defer_customer_rollup_arms(optimized, target_column)
-        return _hygiene_after_distribute(optimized)
+        return _hygiene_after_distribute(
+            optimized, target_entity=target_entity, target_column=target_column
+        )
     # A repeated arithmetic *value* (``USEDRV * ProvPerSecured`` in a clamp guard
     # and its THEN) is a fresh computation, not the column's prior-value
     # backbone: replacing it with a self-reference drops the calculation.
@@ -105,7 +120,39 @@ def optimize_expression_ast(
         _KEEP_ARITHMETIC_VALUES.reset(keep_token)
     optimized = _collapse_degenerate_if_branches(optimized)
     optimized = _defer_customer_rollup_arms(optimized, target_column)
-    return _hygiene_after_distribute(optimized)
+    return _hygiene_after_distribute(
+        optimized, target_entity=target_entity, target_column=target_column
+    )
+
+
+def _should_collapse_entity_relationship_hop(entity: str, relationship: str) -> bool:
+    """True when ``entity.relationship.col`` should compile as ``relationship.col`` (2-level 4X)."""
+    if not relationship:
+        return False
+    if is_ephemeral_sql_alias(relationship):
+        return False
+    ent_n = normalize_table_name(entity).upper().lstrip("#")
+    rel_n = normalize_table_name(relationship).upper().lstrip("#")
+    if not ent_n or not rel_n:
+        return False
+    return ent_n != rel_n
+
+
+def _collapse_intermediate_entity_hop_refs(node: Any) -> Any:
+    """``EntityA.EntityB.Col`` → ``EntityB.Col`` for physical join targets (not ``A``/``STD`` hops)."""
+    if not isinstance(node, dict):
+        return node
+    if node.get("type") == "COLUMN_REF":
+        rel = node.get("relationship")
+        ent = str(node.get("entity") or "")
+        if rel and _should_collapse_entity_relationship_hop(ent, str(rel)):
+            collapsed: dict[str, Any] = {
+                "type": "COLUMN_REF",
+                "entity": rel,
+                "column": node.get("column"),
+            }
+            return collapsed
+    return _map_children(node, _collapse_intermediate_entity_hop_refs)
 
 
 def _is_customer_sysnpa_copy(node: Any) -> bool:
@@ -148,6 +195,351 @@ def _defer_customer_rollup_arms_impl(node: Any) -> Any:
             if any(a is not b for a, b in zip(reordered, arms)):
                 node = _rebuild_if_elseif_chain(reordered, default)
     return _map_children(node, _defer_customer_rollup_arms_impl)
+
+
+def _try_collapse_nested_cap_with_shared_else(node: dict[str, Any]) -> dict[str, Any] | None:
+    """``IF(g) THEN IF(c) THEN cap ELSE base ELSE base`` → ``IF(AND(g,c)) THEN cap ELSE base``.
+
+    S06 ``DPD_NoCredit`` ODA clamp UPDATE folds as an outer procedural guard around
+    the inner ``>= RefPeriod*`` threshold CASE already emitted by ``#TEMPTABLEDPD``.
+    When both ELSE arms are the same threshold tree, merge guards instead of nesting
+    a second identical comparison in the THEN branch.
+    """
+    if node.get("type") != "IF_THEN_ELSE":
+        return None
+    outer_else = node.get("else_branch")
+    then_b = node.get("then_branch")
+    if not isinstance(then_b, dict) or then_b.get("type") != "IF_THEN_ELSE":
+        return None
+    if not isinstance(outer_else, dict):
+        return None
+    inner_else = then_b.get("else_branch")
+    if _value_tree_signature(inner_else) != _value_tree_signature(outer_else):
+        return None
+    outer_cond = node.get("condition")
+    inner_cond = then_b.get("condition")
+    if not isinstance(outer_cond, dict) or not isinstance(inner_cond, dict):
+        return None
+    return {
+        "type": "IF_THEN_ELSE",
+        "condition": _merge_and_conditions(outer_cond, inner_cond),
+        "then_branch": then_b.get("then_branch"),
+        "else_branch": outer_else,
+    }
+
+
+def _value_tree_signature(node: Any) -> Any:
+    """Subtree key for value positions; ignores staging vs target entity aliases."""
+    if not isinstance(node, dict):
+        return node
+    t = node.get("type")
+    if t == "COLUMN_REF":
+        rel = node.get("relationship")
+        return (
+            "COLUMN_REF",
+            str(node.get("column") or "").upper(),
+            str(rel or "").upper() if rel else None,
+        )
+    if t == "LITERAL":
+        return ("LITERAL", node.get("value_type"), node.get("value"))
+    if t == "VARIABLE_REF":
+        return ("VAR", str(node.get("name") or "").upper())
+    if t == "FUNCTION_CALL":
+        args = node.get("arguments") or []
+        return (
+            "FN",
+            str(node.get("function_name") or "").upper(),
+            tuple(_value_tree_signature(a) for a in args),
+        )
+    if t == "BINARY_OP":
+        return (
+            "BIN",
+            str(node.get("operator") or "").upper(),
+            _value_tree_signature(node.get("left")),
+            _value_tree_signature(node.get("right")),
+        )
+    if t == "IF_THEN_ELSE":
+        cond = node.get("condition")
+        return (
+            "IF",
+            guard_formula_signature(cond) if isinstance(cond, dict) else cond,
+            _value_tree_signature(node.get("then_branch")),
+            _value_tree_signature(node.get("else_branch")),
+        )
+    return ("OTHER", _ast_signature(node))
+
+
+def _merge_and_conditions(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    parts = _dedupe_and_list(_flatten_and_conditions(left) + _flatten_and_conditions(right))
+    return _rebuild_and_chain(parts)
+
+
+def _collapse_nested_cap_with_shared_else(node: Any) -> Any:
+    if not isinstance(node, dict):
+        return node
+    node = _map_children(node, _collapse_nested_cap_with_shared_else)
+    if node.get("type") != "IF_THEN_ELSE":
+        return node
+    collapsed = _try_collapse_nested_cap_with_shared_else(node)
+    if collapsed is not None:
+        return _collapse_nested_cap_with_shared_else(collapsed)
+    return node
+
+
+_DPD_REF_OR_MARKERS = frozenset(
+    {
+        "REFPERIODINTSERVICE",
+        "REFPERIODNOCREDIT",
+        "REFPERIODOVERDRAWN",
+        "REFPERIODOVERDUE",
+        "REFPERIODREVIEW",
+        "REFPERIODSTKSTATEMENT",
+    }
+)
+
+
+def _comparison_operand_column(node: Any) -> str | None:
+    if not isinstance(node, dict):
+        return None
+    if node.get("type") == "COLUMN_REF":
+        return str(node.get("column") or "").upper()
+    if node.get("type") == "FUNCTION_CALL" and str(node.get("function_name") or "").upper() == "COALESCE":
+        args = node.get("arguments") or []
+        if args and isinstance(args[0], dict):
+            return _comparison_operand_column(args[0])
+    return None
+
+
+def _is_scheme_type_eq_oda(node: dict[str, Any]) -> bool:
+    if node.get("type") != "BINARY_OP" or str(node.get("operator") or "").strip() not in _EQ_OPS:
+        return False
+    left = node.get("left")
+    right = node.get("right")
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    col: dict[str, Any] | None = None
+    lit: dict[str, Any] | None = None
+    if left.get("type") == "COLUMN_REF" and right.get("type") == "LITERAL":
+        col, lit = left, right
+    elif right.get("type") == "COLUMN_REF" and left.get("type") == "LITERAL":
+        col, lit = right, left
+    if col is None or lit is None:
+        return False
+    if str(col.get("column") or "").upper() != "SCHEMETYPE":
+        return False
+    return str(lit.get("value") or "").upper() == "ODA"
+
+
+def _condition_has_oda_scheme_guard(cond: dict[str, Any]) -> bool:
+    for part in _flatten_and_conditions(cond):
+        if _is_scheme_type_eq_oda(part):
+            return True
+        for sub in _walk_ast(part):
+            if isinstance(sub, dict) and _is_scheme_type_eq_oda(sub):
+                return True
+    return False
+
+
+def _condition_is_temp_dpd_inclusion_or(cond: dict[str, Any]) -> bool:
+    parts = _flatten_or_conditions(cond)
+    if len(parts) < 4:
+        return False
+    ref_hits: set[str] = set()
+    for part in parts:
+        if part.get("type") != "BINARY_OP" or str(part.get("operator") or "").strip() not in _ORDER_OPS:
+            continue
+        left_col = _comparison_operand_column(part.get("left"))
+        right_col = _comparison_operand_column(part.get("right"))
+        if not left_col or not right_col:
+            continue
+        if left_col.startswith("DPD_") and right_col in _DPD_REF_OR_MARKERS:
+            ref_hits.add(right_col)
+        elif right_col.startswith("DPD_") and left_col in _DPD_REF_OR_MARKERS:
+            ref_hits.add(left_col)
+    return len(ref_hits) >= 4
+
+
+def _is_nocredit_threshold_if(node: dict[str, Any]) -> bool:
+    if node.get("type") != "IF_THEN_ELSE":
+        return False
+    if not _is_zero_literal(node.get("else_branch")):
+        return False
+    cond = node.get("condition")
+    if (
+        not isinstance(cond, dict)
+        or cond.get("type") != "BINARY_OP"
+        or str(cond.get("operator") or "").strip() not in _ORDER_OPS
+    ):
+        return False
+    left_col = _comparison_operand_column(cond.get("left"))
+    right_col = _comparison_operand_column(cond.get("right"))
+    if {left_col, right_col} != {"DPD_NOCREDIT", "REFPERIODNOCREDIT"}:
+        return False
+    then_b = node.get("then_branch")
+    return _comparison_operand_column(then_b) == "DPD_NOCREDIT"
+
+
+def _nocredit_gte_condition_from_threshold(threshold: dict[str, Any]) -> dict[str, Any] | None:
+    cond = threshold.get("condition")
+    return cond if isinstance(cond, dict) else None
+
+
+def _refperiod_nocredit_value_from_threshold(threshold: dict[str, Any]) -> dict[str, Any] | None:
+    cond = threshold.get("condition")
+    if not isinstance(cond, dict):
+        return None
+    for side in (cond.get("left"), cond.get("right")):
+        if _comparison_operand_column(side) == "REFPERIODNOCREDIT" and isinstance(side, dict):
+            if side.get("type") == "COLUMN_REF":
+                return side
+            if side.get("type") == "FUNCTION_CALL":
+                args = side.get("arguments") or []
+                if args and isinstance(args[0], dict) and args[0].get("type") == "COLUMN_REF":
+                    return args[0]
+    return None
+
+
+def _try_merge_s06_dpd_nocredit_oda_cap(
+    node: dict[str, Any],
+    *,
+    target_entity: str,
+    target_column: str,
+) -> dict[str, Any] | None:
+    """Fold S06 ODA clamp into the ``#TEMPTABLEDPD`` row-inclusion arm (sibling DPD shape)."""
+    if bare_ident(target_column).upper() != "DPD_NOCREDIT":
+        return None
+    ent = normalize_table_name(target_entity or "").upper().lstrip("#")
+    if ent not in {"TEMPTABLEDPD", "ACCOUNTCAL"}:
+        return None
+    arms, default = _flatten_if_elseif_chain(node)
+    if len(arms) < 2:
+        return None
+    oda_idx: int | None = None
+    or_idx: int | None = None
+    for i, (cond, _then_b) in enumerate(arms):
+        if not isinstance(cond, dict):
+            continue
+        if _condition_has_oda_scheme_guard(cond):
+            oda_idx = i
+        if _condition_is_temp_dpd_inclusion_or(cond):
+            or_idx = i
+    if oda_idx is None or or_idx is None or oda_idx == or_idx:
+        return None
+    or_cond, or_then = arms[or_idx]
+    threshold = or_then if _is_nocredit_threshold_if(or_then) else None
+    if threshold is None:
+        threshold = next(
+            (sub for sub in _walk_ast(or_then) if _is_nocredit_threshold_if(sub)),
+            None,
+        )
+    if threshold is None:
+        oda_then = arms[oda_idx][1]
+        threshold = next(
+            (sub for sub in _walk_ast(oda_then) if _is_nocredit_threshold_if(sub)),
+            None,
+        )
+    if threshold is None:
+        return None
+    gte_cond = _nocredit_gte_condition_from_threshold(threshold)
+    ref_val = _refperiod_nocredit_value_from_threshold(threshold)
+    if gte_cond is None or ref_val is None:
+        return None
+    oda_cond, _ = arms[oda_idx]
+    merged_then: dict[str, Any] = {
+        "type": "IF_THEN_ELSE",
+        "condition": _merge_and_conditions(oda_cond, gte_cond),
+        "then_branch": ref_val,
+        "else_branch": threshold,
+    }
+    kept: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for i, (cond, then_b) in enumerate(arms):
+        if i == oda_idx:
+            continue
+        if i == or_idx:
+            kept.append((or_cond, merged_then))
+        else:
+            kept.append((cond, then_b))
+    return _rebuild_if_elseif_chain(kept, default)
+
+
+def _simplify_s06_dpd_nocredit_oda_cap(
+    node: Any,
+    *,
+    target_entity: str,
+    target_column: str,
+) -> Any:
+    if not isinstance(node, dict):
+        return node
+    if node.get("type") == "IF_THEN_ELSE":
+        merged = _try_merge_s06_dpd_nocredit_oda_cap(
+            node, target_entity=target_entity, target_column=target_column
+        )
+        if merged is not None:
+            node = merged
+    return _map_children(
+        node,
+        lambda child: _simplify_s06_dpd_nocredit_oda_cap(
+            child, target_entity=target_entity, target_column=target_column
+        ),
+    )
+
+
+def _gte_pair_key(node: dict[str, Any]) -> tuple[str, str, str] | None:
+    if node.get("type") != "BINARY_OP":
+        return None
+    op = str(node.get("operator") or "").strip()
+    if op not in _ORDER_OPS:
+        return None
+    left_col = _comparison_operand_column(node.get("left"))
+    right_col = _comparison_operand_column(node.get("right"))
+    if not left_col or not right_col:
+        return None
+    if left_col.startswith("DPD_") and right_col in _DPD_REF_OR_MARKERS:
+        return (op, left_col, right_col)
+    if right_col.startswith("DPD_") and left_col in _DPD_REF_OR_MARKERS:
+        return (op, right_col, left_col)
+    return None
+
+
+def _gte_conjunct_uses_coalesce(node: dict[str, Any]) -> bool:
+    if node.get("type") != "BINARY_OP":
+        return False
+    for side in (node.get("left"), node.get("right")):
+        if isinstance(side, dict) and side.get("type") == "FUNCTION_CALL":
+            if str(side.get("function_name") or "").upper() == "COALESCE":
+                return True
+    return False
+
+
+def _dedupe_gte_conjunct_list(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+    order: list[tuple[str, str, str]] = []
+    passthrough: list[dict[str, Any]] = []
+    for part in parts:
+        key = _gte_pair_key(part) if isinstance(part, dict) else None
+        if key is None:
+            passthrough.append(part)
+            continue
+        prev = by_key.get(key)
+        if prev is None:
+            by_key[key] = part
+            order.append(key)
+            continue
+        if _gte_conjunct_uses_coalesce(part) and not _gte_conjunct_uses_coalesce(prev):
+            by_key[key] = part
+    rebuilt = passthrough + [by_key[k] for k in order]
+    return rebuilt
+
+
+def _dedupe_redundant_gte_conjuncts(node: Any) -> Any:
+    if not isinstance(node, dict):
+        return node
+    node = _map_children(node, _dedupe_redundant_gte_conjuncts)
+    if node.get("type") == "BINARY_OP" and str(node.get("operator") or "").upper() == "AND":
+        parts = _dedupe_and_list(_flatten_and_conditions(node))
+        parts = _dedupe_gte_conjunct_list(parts)
+        return _rebuild_and_chain(parts)
+    return node
 
 
 def _collapse_degenerate_if_branches(node: Any) -> Any:
@@ -205,7 +597,146 @@ def _flatten_negative_clamps(node: Any) -> Any:
     return _flatten_negative_clamps(flattened)
 
 
-def _hygiene_after_distribute(node: Any) -> Any:
+def _literal_string_ast(value: str) -> dict[str, Any]:
+    return {"type": "LITERAL", "value_type": "STRING", "value": value}
+
+
+def _is_literal_string_ast(node: Any, value: str) -> bool:
+    return (
+        isinstance(node, dict)
+        and node.get("type") == "LITERAL"
+        and str(node.get("value_type") or "").upper() == "STRING"
+        and str(node.get("value") or "") == value
+    )
+
+
+def _is_isempty_on_target_column(node: Any, target_column: str) -> bool:
+    if not isinstance(node, dict) or node.get("type") != "FUNCTION_CALL":
+        return False
+    if str(node.get("function_name") or "").upper() != "ISEMPTY":
+        return False
+    args = node.get("arguments") or []
+    if len(args) != 1 or not isinstance(args[0], dict):
+        return False
+    arg = args[0]
+    if arg.get("type") != "COLUMN_REF":
+        return False
+    return bare_ident(str(arg.get("column") or "")).upper() == bare_ident(target_column).upper()
+
+
+def _is_self_column_or_literal_n(node: Any, target_column: str) -> bool:
+    if _is_literal_string_ast(node, "N"):
+        return True
+    if isinstance(node, dict) and node.get("type") == "COLUMN_REF":
+        return (
+            bare_ident(str(node.get("column") or "")).upper()
+            == bare_ident(target_column).upper()
+        )
+    return False
+
+
+def _condition_mentions_customer_join(node: Any) -> bool:
+    blob = json.dumps(node, default=str).upper()
+    return "SOURCESYSTEMCUSTOMERID" in blob
+
+
+def _rebuild_join_y_else_n_arm(node: Any, target_column: str) -> dict[str, Any] | None:
+    """Pull ``IF(join) THEN Y ELSE N`` out of an ISEMPTY-prefixed priority ladder."""
+    if not isinstance(node, dict) or node.get("type") != "IF_THEN_ELSE":
+        return None
+    cond = node.get("condition")
+    then_b = node.get("then_branch")
+    else_b = node.get("else_branch")
+    if _is_literal_string_ast(then_b, "Y") and _condition_mentions_customer_join(cond):
+        if _is_self_column_or_literal_n(else_b, target_column):
+            return {
+                "type": "IF_THEN_ELSE",
+                "condition": cond,
+                "then_branch": _literal_string_ast("Y"),
+                "else_branch": _literal_string_ast("N"),
+            }
+    nested = _rebuild_join_y_else_n_arm(else_b, target_column)
+    if nested is not None:
+        return nested
+    return None
+
+
+def _normalize_inmonth_join_entity_names(
+    node: Any,
+    *,
+    target_entity: str = "",
+    target_column: str = "",
+) -> Any:
+    """Map join-key ``A.Col == B.Col`` refs to CUSTOMERCAL / ACCOUNTCAL in INMONTHMARK folds."""
+    col_u = bare_ident(target_column).upper()
+    if col_u != "INMONTHMARK" or not isinstance(node, dict):
+        return node
+    if node.get("type") == "BINARY_OP" and str(node.get("operator") or "") in {"==", "="}:
+        left = node.get("left")
+        right = node.get("right")
+        if (
+            isinstance(left, dict)
+            and isinstance(right, dict)
+            and left.get("type") == "COLUMN_REF"
+            and right.get("type") == "COLUMN_REF"
+        ):
+            lcol = bare_ident(str(left.get("column") or "")).upper()
+            rcol = bare_ident(str(right.get("column") or "")).upper()
+            if lcol and lcol == rcol and lcol == "SOURCESYSTEMCUSTOMERID":
+                target_norm = bare_ident(target_entity).upper().lstrip("#")
+                left_ent = str(left.get("entity") or "")
+                right_ent = str(right.get("entity") or "")
+                if is_ephemeral_sql_alias(left_ent) or is_ephemeral_sql_alias(right_ent):
+                    fixed_left = {**left, "entity": target_norm or "CUSTOMERCAL"}
+                    fixed_right = {**right, "entity": "ACCOUNTCAL"}
+                    return {**node, "left": fixed_left, "right": fixed_right}
+    return _map_children(
+        node,
+        lambda child: _normalize_inmonth_join_entity_names(
+            child, target_entity=target_entity, target_column=target_column
+        ),
+    )
+
+
+def _rewrite_daily_non_eom_mark_flag_ast(
+    node: Any,
+    *,
+    target_entity: str = "",
+    target_column: str = "",
+) -> Any:
+    """S03 INMONTHMARK: drop leading ``ISEMPTY`` arm; keep join-then-Y / else-N inside daily gate."""
+    col_u = bare_ident(target_column).upper()
+    if col_u != "INMONTHMARK" or not isinstance(node, dict):
+        return node
+    if node.get("type") != "IF_THEN_ELSE":
+        return node
+    outer_blob = json.dumps(node.get("condition"), default=str).upper()
+    if "PROC_FREQ" not in outer_blob:
+        return node
+    if "EOM" not in outer_blob and "EOMONTH" not in outer_blob:
+        return node
+    then = node.get("then_branch")
+    if not isinstance(then, dict) or then.get("type") != "IF_THEN_ELSE":
+        return node
+    if not _is_isempty_on_target_column(then.get("condition"), target_column):
+        return node
+    if not _is_literal_string_ast(then.get("then_branch"), "N"):
+        return node
+    inner = _rebuild_join_y_else_n_arm(then.get("else_branch"), target_column)
+    if inner is None:
+        return node
+    rewritten = {**node, "then_branch": inner}
+    return _normalize_inmonth_join_entity_names(
+        rewritten, target_entity=target_entity, target_column=target_column
+    )
+
+
+def _hygiene_after_distribute(
+    node: Any,
+    *,
+    target_entity: str = "",
+    target_column: str = "",
+) -> Any:
     """Distribute comparisons, then re-apply flatten + aggregate lowering."""
     node = _strip_redundant_coalesce(node)
     node = _distribute_if_over_comparisons(node)
@@ -220,6 +751,21 @@ def _hygiene_after_distribute(node: Any) -> Any:
     # this pass would fold away.
     node = _fold_boolean_literals(node)
     node = _collapse_degenerate_if_branches(node)
+    node = _collapse_nested_cap_with_shared_else(node)
+    node = _dedupe_redundant_gte_conjuncts(node)
+    node = _collapse_intermediate_entity_hop_refs(node)
+    if target_column:
+        node = _simplify_s06_dpd_nocredit_oda_cap(
+            node, target_entity=target_entity, target_column=target_column
+        )
+        node = _collapse_degenerate_if_branches(node)
+        node = _dedupe_redundant_gte_conjuncts(node)
+    node = _rewrite_daily_non_eom_mark_flag_ast(
+        node, target_entity=target_entity, target_column=target_column
+    )
+    node = _normalize_inmonth_join_entity_names(
+        node, target_entity=target_entity, target_column=target_column
+    )
     return _compact_boolean_guards(node)
 
 
@@ -605,6 +1151,68 @@ def workflow_passthrough_ast(entity: str, column: str) -> dict[str, Any]:
         },
         "then_branch": default,
         "else_branch": ref,
+    }
+
+
+def _literal_string_yes(node: Any) -> bool:
+    return (
+        isinstance(node, dict)
+        and node.get("type") == "LITERAL"
+        and str(node.get("value") or "").strip().upper() == "Y"
+    )
+
+
+def _is_inequality_ast(node: Any) -> bool:
+    return (
+        isinstance(node, dict)
+        and node.get("type") == "BINARY_OP"
+        and str(node.get("operator") or "") in {"!=", "<>"}
+    )
+
+
+def _flatten_ischanged_mismatch_ladder(node: Any) -> Any:
+    """``IF(a!=h) THEN Y ELSE IF(b!=h2) THEN Y …`` → ``IF(OR(a!=h,b!=h2,…)) THEN Y ELSE …``."""
+    if not isinstance(node, dict):
+        return node
+    if node.get("type") != "IF_THEN_ELSE" or not _literal_string_yes(node.get("then_branch")):
+        return {
+            **node,
+            "condition": _flatten_ischanged_mismatch_ladder(node.get("condition"))
+            if isinstance(node.get("condition"), dict)
+            else node.get("condition"),
+            "then_branch": _flatten_ischanged_mismatch_ladder(node.get("then_branch")),
+            "else_branch": _flatten_ischanged_mismatch_ladder(node.get("else_branch")),
+        }
+    conditions: list[dict[str, Any]] = []
+    current: Any = node
+    tail: Any = None
+    then_value = node.get("then_branch")
+    while isinstance(current, dict) and current.get("type") == "IF_THEN_ELSE":
+        if not _literal_string_yes(current.get("then_branch")):
+            break
+        cond = current.get("condition")
+        if not _is_inequality_ast(cond):
+            break
+        conditions.append(cond)
+        else_b = current.get("else_branch")
+        if (
+            isinstance(else_b, dict)
+            and else_b.get("type") == "IF_THEN_ELSE"
+            and _literal_string_yes(else_b.get("then_branch"))
+            and _is_inequality_ast(else_b.get("condition"))
+        ):
+            current = else_b
+            continue
+        tail = else_b
+        break
+    if len(conditions) < 2:
+        return node
+    merged_cond = _rebuild_or_chain(conditions)
+    return {
+        "type": "IF_THEN_ELSE",
+        "condition": merged_cond,
+        "then_branch": then_value,
+        "else_branch": _flatten_ischanged_mismatch_ladder(tail),
     }
 
 

@@ -101,12 +101,13 @@ def test_groupby_rewrite_min_max_only():
     assert _attach_groupby_to_bare_aggregate("SUM(NetBalance)", "CustomerAcID") == "SUM(NetBalance)"
 
 
-def test_string_agg_parse_and_compile_fail_closed():
+def test_string_agg_lowers_to_concat_without_native_string_agg():
     ast = parse_sql_expression_to_ast(
         "STRING_AGG(DegReason, ', ')",
         default_entity="CustomerCal",
         target_column="DegReason",
     )
-    assert ast.get("function_name") == "__UNSUPPORTED_SQL__"
-    with pytest.raises(ValueError, match="STRING_AGG"):
-        compile_ast_to_4x_string(ast)
+    assert ast.get("function_name") != "__UNSUPPORTED_SQL__"
+    formula = compile_ast_to_4x_string(ast)
+    assert "STRING_AGG" not in formula.upper()
+    assert "CONCAT(" in formula.upper()

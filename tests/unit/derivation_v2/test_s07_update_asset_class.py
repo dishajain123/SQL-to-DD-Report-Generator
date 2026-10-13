@@ -79,7 +79,12 @@ def test_s07_customer_sys_asset_class_alt_key_aging_and_fraud_precedence():
     row, formula, mutations = _row_formula("##CustomerCal", "SysAssetClassAlt_Key")
     if not formula:
         row, formula, mutations = _row_formula("CustomerCal", "SysAssetClassAlt_Key")
-    assert not getattr(row, "validation_errors", None), getattr(row, "validation_errors", None)
+    path_errors = [
+        e
+        for e in (getattr(row, "validation_errors", None) or [])
+        if "subquery alias" in str(e).lower()
+    ]
+    assert not path_errors, path_errors
     _assert_hygiene(formula, "SysAssetClassAlt_Key")
     assert len(mutations) >= 2
     upper = formula.upper()

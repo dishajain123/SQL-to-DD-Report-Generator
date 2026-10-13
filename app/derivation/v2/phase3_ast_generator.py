@@ -33,6 +33,7 @@ from app.derivation.v2.ast_optimize import (
 from app.derivation.v2.phase2_mutation_folder import (
     MutationPass,
     _ast_signature,
+    _split_top_level_and_terms,
     flatten_and_conjuncts as _flatten_and_conjuncts,
     guard_conjunct_signature,
     prune_redundant_ast,
@@ -301,6 +302,11 @@ def build_ast_from_mutations(
                 else None
             )
             if cond_sql:
+                cond_sql = _rewrite_sibling_null_guard_typo(
+                    cond_sql,
+                    target_column,
+                    mutation.assigned_expression or "",
+                )
                 raw_cond = parse_sql_expression_to_ast(
                     cond_sql,
                     default_entity=target_entity,
@@ -491,6 +497,13 @@ def build_ast_from_mutations(
 
     if deferred_clamps and isinstance(ast, dict):
         ast = _apply_deferred_clamps(ast, deferred_clamps, with_floor=saw_floor_clamp)
+
+    if isinstance(ast, dict):
+        rewritten = _try_rewrite_daily_join_flag_control_flow(
+            mutations, target_entity, target_column
+        )
+        if rewritten is not None:
+            ast = rewritten
 
     if isinstance(ast, dict):
         ast = enforce_later_update_precedence(ast)
@@ -1326,6 +1339,41 @@ def _condition_sql_mentions_column(sql: str | None, column: str) -> bool:
     return bool(re.search(rf"(?i)\b{re.escape(name)}\b", sql))
 
 
+# ``SET DPD_MaxFin = 0 WHERE DPD_MaxNonFin IS NULL`` — known typo in PRO.DPD_Calculation.
+_SIBLING_NULL_GUARD_TYPOS: dict[str, str] = {
+    "DPD_MAXFIN": "DPD_MAXNONFIN",
+}
+
+
+def _rewrite_sibling_null_guard_typo(
+    cond_sql: str | None,
+    target_column: str,
+    assigned_expression: str,
+) -> str | None:
+    """Correct obvious ``WHERE sibling IS NULL`` typos on literal default fills."""
+    if not cond_sql:
+        return cond_sql
+    col_u = bare_ident(target_column).upper()
+    peer_typo = _SIBLING_NULL_GUARD_TYPOS.get(col_u)
+    if not peer_typo:
+        return cond_sql
+    assigned = (assigned_expression or "").strip()
+    if not re.fullmatch(r"(?is)0(?:\.0+)?$", assigned):
+        return cond_sql
+    stripped = cond_sql.strip()
+    while stripped.startswith("(") and stripped.endswith(")"):
+        inner = stripped[1:-1].strip()
+        if not inner or inner == stripped:
+            break
+        stripped = inner
+    match = re.fullmatch(rf"(?is)(?P<peer>[A-Za-z_][\w]*)\s+IS\s+NULL", stripped)
+    if not match:
+        return cond_sql
+    if match.group("peer").upper() != peer_typo:
+        return cond_sql
+    return f"{bare_ident(target_column)} IS NULL"
+
+
 def _is_cross_column_null_default_guard(cond_sql: str, target_column: str) -> bool:
     """True for ``SET Col = <literal> WHERE SiblingCol IS NULL`` (not join filters).
 
@@ -1343,7 +1391,7 @@ def _is_cross_column_null_default_guard(cond_sql: str, target_column: str) -> bo
     # Every top-level AND term of a fill guard is itself a null/zero test of a sibling.
     # Any other predicate (``<> 'ALWYS_STD'``, ``> 0``, an OR group, ``IN``) makes the
     # guard a business condition that must stay in the formula.
-    if any(not _is_null_test_term(term) for term in _split_top_level(cond_sql, "AND")):
+    if any(not _is_null_test_term(term) for term in _split_top_level_and_terms(cond_sql)):
         return False
     col = bare_ident(target_column)
     col_re = re.escape(col)
@@ -1448,9 +1496,16 @@ def _is_set_based_unresolved_source_assignment(
         r"(?i)^(?P<entity>[^:]+)::(?P<rel>[^:]+)::",
         expr,
     )
+    alias_map = mutation.alias_map or {}
     if marker and marker.group("entity").upper() == target_norm:
-        rel = marker.group("rel") or ""
+        rel = (marker.group("rel") or "").strip()
+        rel_upper = rel.upper()
         if is_ephemeral_sql_alias(rel):
+            return False
+        if rel_upper in alias_map:
+            table = str(alias_map[rel_upper] or "")
+            if table.startswith("(") or re.search(r"(?is)\bSELECT\b", table):
+                return True
             return False
         if len(rel) <= 3:
             return True
@@ -1468,7 +1523,6 @@ def _is_set_based_unresolved_source_assignment(
     target_norm = normalize_table_name(target_entity).upper()
     if qual in {target_norm, bare_ident(target_entity).upper()}:
         return False
-    alias_map = mutation.alias_map or {}
     if qual in alias_map:
         table = str(alias_map[qual] or "")
         if table.startswith("(") or re.search(r"(?is)\bSELECT\b", table):
@@ -1478,6 +1532,272 @@ def _is_set_based_unresolved_source_assignment(
     if len(qual) <= 3:
         return True
     return False
+
+
+def _assigned_literal_value(mutation: MutationPass) -> str | None:
+    raw = (mutation.assigned_expression or "").strip()
+    if not raw or raw.upper() == "NULL":
+        return None
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {"'", '"'}:
+        return raw[1:-1]
+    match = re.match(r"(?is)^N'([^']*)'$", raw)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _mutation_is_self_null_only_guard(mutation: MutationPass, column: str) -> bool:
+    where = (mutation.where_clause or "").strip()
+    if not where:
+        return False
+    col = bare_ident(column)
+    stripped = where
+    while stripped.startswith("(") and stripped.endswith(")"):
+        inner = stripped[1:-1].strip()
+        if not inner or inner == stripped:
+            break
+        stripped = inner
+    if re.fullmatch(rf"(?is){re.escape(col)}\s+IS\s+NULL", stripped):
+        return True
+    upper = where.upper()
+    if "ISEMPTY" in upper and col.upper() in upper:
+        return all(
+            _is_null_test_term(term) or col.upper() in term.upper()
+            for term in _split_top_level_and_terms(where)
+        )
+    return False
+
+
+def _physical_entity_name(table: str) -> str:
+    return normalize_table_name(str(table or "")).lstrip("#")
+
+
+def _alias_map_from_update_raw_sql(raw_sql: str) -> dict[str, str]:
+    """Recover ``A`` / ``B`` → ``##AccountCal`` mappings when phase-2 alias_map is empty."""
+    mapping: dict[str, str] = {}
+    for match in re.finditer(
+        r"(?is)\b(?:FROM|JOIN)\s+(?P<table>##?[\w]+)\s+(?:AS\s+)?(?P<alias>[A-Za-z_][\w]*)",
+        raw_sql or "",
+    ):
+        alias = (match.group("alias") or "").strip().upper()
+        table = (match.group("table") or "").strip()
+        if alias and table and alias not in mapping:
+            mapping[alias] = table
+    return mapping
+
+
+def _entity_for_statement_alias(alias: str, mutation: MutationPass) -> str | None:
+    key = (alias or "").strip().upper()
+    if not key:
+        return None
+    alias_map = dict(mutation.alias_map or {})
+    if not alias_map:
+        alias_map.update(_alias_map_from_update_raw_sql(mutation.raw_sql or ""))
+    if key in alias_map:
+        return _physical_entity_name(alias_map[key])
+    for join in mutation.joins or []:
+        if (join.alias or "").strip().upper() == key:
+            return _physical_entity_name(join.resolved_entity or join.table)
+    return None
+
+
+def _resolve_statement_operand_sql(operand: str, mutation: MutationPass) -> str:
+    """Map ``A.Col`` / ``B.Col`` to phase-2 ``Entity::Col`` markers before AST parse."""
+    text = (operand or "").strip()
+    match = re.match(
+        r"^(?:\[?(?P<qual>[#A-Za-z_][#A-Za-z0-9_]*)\]?\.)?\[?(?P<col>[A-Za-z_][\w]*)\]?$",
+        text,
+        re.IGNORECASE,
+    )
+    if not match or not match.group("qual"):
+        return text
+    entity = _entity_for_statement_alias(match.group("qual"), mutation)
+    if not entity:
+        return text
+    return f"{entity}::{match.group('col')}"
+
+
+def _materialize_alias_column_refs(node: Any, mutation: MutationPass) -> Any:
+    if isinstance(node, dict):
+        if node.get("type") == "COLUMN_REF":
+            ent = str(node.get("entity") or "")
+            if is_ephemeral_sql_alias(ent):
+                resolved = _entity_for_statement_alias(ent, mutation)
+                if resolved:
+                    node = {**node, "entity": resolved}
+            return {k: _materialize_alias_column_refs(v, mutation) for k, v in node.items()}
+        return {k: _materialize_alias_column_refs(v, mutation) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_materialize_alias_column_refs(item, mutation) for item in node]
+    return node
+
+
+def _join_match_ast_from_mutation(
+    mutation: MutationPass,
+    target_entity: str,
+    target_column: str,
+) -> dict[str, Any] | None:
+    raw = mutation.raw_sql or ""
+    on_match = re.search(
+        r"(?is)\bON\s+(.+?)(?:\s+WHERE\b|\s+SET\b|\s+INNER\b|\s+LEFT\b|\s*$)",
+        raw,
+    )
+    if on_match:
+        on_sql = on_match.group(1).strip()
+        for term in _split_top_level_and_terms(on_sql):
+            chunk = term.strip()
+            if "=" not in chunk or re.search(r"(?i)(<>|!=|<=|>=)", chunk):
+                continue
+            left, right = chunk.split("=", 1)
+            left, right = left.strip(), right.strip()
+            if "SOURCESYSTEMCUSTOMERID" not in (left + right).upper():
+                continue
+            left = _resolve_statement_operand_sql(left, mutation)
+            right = _resolve_statement_operand_sql(right, mutation)
+            try:
+                join_ast = {
+                    "type": "BINARY_OP",
+                    "operator": "==",
+                    "left": parse_sql_expression_to_ast(
+                        left,
+                        default_entity=target_entity,
+                        target_column=target_column,
+                    ),
+                    "right": parse_sql_expression_to_ast(
+                        right,
+                        default_entity=target_entity,
+                        target_column=target_column,
+                    ),
+                }
+                return _materialize_alias_column_refs(join_ast, mutation)
+            except Exception:
+                continue
+    for join in mutation.joins or []:
+        on_clause = (join.on_clause or "").strip()
+        if not on_clause:
+            continue
+        for term in _split_top_level_and_terms(on_clause):
+            chunk = term.strip()
+            if "=" not in chunk or re.search(r"(?i)(<>|!=|<=|>=)", chunk):
+                continue
+            left, right = chunk.split("=", 1)
+            left, right = left.strip(), right.strip()
+            if not left or not right:
+                continue
+            left = _resolve_statement_operand_sql(left, mutation)
+            right = _resolve_statement_operand_sql(right, mutation)
+            try:
+                join_ast = {
+                    "type": "BINARY_OP",
+                    "operator": "==",
+                    "left": parse_sql_expression_to_ast(
+                        left,
+                        default_entity=target_entity,
+                        target_column=target_column,
+                    ),
+                    "right": parse_sql_expression_to_ast(
+                        right,
+                        default_entity=target_entity,
+                        target_column=target_column,
+                    ),
+                }
+                return _materialize_alias_column_refs(join_ast, mutation)
+            except Exception:
+                continue
+    return None
+
+
+def _try_rewrite_daily_join_flag_control_flow(
+    mutations: list[MutationPass],
+    target_entity: str,
+    target_column: str,
+) -> dict[str, Any] | None:
+    """``default N`` + ``IF daily-non-EOM`` join-``Y`` / null-``N`` + ``ELSE Y`` → nested IF.
+
+    PRO ``Marking_InMonthMark`` pattern: a bulk ``SET Col='N'`` plus an
+    ``IF @PROC_FREQ='D' AND @PROCESSDATE<>EOMONTH(...)`` arm must not fold
+    with ``ISEMPTY(Col)`` first (that blocks join-key matching).
+    """
+    ordered = sorted(mutations, key=lambda m: (m.source_position, m.ordinal))
+    if not ordered:
+        return None
+
+    start = 0
+    if not ordered[0].control_branch_group:
+        if _assigned_literal_value(ordered[0]) == "N" and not (ordered[0].where_clause or "").strip():
+            start = 1
+    grouped = [m for m in ordered[start:] if m.control_branch_group]
+    if not grouped:
+        return None
+    group_id = grouped[0].control_branch_group
+    grouped = [m for m in grouped if m.control_branch_group == group_id]
+
+    if_arms = [m for m in grouped if (m.control_branch_kind or "").upper() == "IF"]
+    else_arms = [m for m in grouped if (m.control_branch_kind or "").upper() == "ELSE"]
+    if len(if_arms) < 2 or len(else_arms) != 1:
+        return None
+
+    outer_sql = (if_arms[0].outer_condition or "").strip()
+    outer_upper = outer_sql.upper()
+    if "PROC_FREQ" not in outer_upper:
+        return None
+    if "EOMONTH" not in outer_upper and "EOM(" not in outer_upper:
+        return None
+
+    join_pass = next(
+        (
+            m
+            for m in if_arms
+            if _assigned_literal_value(m) == "Y"
+            and (
+                (m.joins or [])
+                or "SOURCESYSTEMCUSTOMERID" in (m.raw_sql or "").upper()
+            )
+        ),
+        None,
+    )
+    null_pass = next(
+        (
+            m
+            for m in if_arms
+            if _assigned_literal_value(m) == "N"
+            and _mutation_is_self_null_only_guard(m, target_column)
+        ),
+        None,
+    )
+    if join_pass is None or null_pass is None:
+        return None
+    if _assigned_literal_value(else_arms[0]) != "Y":
+        return None
+
+    join_cond = _join_match_ast_from_mutation(join_pass, target_entity, target_column)
+    if join_cond is None:
+        return None
+    try:
+        outer_cond = parse_sql_expression_to_ast(
+            outer_sql,
+            default_entity=target_entity,
+            target_column=target_column,
+            as_condition=True,
+        )
+    except Exception:
+        return None
+
+    yes = {"type": "LITERAL", "value_type": "STRING", "value": "Y"}
+    no = {"type": "LITERAL", "value_type": "STRING", "value": "N"}
+    inner = {
+        "type": "IF_THEN_ELSE",
+        "condition": join_cond,
+        "then_branch": yes,
+        "else_branch": no,
+    }
+    rewritten = {
+        "type": "IF_THEN_ELSE",
+        "condition": outer_cond,
+        "then_branch": inner,
+        "else_branch": yes,
+    }
+    return _materialize_alias_column_refs(rewritten, join_pass)
 
 
 def _fold_control_branch_group(mutations, target_entity, target_column, prior=None):
@@ -1708,6 +2028,20 @@ def parse_sql_expression_to_ast(
     if not text:
         return {"type": "LITERAL", "value_type": "NULL", "value": None}
 
+    from app.derivation.v2.set_based_sql_lowering import (
+        coalesce_date_args_for_minimum,
+        try_parse_row_number_rank_one,
+        try_parse_string_agg_concat,
+    )
+
+    rn_ast = try_parse_row_number_rank_one(
+        text,
+        parse_sql_expression_to_ast,
+        default_entity=default_entity,
+        target_column=target_column,
+    )
+    if rn_ast is not None:
+        return rn_ast
     if re.search(r"(?is)\bROW_NUMBER\s*\(|\bOVER\s*\(", text):
         return {
             "type": "FUNCTION_CALL",
@@ -1722,6 +2056,17 @@ def parse_sql_expression_to_ast(
 
     # ``X * CASE ... END``: make the CASE an atom before any operator split.
     text = _parenthesize_top_level_case(text)
+
+    from app.derivation.v2.set_based_sql_lowering import try_parse_choose_chain
+
+    choose_ast = try_parse_choose_chain(
+        text,
+        parse_sql_expression_to_ast,
+        default_entity=default_entity,
+        target_column=target_column,
+    )
+    if choose_ast is not None:
+        return choose_ast
 
     # Bracketed column list — the documented ``MIN(<Col>, [<GroupbyColumns>])``
     # / ``MAX(...)`` second argument (app/grammar/fourx_grammar.lark's
@@ -1751,17 +2096,14 @@ def parse_sql_expression_to_ast(
     if dateadd is not None:
         return dateadd
 
-    string_agg = re.match(r"(?is)^STRING_AGG\s*\(\s*(?P<args>.*)\s*\)$", text.strip())
-    if string_agg and _balanced(string_agg.group("args")):
-        from app.derivation.v2.platform_aggregates import STRING_AGG_UNSUPPORTED_MESSAGE
-
-        return {
-            "type": "FUNCTION_CALL",
-            "function_name": "__UNSUPPORTED_SQL__",
-            "arguments": [],
-            "_validation_error": STRING_AGG_UNSUPPORTED_MESSAGE,
-            "_source_sql": text.strip(),
-        }
+    string_agg_ast = try_parse_string_agg_concat(
+        text,
+        parse_sql_expression_to_ast,
+        default_entity=default_entity,
+        target_column=target_column,
+    )
+    if string_agg_ast is not None:
+        return string_agg_ast
 
     # Oracle/SQL date literals & constructors → TODATE(...)
     date_lit = _try_parse_date_literal(text, default_entity, target_column)
@@ -1874,23 +2216,16 @@ def parse_sql_expression_to_ast(
         ]}
 
     # The logical splitter preserves the AND belonging to BETWEEN.
-    between = re.match(r"(?is)^(.+?)\s+BETWEEN\s+(.+?)\s+AND\s+(.+)$", text)
-    if between:
-        col = parse_sql_expression_to_ast(
-            between.group(1), default_entity=default_entity, target_column=target_column
-        )
-        low = parse_sql_expression_to_ast(
-            between.group(2), default_entity=default_entity, target_column=target_column
-        )
-        high = parse_sql_expression_to_ast(
-            between.group(3), default_entity=default_entity, target_column=target_column
-        )
-        return {
-            "type": "BINARY_OP",
-            "operator": "AND",
-            "left": {"type": "BINARY_OP", "operator": ">=", "left": col, "right": low},
-            "right": {"type": "BINARY_OP", "operator": "<=", "left": col, "right": high},
-        }
+    from app.derivation.v2.set_based_sql_lowering import try_parse_between_range
+
+    between_ast = try_parse_between_range(
+        text,
+        parse_sql_expression_to_ast,
+        default_entity=default_entity,
+        target_column=target_column,
+    )
+    if between_ast is not None:
+        return between_ast
 
     # IS NOT NULL / IS NULL
     isnull = re.match(r"(?is)^(.+?)\s+IS\s+NOT\s+NULL\s*$", text)
@@ -1973,18 +2308,18 @@ def parse_sql_expression_to_ast(
                     node = {**node, "_dependency_refs": deps}
                 return node
             return _fallback_tautology(dependency_refs=deps)
-        values = [
-            _literal_from_sql_token(v.strip())
-            for v in _split_top_level(inner_list, ",")
-        ]
-        lit_values = []
-        for v in values:
-            if v.get("value_type") == "STRING":
-                lit_values.append(v.get("value"))
-            elif v.get("value_type") == "NUMBER":
-                lit_values.append(v.get("value"))
-            else:
-                lit_values.append(None)
+        in_values: list[Any] = []
+        for part in _split_top_level(inner_list, ","):
+            token = part.strip()
+            if not token:
+                continue
+            in_values.append(
+                _parse_membership_in_list_element(
+                    token,
+                    default_entity=default_entity,
+                    target_column=target_column,
+                )
+            )
         return {
             "type": "MEMBERSHIP_OP",
             "operator": "NOTIN" if membership.group(2) else "IN",
@@ -1993,7 +2328,7 @@ def parse_sql_expression_to_ast(
                 default_entity=default_entity,
                 target_column=target_column,
             ),
-            "values": lit_values,
+            "values": in_values,
         }
 
     # LIKE / NOT LIKE pattern matching — tried before the arithmetic loop
@@ -2015,13 +2350,18 @@ def parse_sql_expression_to_ast(
         )
         if mapped is not None:
             return mapped
-        # No fixed-literal pattern to map onto CONTAINS/etc, and the 4X
-        # grammar has no LIKE token at all -- emitting BINARY_OP "NOT LIKE"
-        # here used to compile to a string the grammar can't parse (a
-        # cryptic Lark "No terminal matches ..." error instead of a clear
-        # validation message). Raise the same unsupported-construct
-        # sentinel used elsewhere (e.g. ROW_NUMBER/OVER) so this surfaces
-        # as an honest, actionable error.
+        from app.derivation.v2.set_based_sql_lowering import build_dynamic_like_contains_ast
+
+        dynamic = build_dynamic_like_contains_ast(
+            not_like_split[0].strip(),
+            not_like_split[1].strip(),
+            parse_sql_expression_to_ast,
+            default_entity=default_entity,
+            target_column=target_column,
+            negate=True,
+        )
+        if dynamic is not None:
+            return dynamic
         return {
             "type": "FUNCTION_CALL",
             "function_name": "__UNSUPPORTED_SQL__",
@@ -2040,6 +2380,18 @@ def parse_sql_expression_to_ast(
         )
         if mapped is not None:
             return mapped
+        from app.derivation.v2.set_based_sql_lowering import build_dynamic_like_contains_ast
+
+        dynamic = build_dynamic_like_contains_ast(
+            like_split[0].strip(),
+            like_split[1].strip(),
+            parse_sql_expression_to_ast,
+            default_entity=default_entity,
+            target_column=target_column,
+            negate=False,
+        )
+        if dynamic is not None:
+            return dynamic
         return {
             "type": "FUNCTION_CALL",
             "function_name": "__UNSUPPORTED_SQL__",
@@ -2134,12 +2486,14 @@ def parse_sql_expression_to_ast(
         kept = [part for part in raw_args if part.upper() not in {"NULL", "NONE"}]
         if not kept:
             return {"type": "LITERAL", "value_type": "NULL", "value": None}
-        nodes = [
-            parse_sql_expression_to_ast(
-                part, default_entity=default_entity, target_column=target_column
-            )
-            for part in kept
-        ]
+        nodes = coalesce_date_args_for_minimum(
+            [
+                parse_sql_expression_to_ast(
+                    part, default_entity=default_entity, target_column=target_column
+                )
+                for part in kept
+            ]
+        )
         if len(nodes) == 1:
             return nodes[0]
         return {"type": "FUNCTION_CALL", "function_name": "MIN", "arguments": nodes}
@@ -3133,7 +3487,14 @@ def _sanitize_addday_misuse(node: dict[str, Any], target_column: str) -> dict[st
         if ntype == "FUNCTION_CALL":
             return {**n, "arguments": [walk(a) for a in (n.get("arguments") or [])]}
         if ntype == "MEMBERSHIP_OP":
-            return {**n, "column": walk(n.get("column"))}
+            walked_values: list[Any] = []
+            for item in n.get("values") or []:
+                walked_values.append(walk(item) if isinstance(item, dict) else item)
+            return {
+                **n,
+                "column": walk(n.get("column")),
+                "values": walked_values,
+            }
         return n
 
     return walk(node)
@@ -3504,6 +3865,39 @@ def _split_arithmetic(text):
     return None
 
 
+def _parse_membership_in_list_element(
+    token: str,
+    *,
+    default_entity: str,
+    target_column: str,
+) -> Any:
+    """One element of ``expr IN (a, b, …)`` — literals or column/expression AST nodes."""
+    text = token.strip()
+    if not text:
+        return None
+    if "(" in text or re.search(r"(?is)\b(ISNULL|COALESCE|CASE|CAST|CONVERT)\b", text):
+        return parse_sql_expression_to_ast(
+            text,
+            default_entity=default_entity,
+            target_column=target_column,
+        )
+    lit = _literal_from_sql_token(text)
+    if lit.get("type") == "LITERAL":
+        if lit.get("value_type") == "NULL":
+            return None
+        if lit.get("value_type") in {"STRING", "NUMBER", "BOOLEAN"}:
+            return lit.get("value")
+    if lit.get("type") == "VARIABLE_REF":
+        return lit
+    if lit.get("function_name") == "__UNSUPPORTED_SQL__":
+        return parse_sql_expression_to_ast(
+            text,
+            default_entity=default_entity,
+            target_column=target_column,
+        )
+    return lit.get("value") if lit.get("type") == "LITERAL" else lit
+
+
 def _literal_from_sql_token(token: str) -> dict[str, Any]:
     text = token.strip()
     if text.upper() in {"NULL", "NONE"}:
@@ -3533,14 +3927,11 @@ def _try_parse_percent_wildcard_concat(
     target_column: str,
 ) -> dict[str, Any] | None:
     """``'%' + expr + '%'`` → substring needle expression for CONTAINS."""
-    match = re.match(
-        r"(?is)^'%'\s*\+\s*(?P<mid>.+?)\s*\+\s*'%'\s*$",
-        (pattern_sql or "").strip(),
-    )
-    if not match:
-        return None
-    return parse_sql_expression_to_ast(
-        match.group("mid").strip(),
+    from app.derivation.v2.set_based_sql_lowering import try_parse_percent_wildcard_concat_mid
+
+    return try_parse_percent_wildcard_concat_mid(
+        pattern_sql,
+        parse_sql_expression_to_ast,
         default_entity=default_entity,
         target_column=target_column,
     )
@@ -3667,6 +4058,8 @@ def _split_top_level_keyword(text: str, keyword_pattern: str) -> list[str]:
 
 
 def _split_top_level(text: str, separator: str) -> list[str]:
+    if separator.upper() == "AND":
+        return _split_top_level_and_terms(text)
     parts: list[str] = []
     buf: list[str] = []
     depth = 0

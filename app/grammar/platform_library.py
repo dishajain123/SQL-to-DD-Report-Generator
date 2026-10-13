@@ -1,14 +1,15 @@
 """Documented 4X function library (authoritative: samples/platform_docs/4x_functions_operators.md).
 
 Generated derivation formulas must use only these function names plus the control-flow
-and operator syntax defined in that document. Logical ``AND`` / ``OR`` / ``NOT`` use
-infix or ``AND(...)`` / ``OR(...)`` / ``NOT(...)`` forms from the grammar — not listed here.
+and operator syntax defined in that document. Logical ``AND`` / ``OR`` may also use
+``AND(...)`` / ``OR(...)`` call forms from the grammar.
 """
 from __future__ import annotations
 
 # Commonly used + Text + Date & time + Math sections of the platform reference.
 DOCUMENTED_4X_FUNCTIONS: frozenset[str] = frozenset(
     {
+        "NOT",
         "ISEMPTY",
         "ISNOTEMPTY",
         "MAX",

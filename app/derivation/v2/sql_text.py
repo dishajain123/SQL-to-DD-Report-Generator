@@ -14,7 +14,7 @@ from app.parsing.sql_lex import mask_sql, normalize_comparison_spacing
 
 _STMT_START = re.compile(
     r"(?is)\b(?:UPDATE|INSERT|DELETE|MERGE|SELECT|CREATE|DROP|TRUNCATE|EXEC|EXECUTE|DECLARE|GO"
-    r"|IF|BEGIN|ELSE|PRINT|COMMIT|ROLLBACK)\b"
+    r"|IF|BEGIN|ELSE|PRINT|COMMIT|ROLLBACK|SET)\b"
 )
 
 _CACHE_MIN_CHARS = 4000
@@ -26,6 +26,60 @@ def strip_sql_comments(sql: str) -> str:
     if len(sql) >= _CACHE_MIN_CHARS:
         return _strip_large(sql)
     return _strip_small(sql)
+
+
+def strip_debug_print_statements(sql: str) -> str:
+    """Remove T-SQL ``PRINT`` debug statements outside string literals."""
+    text = sql or ""
+    if not text:
+        return text
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    in_single = False
+    while i < n:
+        ch = text[i]
+        if in_single:
+            out.append(ch)
+            if ch == "'" and i + 1 < n and text[i + 1] == "'":
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if ch == "'":
+            in_single = True
+            out.append(ch)
+            i += 1
+            continue
+        if (
+            i + 5 <= n
+            and text[i : i + 5].upper() == "PRINT"
+            and (i == 0 or text[i - 1] in ";\n\r\t(")
+            and (i + 5 >= n or text[i + 5].isspace() or text[i + 5] == "(")
+        ):
+            j = i + 5
+            while j < n and text[j] not in ";\n\r":
+                j += 1
+            if j < n and text[j] == ";":
+                j += 1
+            elif j < n and text[j] in "\n\r":
+                out.append(text[j])
+                j += 1
+            else:
+                out.append(" ")
+            i = j
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def prepare_sql_for_derivation(sql: str) -> str:
+    """Comment + debug PRINT hygiene before mutation extraction."""
+    return strip_debug_print_statements(strip_sql_comments(sql))
 
 
 @lru_cache(maxsize=512)
@@ -206,10 +260,22 @@ def lineage_keeps_target_hop(entity: str, relationship: str | None = None) -> bo
     return False
 
 
+# DimAssetClass ``AssetClassShortName`` hops compiled as ``"CustomerCal"."SUB"."AssetClassAlt_Key"``.
+_DIM_ASSET_CLASS_RELATIONSHIP_HOPS = frozenset(
+    {"SUB", "DB1", "DB2", "DB3", "LOS", "STD"},
+)
+
+
+def is_dim_asset_class_relationship_hop(name: str) -> bool:
+    return bare_ident(name or "").upper() in _DIM_ASSET_CLASS_RELATIONSHIP_HOPS
+
+
 def is_ephemeral_sql_alias(name: str) -> bool:
     """Statement-local alias (``A``, ``B``, ``C``) — not a physical entity name."""
     text = bare_ident(name or "")
     if not text or text.startswith("#") or text.startswith("@"):
+        return False
+    if is_dim_asset_class_relationship_hop(text):
         return False
     if len(text) > 3:
         return False
@@ -237,6 +303,14 @@ def should_collapse_target_join_hop(
 
 def bare_ident(name: str) -> str:
     return (name or "").strip().strip("[]").strip('"').strip()
+
+
+def entity_key_upper(name: str) -> str:
+    """Canonical upper entity token for export / narration (``##CustomerCal`` → ``CUSTOMERCAL``)."""
+    text = normalize_table_name(name or "").upper()
+    while text.startswith("#"):
+        text = text[1:]
+    return text
 
 
 def _parse_simple_select_projection(select_item: str) -> tuple[str | None, str]:
@@ -452,12 +526,14 @@ def extract_update_statements(sql: str) -> list[dict[str, str | None]]:
             # OPTION (MAXDOP 1 / HASH JOIN …) is a statement-level query hint,
             # not part of the FROM or WHERE text.
             from_clause, i = _read_until_keyword(
-                text, i, {"WHERE", "OPTION"}, stop_at_statement=True
+                text, i, {"WHERE", "OPTION", "SET"}, stop_at_statement=True
             )
             from_clause = from_clause.strip() or None
         if i < len(text) and _WHERE_KW.match(text, i):
             i = i + len("WHERE")
-            where_clause, i = _read_until_keyword(text, i, {"OPTION"}, stop_at_statement=True)
+            where_clause, i = _read_until_keyword(
+                text, i, {"OPTION", "SET"}, stop_at_statement=True
+            )
             where_clause = where_clause.strip() or None
 
         statements.append(
@@ -1607,6 +1683,20 @@ def parse_select_list(
         if eq_match:
             eq_alias = bare_ident(eq_match.group("alias"))
             chunk = eq_match.group("value").strip()
+        literal_bracket_alias = re.match(
+            r"(?is)^(?P<lit>(?:N'(?:''|[^'])*'|'(?:''|[^'])*'))\s+\[?(?P<alias>[A-Za-z_][A-Za-z0-9_]*)\]?\s*$",
+            chunk,
+        )
+        if literal_bracket_alias:
+            results.append(
+                (
+                    None,
+                    None,
+                    bare_ident(literal_bracket_alias.group("alias")),
+                    literal_bracket_alias.group("lit").strip(),
+                )
+            )
+            continue
         if "(" in chunk:
             alias = None
             alias_m = re.search(

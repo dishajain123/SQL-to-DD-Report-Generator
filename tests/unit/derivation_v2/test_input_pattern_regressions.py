@@ -140,16 +140,16 @@ def test_like_percent_concat_column_maps_to_contains():
     assert validate_expression(formula).passed
 
 
-def test_string_agg_is_unsupported_not_silently_stripped():
+def test_string_agg_lowers_to_concat():
     ast = parse_sql_expression_to_ast(
         "STRING_AGG(DegReason, ', ')",
         default_entity="AccountCal",
         target_column="DegReason",
     )
-    assert ast.get("function_name") == "__UNSUPPORTED_SQL__"
-    assert "STRING_AGG" in (ast.get("_validation_error") or "")
-    with pytest.raises(ValueError, match="STRING_AGG"):
-        compile_ast_to_4x_string(ast)
+    assert ast.get("function_name") != "__UNSUPPORTED_SQL__"
+    expr = compile_ast_to_4x_string(ast)
+    assert "STRING_AGG" not in expr.upper()
+    assert "CONCAT(" in expr.upper()
 
 
 def test_spaced_qualifier_is_normalized_without_moving_offsets():
